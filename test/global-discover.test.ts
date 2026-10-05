@@ -345,6 +345,137 @@ describe("gstack-global-discover", () => {
     });
   });
 
+  describe("Claude Code sessions from removed worktrees (#1315)", () => {
+    // A Claude worktree is deleted once its branch merges, but its
+    // ~/.claude/projects/<encoded-cwd>/ history stays. The scanner used to drop
+    // every such directory (cwd no longer exists), undercounting sessions.
+    let tmpDir: string;
+    let home: string;
+    let work: string;
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), "gstack-wt-test-"));
+      home = join(tmpDir, "home");
+      work = join(tmpDir, "work");
+      mkdirSync(join(home, ".claude", "projects"), { recursive: true });
+      mkdirSync(work, { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    // Claude Code names the project dir after the cwd with every
+    // non-alphanumeric character replaced by "-".
+    function writeSessions(cwd: string, count: number): void {
+      const dir = join(home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+      mkdirSync(dir, { recursive: true });
+      for (let i = 0; i < count; i++) {
+        writeFileSync(join(dir, `s${i}.jsonl`), JSON.stringify({ type: "user", cwd }) + "\n");
+      }
+    }
+
+    function makeRepo(dir: string, remote: string): void {
+      mkdirSync(dir, { recursive: true });
+      spawnSync("git", ["init", "-q"], { cwd: dir, stdio: "pipe", timeout: 30_000 });
+      spawnSync("git", ["remote", "add", "origin", remote], { cwd: dir, stdio: "pipe", timeout: 30_000 });
+    }
+
+    function discover(): any {
+      const result = spawnSync("bun", ["run", scriptPath, "--since", "7d", "--format", "json"], {
+        encoding: "utf-8",
+        timeout: 30000,
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+      });
+      expect(result.status).toBe(0);
+      return JSON.parse(result.stdout);
+    }
+
+    const REMOTE = "https://github.com/acme/ai-blogger-lab.git";
+
+    test("sessions of a deleted worktree count toward the parent repo", () => {
+      const repo = join(work, "ai-blogger-lab");
+      const wt = join(repo, ".claude", "worktrees", "feat-x");
+      makeRepo(repo, REMOTE);
+      writeSessions(repo, 3);
+      writeSessions(wt, 5); // worktree directory itself never exists on disk
+
+      const json = discover();
+      expect(json.tools.claude_code.total_sessions).toBe(8);
+      expect(json.repos).toHaveLength(1);
+      expect(json.repos[0].sessions.claude_code).toBe(8);
+    });
+
+    test("a deleted worktree started from a subdirectory maps to the parent repo", () => {
+      const repo = join(work, "ai-blogger-lab");
+      makeRepo(repo, REMOTE);
+      writeSessions(join(repo, ".claude", "worktrees", "feat-x", "packages", "app"), 4);
+
+      const json = discover();
+      expect(json.tools.claude_code.total_sessions).toBe(4);
+      expect(json.repos[0].paths).toEqual([repo]);
+    });
+
+    test("a live worktree and its parent still collapse to one repo", () => {
+      const repo = join(work, "ai-blogger-lab");
+      const wt = join(repo, ".claude", "worktrees", "feat-x");
+      makeRepo(repo, REMOTE);
+      makeRepo(wt, REMOTE);
+      writeSessions(repo, 3);
+      writeSessions(wt, 5);
+
+      const json = discover();
+      expect(json.tools.claude_code.total_sessions).toBe(8);
+      expect(json.repos).toHaveLength(1);
+    });
+
+    test("negative control: a deleted worktree whose parent is also gone is skipped", () => {
+      writeSessions(join(work, "gone-repo", ".claude", "worktrees", "feat-x"), 5);
+
+      const json = discover();
+      expect(json.tools.claude_code.total_sessions).toBe(0);
+      expect(json.repos).toHaveLength(0);
+    });
+
+    test("negative control: a deleted non-worktree directory is still skipped", () => {
+      const repo = join(work, "ai-blogger-lab");
+      makeRepo(repo, REMOTE);
+      writeSessions(join(repo, "some", "other", "deleted-dir"), 5);
+
+      const json = discover();
+      expect(json.tools.claude_code.total_sessions).toBe(0);
+    });
+
+    describe("parentRepoOfClaudeWorktree", () => {
+      let parentRepoOfClaudeWorktree: (cwd: string) => string | null;
+
+      beforeEach(async () => {
+        const mod = await import("../bin/gstack-global-discover.ts");
+        parentRepoOfClaudeWorktree = mod.parentRepoOfClaudeWorktree;
+      });
+
+      test("returns the repo root for a worktree path", () => {
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/app/.claude/worktrees/feat-x")).toBe("/Users/me/code/app");
+      });
+
+      test("ignores a subdirectory inside the worktree", () => {
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/app/.claude/worktrees/feat-x/src/lib")).toBe("/Users/me/code/app");
+      });
+
+      test("handles Windows separators", () => {
+        expect(parentRepoOfClaudeWorktree("C:\\code\\app\\.claude\\worktrees\\feat-x")).toBe("C:\\code\\app");
+      });
+
+      test("returns null for paths that are not Claude worktrees", () => {
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/app")).toBeNull();
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/app/.claude/worktrees")).toBeNull();
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/app/.claude/worktrees/")).toBeNull();
+        expect(parentRepoOfClaudeWorktree("/Users/me/code/not.claude/worktrees/x")).toBeNull();
+        expect(parentRepoOfClaudeWorktree("/.claude/worktrees/x")).toBeNull();
+      });
+    });
+  });
+
   describe("extractCwdFromJsonl 64KB cap (PR #1169 bug #8)", () => {
     // Regression: the old 8KB cap landed mid-line on Claude Code sessions with
     // long headers, JSON.parse threw on the truncated tail, the catch

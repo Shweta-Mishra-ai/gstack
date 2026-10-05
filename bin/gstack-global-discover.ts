@@ -246,10 +246,26 @@ function resolveClaudeCodeCwd(
 
   for (const file of sorted.slice(0, 3)) {
     const cwd = extractCwdFromJsonl(join(dirPath, file.name));
-    if (cwd && existsSync(cwd)) return cwd;
+    if (!cwd) continue;
+    if (existsSync(cwd)) return cwd;
+    // The worktree was deleted (branch merged) but its session history stays.
+    // Attribute those sessions to the repo it was created from, instead of
+    // dropping the whole directory and undercounting the project.
+    const parent = parentRepoOfClaudeWorktree(cwd);
+    if (parent && existsSync(parent)) return parent;
   }
 
   return null;
+}
+
+/**
+ * Claude Code creates worktrees at `<repo>/.claude/worktrees/<name>`. Given a
+ * cwd inside one (the worktree root or any subdirectory), return the repo root
+ * it was created from; null for any other path.
+ */
+export function parentRepoOfClaudeWorktree(cwd: string): string | null {
+  const m = cwd.match(/^(.+?)[\\/]\.claude[\\/]worktrees[\\/][^\\/]+(?:[\\/].*)?$/);
+  return m ? m[1] : null;
 }
 
 export function extractCwdFromJsonl(filePath: string): string | null {
