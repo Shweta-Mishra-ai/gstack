@@ -27,7 +27,7 @@ INPUT="$1"
 TMPERR=$(mktemp "${TMPDIR:-/tmp}/gstack-learnings-log.XXXXXX") || { echo "gstack-learnings-log: could not create a temp file in ${TMPDIR:-/tmp}, so the learning was not recorded. Fix: point TMPDIR at a writable directory." >&2; exit 1; }
 trap 'rm -f "$TMPERR"' EXIT
 set +e
-VALIDATED=$(printf '%s' "$INPUT" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun -e "
+VALIDATED=$(printf '%s' "$INPUT" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun --no-env-file --config=/dev/null -e "
 const { hasInjection } = await import(process.env.GSTACK_LIB_DIR + '/jsonl-store.ts');
 const raw = await Bun.stdin.text();
 let j;

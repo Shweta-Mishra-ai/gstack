@@ -24,6 +24,18 @@ setup        text eol=lf
 bin/*        text eol=lf
 **/scripts/* text eol=lf
 
+# Nested executables (#3110). A pattern containing a slash is anchored at the
+# repository root, so `bin/*` above covers only the top-level bin/. These are
+# bash or sh entry points too; a Windows checkout wrote them with CRLF, and a
+# Linux bash reading that checkout (a synced tree, WSL, a bind mount) failed
+# with `set: pipefail: invalid option name`. setup's CRLF repair rewrites
+# copies an older checkout already left with CRLF.
+**/bin/*                           text eol=lf
+hosts/*/hooks/*                    text eol=lf
+lib/cso/images/*                   text eol=lf
+scripts/app/*                      text eol=lf
+browse/test/fixtures/mock-claude/* text eol=lf
+
 # Dockerfiles build on Linux, and test/ci-image-cli-pin.test.ts joins their
 # `\`-continued RUN lines with a `\\\n` match; CRLF left each RUN split.
 Dockerfile*  text eol=lf
@@ -42,6 +54,7 @@ Dockerfile*  text eol=lf
 *.gif        binary
 *.ico        binary
 *.pdf        binary
+*.icns       binary
 
 # The committed diagram-render bundle is hash-pinned (BUILD_INFO sha256);
 # a CRLF rewrite on Windows checkout would break the drift test and change

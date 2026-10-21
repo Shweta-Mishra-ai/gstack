@@ -1,6 +1,6 @@
 {
   "name": "gstack",
-  "version": "1.91.25",
+  "version": "1.91.173",
   "description": "Garry's Stack — Claude Code skills + fast headless browser. One repo, one install, entire AI engineering workflow.",
   "license": "MIT",
   "type": "module",
@@ -22,7 +22,7 @@
     "dev:make-pdf": "bun run make-pdf/src/cli.ts",
     "dev:design": "bun run design/src/cli.ts",
     "build:diagram-render": "cd lib/diagram-render && bun install && bun run scripts/build.ts",
-    "build:gates": "bun build --compile make-pdf/src/cli.ts --outfile make-pdf/dist/pdf && bun build --compile browse/src/cli.ts --outfile browse/dist/browse && bun run build:diagram-render",
+    "build:gates": "bun build --compile make-pdf/src/cli.ts --outfile make-pdf/dist/pdf --no-compile-autoload-dotenv --no-compile-autoload-bunfig && bun build --compile browse/src/cli.ts --outfile browse/dist/browse --no-compile-autoload-dotenv --no-compile-autoload-bunfig && bun run build:diagram-render",
     "gen:skill-docs": "bun run scripts/gen-skill-docs.ts",
     "gen:skill-docs:user": "bun run scripts/gen-skill-docs.ts --respect-detection",
     "audit:manifest": "bun run scripts/prompt-audit-manifest.ts",
@@ -50,6 +50,7 @@
     "eval:bg:gate": "bun run scripts/eval-bg.ts gate",
     "eval:bg:periodic": "bun run scripts/eval-bg.ts periodic",
     "test:health": "bun run scripts/test-health-report.ts",
+    "test:exercised-map": "bun run scripts/exercised-map.ts",
     "eval:list": "bun run scripts/eval-list.ts",
     "eval:compare": "bun run scripts/eval-compare.ts",
     "eval:summary": "bun run scripts/eval-summary.ts",
@@ -68,17 +69,19 @@
     "eval:bg:release": "bun run scripts/eval-bg.ts release"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
+    "@huggingface/transformers": "^4.3.1",
     "@ngrok/ngrok": "^1.7.0",
     "cross-spawn": "^7.0.6",
     "diff": "^9.0.0",
     "html-to-docx": "1.8.0",
-    "marked": "^18.0.11",
+    "html-to-vdom": "0.7.0",
+    "marked": "^18.1.1",
     "playwright": "^1.62.1",
-    "socks": "^2.8.9"
+    "sharp": "^0.35.4",
+    "socks": "^2.8.10"
   },
   "engines": {
-    "bun": ">=1.4.0"
+    "bun": ">=1.4.2"
   },
   "keywords": [
     "browser",
@@ -91,18 +94,23 @@
     "devtools"
   ],
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.2.117",
+    "@anthropic-ai/claude-agent-sdk": "0.2.141",
     "@anthropic-ai/sdk": "^0.78.0",
-    "@types/bun": "1.4.0",
-    "prettier": "3.9.9",
+    "@types/bun": "1.4.3",
+    "prettier": "3.9.10",
     "typescript": "7.0.2",
     "xterm": "^5.3.0",
     "xterm-addon-fit": "^0.8.0"
   },
   "overrides": {
+    "@modelcontextprotocol/sdk": "1.31.0",
     "adm-zip": "^0.6.1",
-    "ip-address": "10.3.1",
-    "sharp": "0.35.4"
+    "fast-uri": "3.1.8",
+    "hono": "4.13.13",
+    "image-size": "2.0.4",
+    "ip-address": "10.7.3",
+    "proxy-addr": "2.0.8",
+    "sharp": "0.35.5"
   },
   "patchedDependencies": {
     "playwright-core@1.62.1": "patches/playwright-core@1.62.1.patch"

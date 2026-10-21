@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-issue-guard — fetch tracker text and emit it inside the untrusted
  * trust envelope (lib/tracker-guard.ts). The ONLY sanctioned path for reading

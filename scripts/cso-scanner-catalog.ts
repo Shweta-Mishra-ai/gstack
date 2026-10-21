@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Assemble and validate a complete source-controlled scanner catalog proposal. */
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';

@@ -13,8 +13,8 @@ const read = (p: string) => fs.readFileSync(path.join(ROOT, p), 'utf-8');
 describe('gstack-upgrade template: ff-only precedes the gated reset (#2517)', () => {
   const tmpl = read('gstack-upgrade/SKILL.md.tmpl');
 
-  test('git pull --ff-only runs before any reset --hard', () => {
-    const ff = tmpl.indexOf('git pull --ff-only --autostash');
+  test('the fast-forward (gstack-ff-update) runs before any reset --hard', () => {
+    const ff = tmpl.indexOf('bash bin/gstack-ff-update . origin/main');
     const reset = tmpl.indexOf('git reset --hard origin/main');
     expect(ff).toBeGreaterThan(-1);
     expect(reset).toBeGreaterThan(-1);

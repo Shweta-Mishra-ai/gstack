@@ -5,6 +5,7 @@
  * Moved from scripts/resolvers/review.ts.
  */
 import { type TemplateContext } from './types';
+import { undeclaredBehaviorLines } from './sideways';
 
 /** Approval readiness precedes output; the exit gate only verifies the saved result. */
 export function generatePlanReviewApprovalCheck(ctx: TemplateContext): string {
@@ -87,12 +88,12 @@ Failed checks use **Gate outcome: Blocked**. Chat or body prose cannot replace
 the verified terminal report. Do not call ExitPlanMode until all checks pass.`;
   if (ctx.skillName === 'plan-eng-review') return `## EXIT PLAN MODE GATE (BLOCKING)
 
-Run this final verification for every review target, in every host mode. It
-checks the completed work; only the later ExitPlanMode call is plan-mode-only.
+Run this for every review target in every host mode; only the later
+ExitPlanMode call is plan-mode-only.
 
-Confirm Approval readiness passed for the current decisions. This is a
-read-only verification, not a new approval or output-writing step. If it is
-stale, report the stale verification and stop before success telemetry;
+Confirm Approval readiness passed for the current decisions; this read-only
+verification is not an approval or a write. If stale, report the stale
+verification and stop before success telemetry;
 follow **Blocked outcome**. Resume under **Recovery routing → Late change or missing work**.
 
 Verify all five checks against the selected report file:
@@ -106,7 +107,7 @@ Verify all five checks against the selected report file:
 5. Confirm \`gstack-review-log\` was called and \`gstack-review-read\` ran at
    least once for the completed saved review.
 
-Apply **Review record and write policy**: forbidden report/log persistence or
+Forbidden report/log persistence uses **Report-back outcome**, not this gate;
 an unrecovered save cannot pass. If any check fails, follow **Blocked outcome**
 without success telemetry or ExitPlanMode. Body prose cannot replace the
 separate terminal structured report.`;
@@ -225,6 +226,69 @@ done
    \`${PLAN_AUDIT_NOT_RUN}\`
 
 **Error handling:** a bound or chosen plan file that is unreadable (permissions, encoding) ${ship ? 'is an audit error, not "no plan": the parent applies its audit-failure recovery and skip/stop decision.' : '→ say "Plan file found but unreadable." and use the Fallback Intent Sources below; never report plan items as verified.'}`;
+}
+
+export const ACCEPTANCE_EDITED = 'ACCEPTANCE_EDITED';
+/** Lower-cased heading keywords that mark a plan section as acceptance-bearing (awk ERE, applied after tolower). */
+export const ACCEPTANCE_HEADING_PATTERN = '^#+ *[0-9.]* *(testable )?(acceptance|success criteria|verification|test plan|testing|done when|definition of done)';
+
+/**
+ * RH-10 (spec-editing as progress): the parent diffs the plan's acceptance-bearing
+ * sections as they stand in the working tree against a baseline and reports
+ * ACCEPTANCE_EDITED beside the child's classes. Parent-only: the child's
+ * seven-field JSON contract is unchanged.
+ */
+function planAcceptanceEditedCheck(): string {
+  return `### Acceptance edits (parent-computed)
+
+Run this after the child's report and before Gate Logic, with the bound plan path
+substituted for \`<plan-path>\`. It compares the plan's acceptance-bearing sections
+(headings matching acceptance, success criteria, verification, test plan, testing,
+done when, definition of done) as they stand in the working tree against a baseline:
+the \`origin/<base>\` version when the plan exists there, else its first commit on this
+branch, else \`baseline unavailable\` (plans outside the repository or not yet tracked).
+
+\`\`\`bash
+PLAN_FILE="<plan-path>"
+_REL=$(git ls-files --full-name --error-unmatch -- "$PLAN_FILE" 2>/dev/null | head -1)
+_BASE_REF=""; _BASE_KIND=""
+if [ -z "$_REL" ]; then
+  echo "ACCEPTANCE_BASELINE: unavailable (plan is not tracked in this repository)"
+elif git cat-file -e "origin/<base>:$_REL" 2>/dev/null; then
+  _BASE_REF="origin/<base>"; _BASE_KIND="origin/<base>"
+else
+  _FIRST=$(git log --diff-filter=A --format=%H "origin/<base>..HEAD" -- "$_REL" 2>/dev/null | tail -1)
+  if [ -n "$_FIRST" ]; then _BASE_REF="$_FIRST"; _BASE_KIND="first commit on branch ($_FIRST)"
+  else echo "ACCEPTANCE_BASELINE: unavailable (no origin/<base> version and no introducing commit)"; fi
+fi
+if [ -n "$_BASE_REF" ]; then
+  echo "ACCEPTANCE_BASELINE: $_BASE_KIND"
+  _ACC_TMP=$(mktemp -d "\${TMPDIR:-/tmp}/gstack-acceptance.XXXXXX") && trap 'rm -rf "$_ACC_TMP"' EXIT
+  _acc_sections() { awk 'BEGIN{keep=0} /^#+ /{keep = (tolower($0) ~ /${ACCEPTANCE_HEADING_PATTERN}/)} keep{print}'; }
+  git show "$_BASE_REF:$_REL" | _acc_sections > "$_ACC_TMP/base"
+  _acc_sections < "$PLAN_FILE" > "$_ACC_TMP/wtree"
+  if diff -u --label baseline --label working-tree "$_ACC_TMP/base" "$_ACC_TMP/wtree" > "$_ACC_TMP/diff"; then
+    echo "${ACCEPTANCE_EDITED}: none"
+  else
+    echo "${ACCEPTANCE_EDITED}: yes"; cat "$_ACC_TMP/diff"
+  fi
+fi
+\`\`\`
+
+Read the result:
+
+- \`${ACCEPTANCE_EDITED}: none\` — record \`Acceptance edits: none (baseline <kind>)\` for the PR body.
+- \`${ACCEPTANCE_EDITED}: yes\` — for each plan item whose acceptance text the diff changed, add
+  \`[${ACCEPTANCE_EDITED}]\` beside the child's classification in the checklist summary. It is a
+  separate class: never fold it into CHANGED (CHANGED means the same goal was achieved by other
+  means and passes the gate). The original obligation is still audited: classify the item
+  against the baseline text, so an item that satisfies only its edited text is PARTIAL or
+  NOT DONE against the original and gated as such. The PR body names each one as a scope
+  change under \`## Plan Completion\` with the baseline and working-tree wording.
+- \`ACCEPTANCE_BASELINE: unavailable\` — record \`Acceptance edits: baseline unavailable (<reason>)\`
+  in the PR body; never report \`none\`.
+
+Limit: an item rewritten in the same commit that introduced the plan is invisible to this check.`;
 }
 
 /** Ship's child audit: the parent already bound the plan, so the child never searches. */
@@ -402,9 +466,13 @@ The parent evaluates the completion checklist in priority order, including after
 
 4. **All DONE or CHANGED:** Pass. "Plan completion: PASS — all items addressed." Continue.
 
+**${ACCEPTANCE_EDITED} items** (parent-computed, see Acceptance edits above) are gated by their
+classification against the original acceptance text, never by the edited text, and are
+never counted as CHANGED. They do not add a gate of their own; they are reported.
+
 **No plan file found:** Skip only the plan completion audit. Continue with Step 8.1, Scope Drift and Prior Learnings; Step 9 QA still runs.
 
-**Include in PR body (Step 19):** Add a \`## Plan Completion\` section with the checklist summary.`;
+**Include in PR body (Step 19):** Add a \`## Plan Completion\` section with the checklist summary, the \`Acceptance edits:\` line and each \`[${ACCEPTANCE_EDITED}]\` item named as a scope change.`;
 }
 
 function planReviewDeliveryIntegrity(): string {
@@ -467,13 +535,13 @@ The plan completion results augment the existing Scope Drift Detection. If a pla
 
 - **NOT DONE items** become additional evidence for **MISSING REQUIREMENTS** in the scope drift report.
 - **Items in the diff that don't match any plan item** become evidence for **SCOPE CREEP** detection.
-- **HIGH-impact plan-file discrepancies** trigger AskUserQuestion:
-  - Show the investigation findings
+- **HIGH-impact plan-file discrepancies** trigger AskUserQuestion showing the investigation findings:
   - Options: A) Stop this review for implementation, B) Continue this review with P1 TODOs, C) Record the items as intentionally dropped
   - A ends this invocation before code review or implementation. List the missing work; after implementation, start a fresh /review.
   - B queues the approved TODO changes for Step 5, not this read-only audit. B/C continue to the final Scope Check and Step 2. None of these choices authorizes shipping or waives required verification.
+  - Spawned or non-interactive: report REQUIREMENTS MISSING, continue; record nothing.
 
-This is **INFORMATIONAL** unless HIGH-impact plan-file discrepancies are found (then it gates via AskUserQuestion).
+Otherwise the audit is **INFORMATIONAL**.
 Discrepancies derived only from fallback sources (commit messages, TODOS.md, PR description) never trigger
 this question, whatever their IMPACT: report them in the Scope Check as lower-confidence missing requirements.
 
@@ -486,9 +554,12 @@ Intent: <from plan file — 1-line summary>
 Plan: <plan file path>
 Delivered: <1-line summary of what the diff actually does>
 Plan items: N DONE, M PARTIAL, K NOT DONE
+${undeclaredBehaviorLines().fields}
 [If NOT DONE: list each missing item with investigation]
 [If scope creep: list each out-of-scope change not in the plan]
 \`\`\`
+
+${undeclaredBehaviorLines().rule}
 
 **No plan file found:** Use commit messages and TODOS.md as fallback sources (see above).
 Emit Step 1.5's Scope Check once without plan fields. If no intent sources exist, state
@@ -529,9 +600,10 @@ export function generatePlanCompletionAuditShip(_ctx: TemplateContext): string {
   return generatePlanCompletionAuditInner('ship');
 }
 
-/** `{{PLAN_COMPLETION_GATE_SHIP:discovery}}` renders the parent-side plan binding that runs before dispatch. */
+/** `{{PLAN_COMPLETION_GATE_SHIP:discovery}}` renders the parent-side plan binding that runs before dispatch; `:acceptance` the parent-side ACCEPTANCE_EDITED check that runs after the child reports. */
 export function generatePlanCompletionGateShip(_ctx: TemplateContext, args?: string[]): string {
   if (args?.includes('discovery')) return generatePlanFileDiscovery(true);
+  if (args?.includes('acceptance')) return planAcceptanceEditedCheck();
   return generatePlanCompletionAuditInner('ship', 'gate');
 }
 

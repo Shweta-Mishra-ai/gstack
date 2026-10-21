@@ -37,7 +37,7 @@ afterAll(() => fs.rmSync(base, { recursive: true, force: true }));
 describe('generator artifact and dry-run contract', () => {
   test('all host artifacts validate, with canonical links and host exclusions', () => {
     expect([...new Set(generated.artifacts.filter(a => a.host).map(a => a.host))].sort()).toEqual([...ALL_HOST_NAMES].sort());
-    expect([...new Set(generated.artifacts.map(a => a.kind))].sort()).toEqual(['asset', 'digest', 'index', 'metadata', 'openclaw', 'section', 'skill']);
+    expect([...new Set(generated.artifacts.map(a => a.kind))].sort()).toEqual(['asset', 'digest', 'doctor-components', 'index', 'metadata', 'openclaw', 'section', 'skill']);
     expect(generated.artifacts.some(a => a.relativePath === 'claude-code/SKILL.md')).toBe(false);
     expect(generated.artifacts.some(a => a.relativePath === '.agents/skills/gstack-claude-code/SKILL.md')).toBe(true);
     expect(generated.artifacts.some(a => a.relativePath === '.agents/skills/gstack-codex/SKILL.md')).toBe(false);
@@ -46,6 +46,7 @@ describe('generator artifact and dry-run contract', () => {
     expect(generated.artifacts.filter(a => a.kind === 'asset').sort((a, b) => a.relativePath.localeCompare(b.relativePath))).toEqual([
       { relativePath: 'review/design-checklist.md', kind: 'asset', host: 'claude' },
       { relativePath: 'lib/dom-dump.js', kind: 'asset', host: 'claude' },
+      { relativePath: 'autoplan/DRIVER.md', kind: 'asset', host: 'claude' },
       ...ALL_HOST_NAMES.filter(host => includesSkill(getHostConfig(host), 'qa')).map(host => ({
         relativePath: host === 'claude' ? 'qa/templates/functional-report-template.md'
           : `${getHostConfig(host).hostSubdir}/skills/gstack-qa/templates/functional-report-template.md`,

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 import * as fs from 'node:fs';
 import { connect } from 'node:net';
 import {
@@ -18,7 +18,7 @@ interface Config {
 }
 function matches(status: number, body: string, oracle: HttpAssertion['expected']): boolean {
   return (
-    status === oracle.status &&
+    (Array.isArray(oracle.status) ? oracle.status.includes(status) : status === oracle.status) &&
     (oracle.includes === undefined || body.includes(oracle.includes)) &&
     (oracle.excludes === undefined || !body.includes(oracle.excludes))
   );

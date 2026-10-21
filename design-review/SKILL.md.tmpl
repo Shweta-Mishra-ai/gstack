@@ -48,9 +48,9 @@ You are a senior product designer AND a frontend engineer. Review live sites wit
 
 **If no URL is given and you're on main/master:** Ask the user for a URL.
 
-**Check for DESIGN.md:**
+**Capture the project's design system:**
 
-Look for `DESIGN.md`, `design-system.md`, or similar in the repo root. If found, read it — all design decisions must be calibrated against it. Deviations from the project's stated design system are higher severity. If not found, use universal design principles and offer to create one from the inferred system.
+Look for `DESIGN.md`, `design-system.md`, or similar in the repo root, then for the tokens the code ships: `:root` CSS custom properties, `tailwind.config.*`, and theme or tokens files. Read what exists; Phase 2 adds what the page renders. All design decisions are calibrated against this system, and deviations from it are higher severity. Use universal design principles only when the project has neither a design doc nor code tokens, and offer to create a DESIGN.md from the inferred system.
 
 {{DESIGN_MD_CHECK:calibrate}}
 
@@ -176,11 +176,17 @@ For each fixable finding, in impact order:
 
 ### 8a.5. Target Mockup (if DESIGN_READY)
 
-If the gstack designer is available and the finding involves visual layout, hierarchy, or spacing (not just a CSS value fix like wrong color or font-size), generate a target mockup showing what the corrected version should look like:
+If the gstack designer is available and the finding involves visual layout, hierarchy, or spacing (not just a CSS value fix like wrong color or font-size), generate a target mockup showing what the corrected version should look like. Write the description of the page or component with the finding fixed into a private file. The brief reuses the captured system verbatim (the same colors, fonts, radii and spacing scale) and changes layout or structure only; never introduce a new palette or typeface for a product that already has one:
+
+{{FREE_TEXT_FILE:BRIEF_FILE=brief}}
+
+Then substitute the printed name for `<brief-file-name>`:
 
 ```bash
-_OUT=$($D generate --brief "<description of the page/component with the finding fixed, referencing DESIGN.md constraints>" --output "$REPORT_DIR/screenshots/finding-NNN-target.png"); _RC=$?
-printf '%s\n' "$_OUT"; echo "EXIT: $_RC"
+BRIEF_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<brief-file-name>"
+[ -s "$BRIEF_FILE" ] || { echo "Not run: $BRIEF_FILE is missing or empty. Write the brief, then rerun this block." >&2; exit 1; }
+_OUT=$($D generate --brief "$(cat "$BRIEF_FILE")" --output "$REPORT_DIR/screenshots/finding-NNN-target.png"); _RC=$?
+printf '%s\n' "$_OUT"; echo "EXIT: $_RC"; [ "$_RC" != 0 ] || rm -f "$BRIEF_FILE"
 ```
 
 Record the printed `outputPath` for this finding (images are never overwritten, so it may be bumped); later steps use that path. Exit 2: no mockup was saved; skip it for this finding.

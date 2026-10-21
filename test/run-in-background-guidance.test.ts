@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { generateCodexPlanReview } from '../scripts/resolvers/outside-voice-steps';
-import { CODEX_MODEL_CONFIG_FLAG } from '../scripts/resolvers/constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from '../scripts/resolvers/constants';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
 import { expectMentions, expectTokens } from './helpers/prompt-structure';
@@ -50,6 +50,8 @@ describe('generated Codex plan-review shell invocation', () => {
     const state = path.join(dir, 'state');
     fs.mkdirSync(state);
     fs.writeFileSync(path.join(state, '.codex-review-notice-shown'), '');
+    fs.writeFileSync(path.join(state, '.model-policy-notice-v1'), '');
+    fs.writeFileSync(path.join(dir, 'auth.json'), '{}');
     const calls = path.join(dir, 'calls');
     const stale = path.join(dir, 'codex-out-foreign');
     const staleError = path.join(dir, 'codex-planreview-foreign');
@@ -67,10 +69,12 @@ printf '%s\\n' "$p"
     // and writes its final message to -o (stdout carries --json events).
     writeBin('codex', `
 [ "$1" = sandbox ] && exit 0
-printf '%s\\n' "$FAKE_REVIEW_ID" >> "$FAKE_CALLS"
+[ "$1" = --version ] && { printf '%s\\n' 'codex-cli 0.160.0'; exit 0; }
 out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+[ -n "$out" ] || { printf '%s\\n' OK; exit 0; }
+printf '%s\\n' "$FAKE_REVIEW_ID" >> "$FAKE_CALLS"
 cat > /dev/null
-printf '%s\\n' "$FAKE_REVIEW_ID: current findings" "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding." > "$out"
+printf '%s\\n' "$FAKE_REVIEW_ID: current findings" "No issues found." "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding." > "$out"
 printf '%s\\n' '{"type":"turn.completed"}'
 printf '%s\\n' "$FAKE_REVIEW_ID: current stderr" >&2
 exit "$FAKE_CODEX_STATUS"
@@ -95,13 +99,13 @@ exec ${quote(Bun.which('cat')!)} "$@"
       }));
     };
     // #2914: the selected model and its source are printed before the paid call.
-    const selected = `CODEX_MODEL: gpt-6-astra (exec; source: gstack default (no ${path.join(dir, 'config.toml')}))\n`;
+    const selected = (cached = false) => `CODEX_MODEL: gpt-6-astra (exec; role: plan-review, tier: frontier; source: gstack catalog frontier/openai (verified 2026-10-07))\nAUTH_OK\nMODEL_OK${cached ? ' (cached)' : ''}\nHINT: If the review rejects the selected model, repair its winning source: gstack-config set model_frontier_openai <model-id>; gstack-config set plan_review_tier smart; gstack-config set plan_review_tier host.\n`;
     return { dir, run, stale, staleError, calls, selected,
       created: () => fs.existsSync(created) ? fs.readFileSync(created, 'utf8').trim().split('\n') : [],
       cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   }
 
-  const findings = (id: string) => `${id}: current findings\nRecommendation: fix ${id} because this is the current finding.\n`;
+  const findings = (id: string) => `${id}: current findings\nNo issues found.\nRecommendation: fix ${id} because this is the current finding.\n`;
   // INV-1: the verdict-form validator prints its verdict before the completed status.
   const unavailable = (id: string) => `${findings(id)}VERDICT: unavailable\nFINDINGS: none\nREASON: execution_failed\n`;
   const completed = (id: string) => `${findings(id)}VERDICT: clean\nFINDINGS: none\nOUTSIDE_STATUS: completed provider=codex host=claude\n`;
@@ -112,7 +116,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const results = f.run('current');
       expect(results.map(result => result.status)).toEqual([0]);
       expect(results[0]!.stdout).toBe(completed('current'));
-      expect(results[0]!.stderr).toBe(`${f.selected}current: current stderr\n`);
+      expect(results[0]!.stderr).toBe(`${f.selected()}current: current stderr\n`);
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
     } finally { f.cleanup(); }
@@ -147,7 +151,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
         const results = f.run(id);
         expect(results.map(result => result.status)).toEqual([0]);
         expect(results[0]!.stdout).toBe(completed(id));
-        expect(results[0]!.stderr).toBe(`${f.selected}${id}: current stderr\n`);
+        expect(results[0]!.stderr).toBe(`${f.selected(id === 'second')}${id}: current stderr\n`);
       }
       expect(new Set(f.created()).size).toBe(2);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -180,14 +184,17 @@ function boundedOutsideVoice(content: string): string {
   return content.match(/\*\*Bounded outside-voice wait[\s\S]*?(?=\*\*(?:Integrate reviewer findings|Cross-model tension):\*\*)/)?.[0] ?? '';
 }
 function hasBoundedOutsideVoiceWait(content: string): boolean {
-  const fallback = boundedOutsideVoice(content);
-  return ['Bounded outside-voice wait', 'subagent_type: "Plan"', 'run_in_background: true',
-    'Immediately call TaskOutput', 'block: true', 'timeout: 300000', 'Make one wait only',
-    '`<retrieval_status>` must be `success`', '`<task_id>` must match', '`<task_type>` must be `local_agent`',
-    '`<status>`\n   must be `completed`', '`<output>` must be nonempty', 'must be no outer\n   `<error>`',
+  // #3182: Claude Code 2.1.277 removed TaskOutput. The deadline is a background
+  // timer the host reports when it exits; TaskStop ends whichever task lost.
+  const fallback = boundedOutsideVoice(content).replace(/\s+/g, ' ');
+  return ['Bounded outside-voice wait', '`command: "sleep 300"`', 'subagent_type: "Plan"', 'run_in_background: true',
+    'End your turn and wait for task notifications', 'Make one wait only',
+    '`<task-notification>`', '`<task-id>` must match the agent ID', '`<status>` must be `completed`',
+    'is waiting on its own background work', 'must be nonempty',
     'identifiable complete', 'Reject raw or in-progress transcripts',
-    'call TaskStop with the same ID', 'Ignore partial or late results',
+    'call TaskStop with the timer', 'TaskStop with the same ID', 'Ignore partial or late results',
     'STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"'].every(part => fallback.includes(part))
+    && !fallback.includes('TaskOutput')
     && /Skip (?:Integrate reviewer findings and )?Cross-model tension\. Persist an unavailable result/.test(fallback);
 }
 
@@ -226,22 +233,23 @@ describe('outside-voice dispatch contract', () => {
     expect(prompt).toContain('explicit user approval');
   });
 
-  test('fallback uses one exact-ID wait and explicit cancellation without a model override', () => {
+  test('fallback uses one host-timed wait and explicit cancellation without a model override', () => {
     expect(hasBoundedOutsideVoiceWait(rendered)).toBe(true);
-    expectMentions(fallback, [['before', 'taskoutput', 'dispatch']], 'fallback');
+    expectMentions(fallback, [['before', 'taskstop', 'dispatch']], 'fallback');
     expectMentions(fallback, [['without', 'unavailable', 'launching']], 'fallback');
     expect(fallback).toContain('Do not set a model\noverride');
-    expectMentions(fallback, [['wait', 'dispatch/cancellation', 'five-minute']], 'fallback');
-    expectTokens(fallback, ['`agentId`'], 'fallback');
+    expectMentions(fallback, [['five-minute', 'host timer']], 'fallback');
+    expect(fallback).toContain('Keep the returned agent ID');
     expectMentions(fallback, [['do not', 'returned', 'launch']], 'fallback');
-    expectMentions(fallback, [['does not', 'taskoutput', 'timeout']], 'fallback');
+    expectMentions(fallback, [['report directly', 'no enforced deadline', 'no credit']], 'fallback');
+    expect(fallback).not.toContain('TaskOutput');
     expect(fallback).not.toContain('allowed_tools');
     expect(fallback).not.toContain('run_in_background: false');
   });
 
   test('only the matching completed final report can enter agreement and persistence', () => {
-    for (const guard of ['<retrieval_status>', '<task_id>', '<task_type>', 'local_agent', '<status>', 'completed',
-      '<output>', 'nonempty', 'no outer', '<error>', 'identifiable complete',
+    for (const guard of ['<task-notification>', '<task-id>', 'must match the agent ID', '<status>', 'completed',
+      '<summary>', '<result>', 'nonempty', 'is waiting on its own background', 'turn limit', 'identifiable',
       'Reject raw or in-progress transcripts', 'do not extract\n   finding fragments from them']) expect(fallback).toContain(guard);
     expectMentions(fallback, [['do not', 'completeness', 'establish']], 'fallback');
     expect(fallback).not.toContain('isRawTranscript');
@@ -258,28 +266,29 @@ describe('outside-voice dispatch contract', () => {
     const apply = rendered.indexOf('**4. Apply the answered row.**');
     expect(answer).toBeGreaterThan(0);
     expect(apply).toBeGreaterThan(answer);
-    // B1: the sandbox comes from _gstack_codex_select_model (read-only unless GSTACK_CODEX_NO_SANDBOX=1).
-    expect(rendered).toContain(`-s "\${_GSTACK_CODEX_SANDBOX:?}" ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="high"'`);
+    // B1: the sandbox comes from the probe's select-model (read-only unless GSTACK_CODEX_NO_SANDBOX=1).
+    expect(rendered).toContain(`run-with-timeout --effort high `);
+    expect(rendered).toContain(`-s "\${_CODEX_SANDBOX_MODE:?}" ${CODEX_MODEL_CONFIG_FLAG} ${CODEX_WEB_SEARCH_FLAG}`);
   });
 
   test('the generated-carrier exception rejects missing wait, cancellation or result guards', () => {
     expect(hasBoundedOutsideVoiceWait(rendered)).toBe(true);
-    for (const guard of ['subagent_type: "Plan"', 'timeout: 300000', 'call TaskStop with the same ID',
-      '<status>', '<output>', 'Reject raw or in-progress transcripts',
+    for (const guard of ['subagent_type: "Plan"', 'sleep 300', 'TaskStop with the same ID', 'call TaskStop with the timer',
+      '<status>', '<task-notification>', 'Reject raw or in-progress transcripts',
       'Ignore partial or late results', 'Skip Cross-model tension. Persist an unavailable result',
       'STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"']) {
       expect(hasBoundedOutsideVoiceWait(rendered.replaceAll(guard, 'missing guard')), guard).toBe(false);
     }
     expect(hasBoundedOutsideVoiceWait('Dispatch via the Agent tool with run_in_background: true')).toBe(false);
+    expect(hasBoundedOutsideVoiceWait(rendered.replace('Make one wait only', 'Make one wait only with TaskOutput'))).toBe(false);
   });
 
   test('expanded Codex availability states preserve the same bounded dispatch guards', () => {
-    const earlier = rendered.replaceAll('broken_install', 'not_installed')
-      .replaceAll('model_unusable', 'not_authed');
-    expect(earlier).not.toBe(rendered);
-    for (const content of [earlier, rendered]) {
+    const expanded = rendered.replace('**If `CODEX_MODE: ready`', '**If `CODEX_MODE: ready` or `unverified (rate_limited)`');
+    expect(expanded).not.toBe(rendered);
+    for (const content of [rendered, expanded]) {
       expect(hasBoundedOutsideVoiceWait(content)).toBe(true);
-      expect(hasBoundedOutsideVoiceWait(content.replace('call TaskStop with the same ID', 'missing cancellation'))).toBe(false);
+      expect(hasBoundedOutsideVoiceWait(content.replace('TaskStop with the same ID', 'missing cancellation'))).toBe(false);
     }
   });
 

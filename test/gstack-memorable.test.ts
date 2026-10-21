@@ -79,6 +79,17 @@ describe('enable', () => {
     }
   });
 
+  test('a per-session CLAUDE_CONFIG_DIR linking back to ~/.claude registers the $HOME path, which outlives the session (#3180)', () => {
+    const session = path.join(home, 'session-1234');
+    fs.mkdirSync(session);
+    fs.symlinkSync(path.join(home, '.claude', 'skills'), path.join(session, 'skills'));
+    const r = run(['enable'], { CLAUDE_CONFIG_DIR: session });
+    expect(r.status).toBe(0);
+    expect(commands()).toEqual([`${canonical}/${HOOK_REL}`]);
+    fs.rmSync(session, { recursive: true, force: true });
+    expect(fs.existsSync(commands()[0])).toBe(true);
+  });
+
   test('twice: unchanged, one entry; over a stale worktree path: re-pointed', () => {
     expect(run(['enable']).stdout).toContain('registered');
     const again = run(['enable']);

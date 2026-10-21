@@ -1,4 +1,5 @@
 import type { TemplateContext } from '../types';
+import { getHostConfig } from '../../../hosts/index';
 
 /**
  * Plan-mode-skill semantics block.
@@ -18,8 +19,13 @@ import type { TemplateContext } from '../types';
  * any plan-mode-aware telemetry) and before generateUpgradeCheck + onboarding
  * gates. See ceo-plan 2026-04-24 "remove vestigial plan-mode handshake" for
  * the full rationale.
+ *
+ * Hosts whose capabilities declare planMode:false have no plan mode to be in,
+ * so the section renders empty for them (#3168).
  */
 export function generatePlanModeInfo(ctx: TemplateContext): string {
+  if (!getHostConfig(ctx.host).capabilities.planMode) return '';
+  if (ctx.planMode === false) return '';
   const entryOrder = ctx.skillName === 'plan-eng-review'
     ? 'starting from the Scope gate, then follow its Startup sequence'
     : 'starting from the Scope gate (current target announcement or answered question), then preamble and Step 0';
@@ -39,7 +45,7 @@ export function generateCompletionStatus(ctx: TemplateContext): string {
   return `## Completion Status Protocol
 
 When completing a skill workflow, report status using one of:
-- **DONE** — completed with evidence.
+- **DONE** — completed with evidence valid for the final consumed inputs; name reuse and anything not independently verified.
 - **DONE_WITH_CONCERNS** — completed, but list concerns.
 - **BLOCKED** — cannot proceed; state blocker and what was tried.
 - **NEEDS_CONTEXT** — missing info; state exactly what is needed.

@@ -6,26 +6,18 @@
  * 1. `new URL(import.meta.url).pathname` yields `/C:/Users/...`; path.resolve
  *    then rebases it onto the drive root as `C:\C:\Users\...`. fileURLToPath
  *    is the correct conversion. (ENOENT before the bin ever ran.)
- * 2. `bin/gstack-*` are extensionless bash scripts. Windows has no shebang
- *    support, so they must be handed to bash explicitly.
+ * 2. `bin/gstack-*` are extensionless shebang scripts. Windows has no shebang
+ *    support, so lib/script-invocation.ts hands them to Git Bash (or Bun).
  *
  * Also home to runExternal: the contained runner for EXTERNAL executables
  * (third-party binaries a hook hands data to; see its doc comment). Unlike
  * runBin it refuses win32, because its guarantee is process-group containment.
  */
-import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn, spawnSync, type SpawnSyncOptions } from 'child_process';
-
-// Forward slashes on purpose: Bun's spawnSync on Windows returns ENOENT for a
-// backslash exe path containing spaces.
-const GIT_BASH = 'C:/Program Files/Git/bin/bash.exe';
-
-/** bash Windows itself can execute — env override, Git Bash, then PATH. */
-function bashExe(): string {
-  return process.env.GSTACK_BASH || (fs.existsSync(GIT_BASH) ? GIT_BASH : 'bash');
-}
+import { spawn, type SpawnSyncOptions } from 'child_process';
+import { resolveWindowsBashCached, runScriptSync } from '../../../lib/script-invocation';
+import { resolveStateRoot } from '../../../lib/state-root';
 
 /** gstack install root. This file lives at hosts/claude/hooks/. */
 export function repoRoot(): string {
@@ -38,12 +30,15 @@ export function binPath(name: string): string {
   return path.join(repoRoot(), 'bin', name);
 }
 
-/** Resolve `name` under bin/ and run it, via bash on Windows. */
+/**
+ * Resolve `name` under bin/ and run it through lib/script-invocation.ts. On
+ * Windows the Git Bash resolution is cached in the state root (keyed by the
+ * git.exe path and mtime), so a hook spawns nothing extra on the hot path.
+ */
 export function runBin(name: string, args: string[], opts: SpawnSyncOptions) {
-  const bin = binPath(name);
-  return process.platform === 'win32'
-    ? spawnSync(bashExe(), [bin, ...args], opts)
-    : spawnSync(bin, args, opts);
+  return runScriptSync(binPath(name), args, opts, {
+    resolve: () => resolveWindowsBashCached(path.join(resolveStateRoot(), 'cache', 'windows-bash.json')),
+  });
 }
 
 /** Kept tail of the child's stderr, for the caller's error log. */

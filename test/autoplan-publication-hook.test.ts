@@ -1,12 +1,26 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { runPublicationHook } from '../autoplan/bin/phase-publication-hook.ts';
+import { OWNED_READ_APPROVAL } from '../autoplan/bin/owned-read';
 
 const ROOT = path.join(import.meta.dir, '..');
+// Every guarded decision appends to the guard log; keep it out of the real state root.
+let previousGstackHome: string | undefined;
+let guardLogHome = '';
+beforeAll(() => {
+  previousGstackHome = process.env.GSTACK_HOME;
+  guardLogHome = fs.mkdtempSync(path.join(tmpdir(), 'autoplan-guard-log-'));
+  process.env.GSTACK_HOME = guardLogHome;
+});
+afterAll(() => {
+  if (previousGstackHome === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = previousGstackHome;
+  fs.rmSync(guardLogHome, { recursive: true, force: true });
+});
 const SHIM = path.join(ROOT, 'autoplan/bin/phase-publication-hook');
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -21,9 +35,11 @@ function run(bytes: string, shim = SHIM, env = process.env) {
 }
 
 describe('Autoplan hook transport', () => {
-  test('ordinary project and non-Read tools abstain without a parent journal', () => {
+  test('ordinary project files and non-Read tools abstain without a parent journal; the close section is approved', () => {
     expect(run(JSON.stringify({ ...input, tool_name: 'Bash' })).output).toEqual({});
-    expect(run(JSON.stringify({ ...input, tool_input: { file_path: path.join(ROOT, 'autoplan/sections/phase-close.md') } })).output).toEqual({});
+    expect(run(JSON.stringify({ ...input, tool_input: { file_path: path.join(ROOT, 'package.json') } })).output).toEqual({});
+    expect(run(JSON.stringify({ ...input, tool_input: { file_path: path.join(ROOT, 'autoplan/sections/phase-close.md') } })).output)
+      .toEqual(OWNED_READ_APPROVAL);
   });
   test('invalid input fails closed with one nested native denial', () => {
     const { child, output } = run('{'); expect(child.status).toBe(0);
@@ -83,7 +99,7 @@ describe('Autoplan hook journal-root verdicts', () => {
     fs.writeFileSync(file, rows.map(r => JSON.stringify(r)).join('\n') + '\n' + (partial ? '{"type":"assistant"' : ''));
     const value = { hook_event_name: 'PreToolUse', session_id: sessionId, cwd, transcript_path: file,
       tool_name: 'Read', tool_use_id: 'toolu_current', tool_input: { file_path: entry } };
-    const env = { CLAUDE_PROJECT_DIR: cwd, GSTACK_HOME: home };
+    const env = { CLAUDE_PROJECT_DIR: cwd, GSTACK_HOME: home, GSTACK_STATE_ROOT: home };
     const log = path.join(home, 'analytics', 'autoplan-guard.jsonl');
     async function hookRun(overrides: Record<string, string> = {}): Promise<any> {
       const previous = Object.fromEntries(Object.keys({ ...env, ...overrides }).map(k => [k, process.env[k]]));
@@ -105,8 +121,8 @@ describe('Autoplan hook journal-root verdicts', () => {
     expect(output.hookSpecificOutput.additionalContext).toContain('NOT verified');
     const records = fs.readFileSync(s.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(records).toHaveLength(1);
-    expect(records[0]).toMatchObject({ event: 'unverified_phase_entry', reason: 'unrecognized_shape:preamble:system:local_command',
-      claude_code_version: '2.1.284', record_types: ['system:local_command', 'user'] });
+    expect(records[0]).toMatchObject({ schema: 1, decision: 'allow', disposition: 'unverified', code: 'unrecognized_shape:preamble:system:local_command',
+      path: 'none', claude_code_version: '2.1.284', record_types: ['system:local_command', 'user'] });
     expect(fs.readFileSync(s.log, 'utf8')).not.toContain('Secret plan text');
   });
 
@@ -118,16 +134,19 @@ describe('Autoplan hook journal-root verdicts', () => {
     expect(output.systemMessage).toContain('NOT verified');
   });
 
-  for (const [label, options] of [['the current tool_use is missing', { current: false }],
-    ['a record is still being written', { partial: true }]] as const)
-    test(`no advisory when ${label}: deny and retry`, async () => {
-      const s = session('unknown', options);
-      const output = await s.hookRun();
-      expect(output.hookSpecificOutput.permissionDecision).toBe('deny');
-      expect(output.hookSpecificOutput.permissionDecisionReason).toContain('no missing-publication conclusion');
-      expect(output.hookSpecificOutput.permissionDecisionReason).toContain('code unrecognized_shape:preamble:system:local_command');
-      expect(fs.existsSync(s.log)).toBe(false);
-    });
+  test('UC1: an unrecognized shape is unverified even before Claude Code journals the current call', async () => {
+    const s = session('unknown', { current: false });
+    const output = await s.hookRun();
+    expect(output.hookSpecificOutput.permissionDecision).toBeUndefined();
+    expect(output.systemMessage).toContain('code unrecognized_shape:preamble:system:local_command');
+  });
+  test('CEO-2: a record still being written is ignored, so the complete unrecognized shape is the advisory', async () => {
+    const s = session('unknown', { partial: true });
+    const output = await s.hookRun();
+    expect(output.hookSpecificOutput.permissionDecision).toBeUndefined();
+    expect(output.systemMessage).toContain('code unrecognized_shape:preamble:system:local_command');
+    expect(output.systemMessage).not.toContain('Wait for the current response to finish');
+  });
 
   for (const code of ['competing_root', 'foreign_cwd', 'sidechain', 'agent', 'cycle'] as const)
     test(`${code} is a hard denial naming the code, version, fallback and guide`, async () => {
@@ -140,7 +159,8 @@ describe('Autoplan hook journal-root verdicts', () => {
       expect(reason).toContain('/plan-ceo-review, then /plan-devex-review, then /plan-eng-review');
       expect(reason).toContain('docs/autoplan-guard-troubleshooting.md');
       expect(reason).not.toContain('no missing-publication conclusion');
-      expect(fs.existsSync(s.log)).toBe(false);
+      const records = fs.readFileSync(s.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(records).toEqual([expect.objectContaining({ decision: 'deny', disposition: 'fallback', code, path: 'none' })]);
     });
 
   test('a real 2.1.284 SessionStart journal is owned and reaches publication evaluation', async () => {

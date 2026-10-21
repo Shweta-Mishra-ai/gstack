@@ -1,6 +1,8 @@
 name: E2E Evals
 # eval-bg (scripts/eval-bg.ts) finds its dispatch by the nonce in the run name (ENG-12).
-run-name: ${{ inputs.nonce != '' && format('E2E Evals [eval-bg {0}]', inputs.nonce) || '' }}
+# A dispatched screen's name also ends ` screen #<pr>`, which recover-receipts and
+# gate-reuse filter on to list a PR's screens beside its pull_request runs.
+run-name: "${{ inputs.nonce != '' && format('E2E Evals [eval-bg {0}]{1}', inputs.nonce, inputs.screen_pr != '' && format(' screen #{0}', inputs.screen_pr) || '') || '' }}"
 on:
   pull_request:
     branches: [main]
@@ -30,9 +32,33 @@ on:
         description: 'Same-repo PR number whose receipt store this run reads read-only (never saves); empty = fresh'
         type: string
         default: ''
+      # Merge trains (docs/ship-policy.md#run-a-merge-train): only under a train
+      # block in the default branch's .gstack/ship-policy.json. The route job
+      # validates them before any paid work (scripts/train-gate.ts route).
+      cases:
+        description: 'Train bisect: comma-separated case ids from the full gate plan (gstack-ship-queue train bisect sets it)'
+        type: string
+        default: ''
+      prefix_shas:
+        description: 'Train bisect: comma-separated prefix commits, each an ancestor of the train head on train/<nonce>'
+        type: string
+        default: ''
+      screen_pr:
+        description: 'Dispatched screen: the same-repo PR number (gstack-ship-queue ready --screen sets it)'
+        type: string
+        default: ''
+      screen_merge_sha:
+        description: "Dispatched screen: the PR's refs/pull/<n>/merge commit to check out and test"
+        type: string
+        default: ''
+      screen_policy:
+        description: 'Dispatched screen: narrow or broad (a broad screen never adopts a narrow run)'
+        type: string
+        default: ''
 
+# A dispatched screen is keyed on its PR, so a newer head's screen cancels the older one.
 concurrency:
-  group: evals-${{ github.event.pull_request.number || github.run_id }}
+  group: evals-${{ github.event.pull_request.number || (inputs.screen_pr != '' && format('screen-{0}', inputs.screen_pr)) || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -95,10 +121,10 @@ jobs:
       # Registry cache export needs a docker-container builder — the default
       # `docker` driver hard-errors on cache-to (first live run of the trio).
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
@@ -120,47 +146,198 @@ jobs:
           docker manifest inspect "$EVAL_IMAGE" > /tmp/eval-runtime-manifest.json
           echo "id=$(sha256sum /tmp/eval-runtime-manifest.json | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
 
-  # ── Push-burst debounce (W1d: CEO-15, ENG-11, DX-7) ──────────────────────
-  # Only on `synchronize` when another evals.yml run for this PR started in
-  # the last 15 minutes (a push burst): wait 90 s before planning, so the next
-  # push's cancel-in-progress lands before any paid slice starts. A first push
-  # pays nothing. cancel-in-progress does the superseding; the head-SHA check
-  # only reports "superseded by <sha>" when this run outlives the wait. The PR
-  # label evals-no-debounce skips the wait.
-  debounce:
+  # ── Route (merge trains, GSTA-49 T1b; docs/ship-policy.md#run-a-merge-train)
+  # Names the run's mode before any paid work, from the train policy of the
+  # base revision (the PR's base commit, or the default branch for a
+  # dispatch). Without a `train` block every run routes as before: a
+  # pull_request run is `pr`, a dispatch is `dispatch`, and no other job
+  # changes. Under a train block a PR push is `pr-summary` (screen-summary
+  # prints the screening selection and its estimated cost; no paid slice
+  # starts), and gstack-ship-queue's dispatches are `screen`, `train` or
+  # `bisect` once scripts/train-gate.ts has validated their inputs. A refused
+  # dispatch fails here, before any paid work.
+  route:
     runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'evals-no-debounce')
-    timeout-minutes: 5
+    if: github.actor != 'dependabot[bot]'
+    timeout-minutes: 30
     permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.route.outputs.mode }}
+      record_artifact: ${{ steps.policy.outputs.record_artifact }}
+      full_gate_check: ${{ steps.policy.outputs.full_gate_check }}
+      screen_head: ${{ steps.screen.outputs.head_sha }}
+      screen_base: ${{ steps.screen.outputs.base_sha }}
+      screen_branch: ${{ steps.screen.outputs.head_branch }}
+      superseded: ${{ steps.screen.outputs.superseded }}
+      bisect_slices: ${{ steps.bisect.outputs.slices }}
+      bisect_timeouts: ${{ steps.bisect.outputs.slice_timeouts }}
+      bisect_refs: ${{ steps.bisect.outputs.prefix_refs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      # Read with git and jq only: no repository code decides whether PR pushes start paid work.
+      - name: Read the train policy (base revision)
+        id: policy
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          base="${BASE_SHA:-origin/${DEFAULT_BRANCH}}"
+          train=$(git show "${base}:.gstack/ship-policy.json" 2>/dev/null | jq -c 'if (.train | type) == "object" then .train else null end' 2>/dev/null || true)
+          artifact=$(jq -r '.record_artifact // ""' <<<"${train:-null}" 2>/dev/null || true)
+          check=$(jq -r '.full_gate_check // ""' <<<"${train:-null}" 2>/dev/null || true)
+          if [ -z "$train" ] || [ "$train" = null ]; then
+            echo "train=false" >> "$GITHUB_OUTPUT"
+            echo "- Train policy: none at ${base}; this run routes as before" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$artifact" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] && [[ "$check" =~ ^[A-Za-z0-9_./-]{1,64}$ ]]; then
+            { echo "train=true"; echo "record_artifact=${artifact}"; echo "full_gate_check=${check}"; } >> "$GITHUB_OUTPUT"
+            echo "- Train policy: declared at ${base} (record artifact ${artifact}, check ${check})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "train=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the train block at ${base} names no valid record_artifact and full_gate_check; this run routes as before"
+          fi
+
+      - name: Route this run
+        id: route
+        env:
+          TRAIN_POLICY: ${{ steps.policy.outputs.train }}
+          NONCE: ${{ inputs.nonce }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EVALS_ALL: ${{ inputs.evals_all }}
+          CASES: ${{ inputs.cases }}
+          PREFIX_SHAS: ${{ inputs.prefix_shas }}
+          SCREEN_PR: ${{ inputs.screen_pr }}
+          SCREEN_MERGE_SHA: ${{ inputs.screen_merge_sha }}
+          SCREEN_POLICY: ${{ inputs.screen_policy }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            mode='pr'
+            if [ "$TRAIN_POLICY" = true ]; then mode=pr-summary; fi
+            echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+            echo "- Run mode: ${mode}" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f scripts/train-gate.ts ]; then
+            bun --no-env-file --config=/dev/null --no-install run scripts/train-gate.ts route --github-output "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "${CASES}${PREFIX_SHAS}${SCREEN_PR}${SCREEN_MERGE_SHA}${SCREEN_POLICY}" ]; then
+            echo "::error::${GITHUB_REF_NAME} has no scripts/train-gate.ts to validate the train or screen inputs; dispatch from a ref that has it"
+            exit 1
+          else
+            echo "mode=dispatch" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The screen's merge commit must merge the PR's current head into its
+      # base, and Free Tests must be green on that head (base-branch code: a
+      # screen dispatches on the default branch). No quiet window: a screen is
+      # an explicit request. A moved PR head reports superseded and plans nothing.
+      - name: Check the screen's PR head (Free Tests)
+        id: screen
+        if: steps.route.outputs.mode == 'screen'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCREEN_PR: ${{ inputs.screen_pr }}
+          SCREEN_MERGE_SHA: ${{ inputs.screen_merge_sha }}
+        run: |
+          bun --no-install run scripts/eval-readiness.ts wait --repo "$GITHUB_REPOSITORY" --pr "$SCREEN_PR" --merge-sha "$SCREEN_MERGE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --quiet-minutes 0 --deadline-minutes 20 \
+            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Plan the bisect (one executor per prefix)
+        id: bisect
+        if: steps.route.outputs.mode == 'bisect'
+        env:
+          CASES: ${{ steps.route.outputs.cases }}
+          PREFIXES: ${{ steps.route.outputs.prefixes }}
+          NONCE: ${{ inputs.nonce }}
+        run: |
+          bun --no-env-file --config=/dev/null --no-install run scripts/train-gate.ts bisect-plan --cases "$CASES" --prefixes "$PREFIXES" --nonce "$NONCE" \
+            --out /tmp/train-bisect/bisect.json --github-output "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the bisect plan to its executors
+        if: steps.route.outputs.mode == 'bisect'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: train-bisect-plan
+          path: /tmp/train-bisect/bisect.json
+          retention-days: 30
+
+  # ── Readiness-gated dispatch (R1, GSTA-48) ───────────────────────────────
+  # Paid slices for a PR head start only after the PR has been quiet for the
+  # window (vars.EVALS_QUIET_MINUTES, default 10; the evals-no-debounce label
+  # sets it to 0) and Free Tests has passed on the same head SHA. A newer push
+  # still cancels this run (cancel-in-progress), so the window is a sleep; the
+  # same heads get the same selection and verdict rules, only the start moves.
+  # Free Tests red on this head fails the run without paid work (re-run this
+  # workflow after a green Free Tests rerun). Dispatches never wait: they are
+  # explicit (eval:bg, census). Version Gate is not an input, so a stamp push
+  # waits for its own Free Tests only and always gets its gate.
+  readiness:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 90
+    permissions:
+      contents: read
       actions: read
       pull-requests: read
     outputs:
       superseded: ${{ steps.wait.outputs.superseded }}
     steps:
-      - name: Wait out a push burst
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Wait for a quiet PR and green Free Tests on this head
         id: wait
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          QUIET_MINUTES: ${{ contains(github.event.pull_request.labels.*.name, 'evals-no-debounce') && '0' || vars.EVALS_QUIET_MINUTES || '10' }}
         run: |
-          since=$(date -u -d '15 minutes ago' +%s)
-          recent=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/evals.yml/runs" -f event=pull_request \
-            -f branch="$HEAD_BRANCH" -f per_page=20 \
-            --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and any(.pull_requests[]; .number == $PR_NUMBER) and ((.created_at | fromdateiso8601) >= $since))] | length" \
-            2>/dev/null || echo 0)
-          if [ "${recent:-0}" -eq 0 ]; then
-            echo "- Debounce: no other run for this PR in the last 15 min; no wait" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "- Debounce: ${recent} run(s) for this PR started in the last 15 min; waiting 90 s (label evals-no-debounce skips this)" >> "$GITHUB_STEP_SUMMARY"
-          sleep 90
-          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha 2>/dev/null || echo "$HEAD_SHA")
-          if [ "$head" != "$HEAD_SHA" ]; then
-            echo "superseded=true" >> "$GITHUB_OUTPUT"
-            echo "- Debounce: superseded by ${head}; this run plans no slices" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bun --no-install run scripts/eval-readiness.ts wait --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" \
+            --run-id "$GITHUB_RUN_ID" --quiet-minutes "$QUIET_MINUTES" --deadline-minutes 80 \
+            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
+  # GSTA-48 P3-1: a head the readiness job blocked runs no gate, so the PR's
+  # last "## E2E Evals" comment would still show an older head's verdict.
+  # Replace it (never post a new one) with what happened to this head. Runs no
+  # repository code.
+  readiness-comment:
+    runs-on: ubuntu-24.04
+    needs: [readiness]
+    if: ${{ !cancelled() && needs.readiness.result == 'failure' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Replace a stale verdict comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          COMMENT_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("## E2E Evals")) | .id' | tail -1)
+          if [ -z "$COMMENT_ID" ]; then exit 0; fi
+          BODY="## E2E Evals: ⛔ NOT RUN on \`${HEAD_SHA}\`
+
+          The readiness job blocked this head (Free Tests did not pass on it, or did not finish within the readiness deadline), so no paid gate ran and no verdict covers it. An earlier verdict in this comment belonged to an older head.
+
+          Details: [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}). Fix and push, or re-run Free Tests and then re-run this workflow."
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" -X PATCH -f body="$BODY"
 
   # ── Receipt recovery (W1c: CEO-14/34, ENG-4/5/7) ─────────────────────────
   # A run cancelled by the next push never reaches slices-report, so its
@@ -175,10 +352,11 @@ jobs:
   # plan-slices turns reuse off, so cases execute unreduced.
   recover-receipts:
     runs-on: ubuntu-24.04
-    needs: [debounce]
-    # Runs after the debounce settles, so a superseded run's cancellation has usually completed.
+    needs: [readiness, route]
+    # Runs after readiness settles, so a superseded run's cancellation has usually completed; a head whose Free Tests failed recovers nothing.
     # A dispatch naming pr_receipts reads that PR's receipts from its runs' artifacts (cache entries are ref-scoped).
-    if: ${{ !cancelled() && needs.debounce.outputs.superseded != 'true' && github.actor != 'dependabot[bot]' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'evals-fresh')) || (github.event_name == 'workflow_dispatch' && inputs.pr_receipts != '')) }}
+    # A dispatched screen only looks for a gate verdict to reuse (R2a/R2); a PR push under a train policy (pr-summary) skips this job.
+    if: ${{ !cancelled() && (needs.readiness.result == 'success' || needs.readiness.result == 'skipped') && needs.readiness.outputs.superseded != 'true' && needs.route.result == 'success' && needs.route.outputs.superseded != 'true' && github.actor != 'dependabot[bot]' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.route.outputs.mode == 'pr' && !contains(github.event.pull_request.labels.*.name, 'evals-fresh')) || (github.event_name == 'workflow_dispatch' && inputs.pr_receipts != '') || needs.route.outputs.mode == 'screen') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -186,12 +364,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha || inputs.base_sha || github.event.repository.default_branch }}
+          ref: ${{ github.event.pull_request.base.sha || needs.route.outputs.screen_base || inputs.base_sha || github.event.repository.default_branch }}
           persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - name: Restore this PR's verified judge and E2E results
         id: store
@@ -203,6 +381,7 @@ jobs:
           restore-keys: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
 
       - name: Recover receipts of cancelled runs (base-ref code)
+        if: needs.route.outputs.mode != 'screen'
         env:
           GH_TOKEN: ${{ github.token }}
           STORE_KEY: ${{ steps.store.outputs.cache-matched-key }}
@@ -221,13 +400,85 @@ jobs:
             --store /tmp/gstack-eval-input-cache --store-key "$STORE_KEY" --mode "$RECOVERY_MODE" --budget-seconds 60 >> "$GITHUB_STEP_SUMMARY" \
             || echo "- Receipt recovery crashed; reuse stays off this run" >> "$GITHUB_STEP_SUMMARY"
 
+      # Verdict reuse (GSTA-48), a gate edit: base-ref code proposes reusing
+      # the newest executed GREEN gate of this PR when this head differs from
+      # it only by stamp files on the same base (R2a: TREE same-modulo-stamps
+      # from the tree receipt under the base's ship policy), or when main
+      # moved and the PR's own diff from its merge-base, stamp files excluded,
+      # is byte-identical (R2). plan-slices confirms the selection is
+      # identical. Anything else (a red, partial or cancelled gate, a changed
+      # own diff, a non-stamp byte, no binding or receipt, a gh or git error,
+      # evals-fresh) leaves no candidate: the full gate runs.
+      # A dispatched screen (GSTA-49 T1b) finds the same way, authenticated by
+      # PR number, head, repository and tested base (its merge commit's first
+      # parent), listing the PR's pull_request runs and earlier screens; a
+      # broad screen never adopts a narrow run.
+      - name: Find a gate verdict to reuse (R2a/R2, base-ref code)
+        if: github.event_name == 'pull_request' || needs.route.outputs.mode == 'screen'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.screen_pr }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref || needs.route.outputs.screen_branch }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.route.outputs.screen_head }}
+          TESTED_SHA: ${{ inputs.screen_merge_sha || github.sha }}
+          SCREEN_POLICY: ${{ inputs.screen_policy }}
+        run: |
+          if [ ! -f scripts/gate-reuse.ts ]; then
+            echo "- Gate verdict reuse unavailable: the base ref has no scripts/gate-reuse.ts; the full gate runs" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          bun --no-install run scripts/gate-reuse.ts find --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head-repo "$HEAD_REPO" \
+            --branch "$HEAD_BRANCH" --run-id "$GITHUB_RUN_ID" --head-sha "$HEAD_SHA" --tested-sha "$TESTED_SHA" \
+            ${SCREEN_POLICY:+--screen-policy "$SCREEN_POLICY"} --out /tmp/gate-reuse --budget-seconds 90 >> "$GITHUB_STEP_SUMMARY" \
+            || echo "- Gate verdict reuse crashed; the full gate runs" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand a gate reuse candidate to plan-slices
+        if: github.event_name == 'pull_request' || needs.route.outputs.mode == 'screen'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gate-reuse-candidate
+          path: /tmp/gate-reuse
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Hand the receipt store to plan-slices
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: receipt-store
           path: /tmp/gstack-eval-input-cache
           if-no-files-found: ignore
           retention-days: 7
+
+  # ── PR push under a train policy (GSTA-49 T1b, a gate edit) ─────────────
+  # Only when the base revision declares a `train` block: the push starts no
+  # paid slice. This job prints how to request the paid screen, the
+  # screening selection and its estimated cost, for free; the train's full
+  # gate covers every merge. Without a train block it never runs.
+  screen-summary:
+    runs-on: ubuntu-24.04
+    needs: [route]
+    if: needs.route.outputs.mode == 'pr-summary' && github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Print the screening selection and its estimated cost (no paid case runs)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slices 1
+          bun --no-env-file --config=/dev/null --no-install run scripts/train-gate.ts screen-summary /tmp/paid-plan/manifest.json --pr "$PR_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          bun --no-install run scripts/test-pr-profile.ts summary /tmp/paid-plan/manifest.json >> "$GITHUB_STEP_SUMMARY"
 
   # ── Sliced lane (the ONLY paid lane; legacy 17-row matrix deleted) ──────────
   # One PLANNER computes diff selection + the slice plan ONCE (killing
@@ -248,18 +499,27 @@ jobs:
   # branch (see CLAUDE.md's garrytan-agents workflow).
   plan-slices:
     runs-on: ubicloud-standard-8
-    needs: [debounce, recover-receipts]
-    # !cancelled(): plans even when the debounce or recovery was skipped (first push, dispatch, evals-fresh) or recovery failed (reuse is then off); a superseded run plans nothing.
-    if: ${{ !cancelled() && needs.debounce.outputs.superseded != 'true' && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: [readiness, recover-receipts, route]
+    # !cancelled(): plans even when readiness or recovery was skipped (dispatch, evals-fresh) or recovery failed (reuse is then off); a superseded run, or a head whose readiness failed (Free Tests red), plans nothing.
+    # The route job must have named a planned mode: pr-summary (a PR push under a train policy) and bisect plan nothing here, and neither does a refused dispatch.
+    if: ${{ !cancelled() && (needs.readiness.result == 'success' || needs.readiness.result == 'skipped') && needs.readiness.outputs.superseded != 'true' && needs.route.result == 'success' && needs.route.outputs.superseded != 'true' && contains(fromJSON('["pr","screen","train","dispatch"]'), needs.route.outputs.mode) && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       slices: ${{ steps.matrix.outputs.slices }}
       slice_timeouts: ${{ steps.matrix.outputs.slice_timeouts }}
+      gate_reuse: ${{ steps.gate_reuse.outputs.gate_reuse }}
+      # The route, forwarded: the executors and the report read it from here.
+      mode: ${{ needs.route.outputs.mode }}
+      record_artifact: ${{ needs.route.outputs.record_artifact }}
+      full_gate_check: ${{ needs.route.outputs.full_gate_check }}
+      screen_head: ${{ needs.route.outputs.screen_head }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # A dispatched screen tests the PR's pinned refs/pull/<n>/merge commit; empty for every other run (its own ref).
+          ref: ${{ inputs.screen_merge_sha }}
           # Preserve full history for merge-base diff selection. Moving the
           # planner off the eval image must not change its selection inputs.
           fetch-depth: 0
@@ -267,7 +527,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       # DX-1: a dispatch from scripts/eval-bg.ts names the revision it means
       # to test; a different checkout fails here before any paid work.
@@ -291,7 +551,7 @@ jobs:
       - name: Download this PR's receipt store
         if: github.event_name == 'pull_request' || inputs.pr_receipts != ''
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: receipt-store
           path: /tmp/gstack-eval-input-cache
@@ -307,9 +567,27 @@ jobs:
         env:
           EVALS_ALL: ${{ (github.event_name == 'workflow_dispatch' && inputs.evals_all) && '1' || '' }}
           EVALS_CACHE_DIR: ${{ steps.reuse.outputs.reuse == 'on' && '/tmp/gstack-eval-input-cache' || '' }}
-          # Dispatch diff base (CEO-17): the exact merge-base, else the named base branch, else detection.
-          EVALS_BASE: ${{ inputs.base_sha || (inputs.base_ref != '' && format('origin/{0}', inputs.base_ref)) || '' }}
+          # Dispatch diff base (CEO-17): a screen's merge-commit first parent, else the exact merge-base, else the named base branch, else detection.
+          EVALS_BASE: ${{ needs.route.outputs.screen_base || inputs.base_sha || (inputs.base_ref != '' && format('origin/{0}', inputs.base_ref)) || '' }}
         run: EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slice-budget 420 --jobs 2 --max-parallel 20
+
+      # R2a/R2: reuse holds only when this head's own plan selects exactly the
+      # cases and trial plans the reused gate ran (selection fingerprint).
+      - name: Download a gate reuse candidate
+        if: github.event_name == 'pull_request' || needs.route.outputs.mode == 'screen'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: gate-reuse-candidate
+          path: /tmp/gate-reuse
+
+      - name: Confirm gate verdict reuse (R2a/R2)
+        id: gate_reuse
+        if: github.event_name == 'pull_request' || needs.route.outputs.mode == 'screen'
+        run: |
+          mkdir -p /tmp/gate-reuse
+          bun --no-install run scripts/gate-reuse.ts confirm /tmp/gate-reuse /tmp/paid-plan/manifest.json --out /tmp/paid-plan \
+            --github-output "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
 
       # CEO-13: the mode, case counts and, on fallback, every file that
       # restored the full gate with the edit that narrows it next time.
@@ -329,13 +607,14 @@ jobs:
         if: github.event_name == 'pull_request'
         run: mkdir -p /tmp/paid-plan/store && cp -a /tmp/gstack-eval-input-cache/. /tmp/paid-plan/store/
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-plan
           path: |
             /tmp/paid-plan/manifest.json
             /tmp/paid-plan/receipts
             /tmp/paid-plan/store
+            /tmp/paid-plan/gate-reuse.json
           retention-days: 30
 
   eval-slices:
@@ -346,7 +625,8 @@ jobs:
     # !cancelled(), not always(): still runs when build-image was skipped
     # (image already published), but a newer push's cancel-in-progress stops
     # it instead of letting a superseded run finish its paid slices first.
-    if: ${{ !cancelled() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success' }}
+    # A confirmed verdict reuse (R2a/R2) runs no paid slice.
+    if: ${{ !cancelled() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success' && needs.plan-slices.outputs.gate_reuse != 'true' }}
     # The planner packs ~7 minutes of recorded work per slice (EVALS_JOBS=2 x
     # EVALS_CONCURRENCY=2 per runner, never the old 40-way per-row fan-out
     # that queued claude session STARTUP behind 39 siblings). Each slice's job
@@ -374,6 +654,8 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # A dispatched screen's pinned merge commit (the planner verified it); empty otherwise.
+          ref: ${{ inputs.screen_merge_sha }}
           # Full history: files with SELF-derived selection (the LLM-judge
           # map, routing) walk git at module load, and selection is
           # fail-closed on git errors — a shallow checkout crashed those
@@ -404,7 +686,7 @@ jobs:
       - name: Register gstack skills for PTY smokes
         uses: ./.github/actions/register-gstack-skills
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: paid-plan
           path: /tmp/paid-plan
@@ -457,10 +739,11 @@ jobs:
         run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/paid-plan/manifest.json --slice ${{ matrix.slice }}
 
       # Attempt-scoped: a re-run attempt's trials are reported under that
-      # attempt and never replace (or collide with) the first attempt's.
+      # attempt and never collide with the first attempt's; the report reads
+      # them through the rule-16 case history (scripts/lib/paid-rerun.ts).
       - name: Upload slice results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           path: /tmp/paid-slice-results
@@ -468,7 +751,7 @@ jobs:
 
       - name: Upload native capture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-captures-${{ env.EVALS_RUN_ID }}
           include-hidden-files: true
@@ -486,7 +769,7 @@ jobs:
       # longer reds its runner, but its full log is the diagnosis evidence.
       - name: Upload shard logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-logs-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           include-hidden-files: true
@@ -499,9 +782,358 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  slices-report:
-    runs-on: ubicloud-standard-2
+  # ── Rule-16 rerun (CREW rule 16, Garry 2026-10-19; a gate edit) ────────
+  # "You can just run the failed test again and note that it is flaky... You
+  # don't have to do the whole test pass again for one failed test." After the
+  # slices, the planner reruns ONCE, at the same head and in this run attempt,
+  # only the cases whose verdict failed once with no rerun yet: a red rule or
+  # judge case on its own shard (narrowed to it in PR mode; other cases a whole
+  # file reruns never count), a behavior FAIL as its whole planned panel.
+  # Harness, INFRA, INCOMPLETE and unattributed reds, a case already red twice,
+  # or any other problem plan nothing (scripts/lib/paid-rerun.ts planRerun).
+  # The rerun runs fresh (no receipts, no reuse) and never changes a trial
+  # count, kind or threshold; slices-report decides FLAKY (green, annotated,
+  # flake record) or red. Train runs use the same path; bisects rerun inside
+  # scripts/train-gate.ts.
+  rerun-plan:
+    runs-on: ubuntu-24.04
     needs: [plan-slices, eval-slices]
+    if: ${{ !cancelled() && needs.plan-slices.result == 'success' && needs.plan-slices.outputs.gate_reuse != 'true' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      planned: ${{ steps.plan.outputs.planned }}
+      slices: ${{ steps.plan.outputs.slices }}
+      slice_timeouts: ${{ steps.plan.outputs.slice_timeouts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.screen_merge_sha }}
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: paid-plan
+          path: /tmp/paid-report
+
+      # Every attempt's slices and earlier attempts' reruns: one history per case.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: paid-slice-*
+          path: /tmp/paid-report
+
+      # A missing rerun artifact leaves its case red (fail-closed), never green.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        continue-on-error: true
+        with:
+          pattern: paid-rerun-*
+          # Its own directory: download-artifact unpacks a lone match into its path itself, so the
+          # report root would otherwise take a rerun slice's files (run 39363705692).
+          path: /tmp/paid-report/reruns
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        continue-on-error: true
+        with:
+          pattern: rerun-plan-a*
+          # Each artifact holds rerun-plan-a<attempt>/manifest.json, so even a lone match never
+          # lands on the plan's own manifest.json (run 39363705692).
+          path: /tmp/paid-report
+
+      - name: Plan the rule-16 rerun of this attempt's failed cases
+        id: plan
+        run: |
+          EVALS_TIER=gate bun --no-env-file --config=/dev/null --no-install run scripts/test-paid-shards.ts --tier gate --report /tmp/paid-report \
+            --rerun-plan "/tmp/paid-rerun-plan/rerun-plan-a$GITHUB_RUN_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
+          PLAN="/tmp/paid-rerun-plan/rerun-plan-a$GITHUB_RUN_ATTEMPT/manifest.json"
+          if [ -f "$PLAN" ]; then
+            { echo "planned=true"
+              echo "slices=$(jq -c '[range(1; .sliceCount + 1)]' "$PLAN")"
+              echo "slice_timeouts=$(jq -ec '[0] + .plan.sliceCiTimeoutMinutes' "$PLAN")"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "planned=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Hand the rerun manifest to its executors and the report
+        if: steps.plan.outputs.planned == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rerun-plan-a${{ github.run_attempt }}
+          path: /tmp/paid-rerun-plan
+          retention-days: 90
+
+  eval-rerun:
+    runs-on: ubicloud-standard-8
+    needs: [build-image, rerun-plan]
+    if: ${{ !cancelled() && needs.build-image.result == 'success' && needs.rerun-plan.outputs.planned == 'true' }}
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-rerun-${{ matrix.slice }}
+    timeout-minutes: ${{ fromJSON(needs.rerun-plan.outputs.slice_timeouts)[matrix.slice] }}
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.build-image.outputs.image-tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user runner
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        slice: ${{ fromJSON(needs.rerun-plan.outputs.slices) }}
+    steps:
+      - name: Record the job start for the slice deadline
+        run: echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.screen_merge_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fix bun temp
+        uses: ./.github/actions/fix-bun-temp
+
+      - name: Restore deps
+        uses: ./.github/actions/restore-deps
+
+      - run: bun run build
+
+      - name: Seed claude interactive config
+        uses: ./.github/actions/seed-claude-config
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Register gstack skills for PTY smokes
+        uses: ./.github/actions/register-gstack-skills
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: rerun-plan-a${{ github.run_attempt }}
+          path: /tmp/paid-rerun-plan
+
+      - name: Authenticate the Codex CLI
+        shell: bash
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          codex="${GSTACK_CI_CODEX_BIN_DIR:?}/codex"
+          export CODEX_HOME="$HOME/.gstack-ci-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "GSTACK_CI_CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::warning::OPENAI_API_KEY is unavailable; Codex eval cases cannot authenticate and will fail."
+            exit 0
+          fi
+          printenv OPENAI_API_KEY | "$codex" login --with-api-key
+          "$codex" login status >/dev/null 2>&1
+
+      # No EVALS_CACHE_*: a rerun never reuses a receipt and publishes none.
+      - name: Rerun slice ${{ matrix.slice }} (rule 16, once)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
+          EVALS_JOBS: "2"
+          EVALS_CONCURRENCY: "2"
+          GSTACK_EVAL_DIR: /tmp/paid-rerun-results
+        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/paid-rerun-plan/rerun-plan-a${{ github.run_attempt }}/manifest.json --slice ${{ matrix.slice }}
+
+      - name: Upload rerun results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: paid-rerun-${{ matrix.slice }}-a${{ github.run_attempt }}
+          path: /tmp/paid-rerun-results
+          retention-days: 90
+
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload shard logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rerun-logs-${{ matrix.slice }}-a${{ github.run_attempt }}
+          include-hidden-files: true
+          path: |
+            /home/runner/.cache/gstack-paid-shard-*.log
+            /tmp/gstack-paid-shard-*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ── Train bisect (GSTA-49 T1b) ─────────────────────────────────────────
+  # One executor per prefix of the train (route's validated prefix_shas, each
+  # an ancestor of the train head): every red case once, one trial, on that
+  # prefix's own checkout. Each writes the per-prefix record that
+  # `gstack-ship-queue train bisect` reads, as <record_artifact>-bisect-<sha12>.
+  # A bisect never reuses a result and never binds a verdict.
+  train-bisect:
+    runs-on: ubicloud-standard-8
+    needs: [build-image, route]
+    if: ${{ !cancelled() && needs.build-image.result == 'success' && needs.route.result == 'success' && needs.route.outputs.mode == 'bisect' }}
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-train-bisect-${{ matrix.slice }}
+    timeout-minutes: ${{ fromJSON(needs.route.outputs.bisect_timeouts)[matrix.slice] }}
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.build-image.outputs.image-tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user runner
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        slice: ${{ fromJSON(needs.route.outputs.bisect_slices) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ fromJSON(needs.route.outputs.bisect_refs)[matrix.slice] }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the prefix checkout
+        id: prefix
+        env:
+          PREFIX_SHA: ${{ fromJSON(needs.route.outputs.bisect_refs)[matrix.slice] }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$PREFIX_SHA" ]; then
+            echo "::error::train-bisect checked out ${actual}, not its prefix ${PREFIX_SHA}"
+            exit 1
+          fi
+          echo "short=${PREFIX_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Fix bun temp
+        uses: ./.github/actions/fix-bun-temp
+
+      - name: Restore deps
+        uses: ./.github/actions/restore-deps
+
+      - run: bun run build
+
+      # Any slice can host a PTY smoke, so the seed/registration steps run
+      # UNCONDITIONALLY (both are idempotent) — the old matrix keyed them on
+      # matrix.suite.name, which a sliced lane cannot do. The register
+      # composite carries the fail-fast dangling-symlink/frontmatter
+      # verification loop, so a moved skill target fails HERE in seconds,
+      # not as a wedged PTY session at the shard wall.
+      - name: Seed claude interactive config
+        uses: ./.github/actions/seed-claude-config
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Register gstack skills for PTY smokes
+        uses: ./.github/actions/register-gstack-skills
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: train-bisect-plan
+          path: /tmp/train-bisect
+
+      - name: Authenticate the Codex CLI
+        shell: bash
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          codex="${GSTACK_CI_CODEX_BIN_DIR:?}/codex"
+          export CODEX_HOME="$HOME/.gstack-ci-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "GSTACK_CI_CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::warning::OPENAI_API_KEY is unavailable; Codex eval cases cannot authenticate and will fail."
+            exit 0
+          fi
+          printenv OPENAI_API_KEY | "$codex" login --with-api-key
+          "$codex" login status >/dev/null 2>&1
+
+      - name: Run the red cases on prefix ${{ matrix.slice }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
+          EVALS_JOBS: "1"
+          EVALS_CONCURRENCY: "1"
+          SLICE: ${{ matrix.slice }}
+        run: EVALS_TIER=gate bun --no-env-file --config=/dev/null run scripts/train-gate.ts bisect-prefix --plan /tmp/train-bisect/bisect.json --index "$SLICE" --out /tmp/train-bisect/out
+
+      - name: Upload the prefix record
+        if: always() && steps.prefix.outputs.short != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ needs.route.outputs.record_artifact }}-bisect-${{ steps.prefix.outputs.short }}
+          path: /tmp/train-bisect/out/bisect-prefix.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90
+
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # The spooled per-shard full logs — a red weekly/PR lane three weeks
+      # later needs more than a summary line.
+      # always(), not failure(): a failed behavior trial is a verdict and no
+      # longer reds its runner, but its full log is the diagnosis evidence.
+      - name: Upload shard logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: train-bisect-logs-${{ matrix.slice }}-a${{ github.run_attempt }}
+          include-hidden-files: true
+          # The Fix-bun-temp step points TMPDIR at /home/runner/.cache, so the
+          # runner's spool lands THERE, not /tmp — the original /tmp glob
+          # uploaded nothing and a red slice's diagnostics were unreachable.
+          path: |
+            /home/runner/.cache/gstack-paid-shard-*.log
+            /tmp/gstack-paid-shard-*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  slices-report:
+    # GitHub-hosted, like recover-receipts: Ubicloud runners send actions/cache
+    # to Ubicloud's own transparent cache, which a GitHub-hosted restore never
+    # sees, so a store saved on Ubicloud was never restored (GSTA-48: every
+    # restore missed, e.g. #3253's restamp gate 3 minutes after a saved store).
+    runs-on: ubuntu-24.04
+    needs: [plan-slices, eval-slices, rerun-plan, eval-rerun]
     # !cancelled(): the report must run (and FAIL) when an executor died — a
     # missing slice artifact reading as green is the class this lane kills —
     # but a run superseded by a newer push stops here.
@@ -518,31 +1150,58 @@ jobs:
     permissions:
       contents: read
     outputs:
-      reconcile-exit: ${{ steps.reconcile.outputs.exit }}
+      reconcile-exit: ${{ steps.reconcile.outputs.exit || steps.reused.outputs.exit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # A screen's pinned merge commit (empty otherwise); a train run needs the
+          # history of its prefix commits T1..Tk for the train record.
+          ref: ${{ inputs.screen_merge_sha }}
+          fetch-depth: ${{ needs.plan-slices.outputs.mode == 'train' && '0' || '1' }}
           persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: paid-plan
           path: /tmp/paid-report
 
       # One directory per attempt-scoped slice artifact (no merge): shard
-      # records can never overwrite each other, and the report keeps the
-      # first attempt's verdict.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      # records can never overwrite each other. Attempt 1 decides the lane;
+      # a later attempt or a rule-16 rerun resolves a red only by the flaky
+      # rule (scripts/lib/paid-rerun.ts) and never hides a new red.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: paid-slice-*
           path: /tmp/paid-report
 
+      # Rule-16 reruns and their manifests. A missing one leaves its case red.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        continue-on-error: true
+        with:
+          pattern: paid-rerun-*
+          # Its own directory: download-artifact unpacks a lone match into its path itself, so the
+          # report root would otherwise take a rerun slice's files (run 39363705692).
+          path: /tmp/paid-report/reruns
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        continue-on-error: true
+        with:
+          pattern: rerun-plan-a*
+          # Each artifact holds rerun-plan-a<attempt>/manifest.json, so even a lone match never
+          # lands on the plan's own manifest.json (run 39363705692).
+          path: /tmp/paid-report
+
       - name: Reconcile slices against the manifest (fail-closed)
         id: reconcile
+        if: needs.plan-slices.outputs.gate_reuse != 'true'
+        env:
+          # Flake records name the PR and its head (scripts/lib/paid-rerun.ts flakeRecords).
+          GSTACK_GATE_PR: ${{ github.event.pull_request.number || inputs.screen_pr }}
+          GSTACK_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.plan-slices.outputs.screen_head || inputs.expected_sha }}
         run: |
           set +e
           EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --report /tmp/paid-report | tee /tmp/report.txt
@@ -551,6 +1210,19 @@ jobs:
           # exit (always 0) — the fail-closed gate was silently fail-open
           # (caught by the ship review army; the wiring test now pins this).
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # R2a/R2: the planner confirmed a reuse, so no slice ran; the verdict is
+      # the reused gate's, printed with which run, which head and why. A
+      # missing or malformed reuse record exits 1 (fail-closed).
+      - name: Report the reused gate verdict (R2a/R2)
+        id: reused
+        if: needs.plan-slices.outputs.gate_reuse == 'true'
+        run: |
+          set +e
+          bun --no-install run scripts/gate-reuse.ts report /tmp/paid-report/gate-reuse.json --repo "$GITHUB_REPOSITORY" > /tmp/report.txt
+          code=$?
+          cat /tmp/report.txt
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
 
       - name: Summarize PR coverage and reuse
         if: always()
@@ -583,7 +1255,7 @@ jobs:
 
       - name: Upload reconciliation output for the comment job
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: report-verdict-a${{ github.run_attempt }}
           path: |
@@ -594,18 +1266,121 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # Rule 16: one JSONL record per case that failed once and passed on its
+      # one rerun (case, PR, head, run, both attempts, symptom, rerun cost),
+      # read by the daily flaky-fix pass (docs/TESTING_INTERNALS.md#flaky-reruns).
+      - name: Upload flake records for the daily flaky-fix pass
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-records-a${{ github.run_attempt }}
+          path: /tmp/paid-report/flake-records.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # R2a/R2: what this executed run proved, read by a later push. The base
+      # is the tested merge commit's first parent. Reused runs bind nothing,
+      # so reuse never chains off a reuse.
+      # A dispatched screen binds too (purpose screen, its tested merge commit
+      # and policy). Train, bisect and other dispatches never bind for reuse.
+      - name: Bind this run's verdict for reuse (R2a/R2)
+        if: always() && (github.event_name == 'pull_request' || needs.plan-slices.outputs.mode == 'screen') && needs.plan-slices.outputs.gate_reuse != 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.screen_pr }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || needs.plan-slices.outputs.screen_head }}
+          TESTED_SHA: ${{ inputs.screen_merge_sha || github.sha }}
+          SCREEN_POLICY: ${{ inputs.screen_policy }}
+          RECONCILE_EXIT: ${{ steps.reconcile.outputs.exit }}
+        run: |
+          bun --no-install run scripts/gate-reuse.ts bind /tmp/paid-report --out /tmp/gate-binding --repo "$GITHUB_REPOSITORY" \
+            --pr "$PR_NUMBER" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --head-sha "$HEAD_SHA" \
+            --tested-sha "$TESTED_SHA" --profile "$EVALS_PROFILE" --reconcile-exit "$RECONCILE_EXIT" \
+            ${SCREEN_POLICY:+--purpose screen --screen-policy "$SCREEN_POLICY"} >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the gate binding
+        if: always() && (github.event_name == 'pull_request' || needs.plan-slices.outputs.mode == 'screen') && needs.plan-slices.outputs.gate_reuse != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gate-binding-a${{ github.run_attempt }}
+          path: /tmp/gate-binding/gate-binding.json
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Upload trial outcomes for pass-rate history
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: trial-outcomes-pr-a${{ github.run_attempt }}
           path: /tmp/paid-report/trial-outcomes.jsonl
           if-no-files-found: ignore
           retention-days: 90
 
+      # GSTA-49 T1b: a train's own gate run publishes its record, read by
+      # gstack-ship-queue's verdict and verify and by the main backstop: the
+      # census from this run's plan manifest, one panel per planned case, and
+      # the prefix trees T1..Tk modulo stamps. GREEN only for a complete census.
+      - name: Write the train record
+        if: always() && needs.plan-slices.outputs.mode == 'train'
+        env:
+          NONCE: ${{ inputs.nonce }}
+          HEAD_SHA: ${{ inputs.expected_sha }}
+          RECORD: ${{ needs.plan-slices.outputs.record_artifact }}
+          RECONCILE_EXIT: ${{ steps.reconcile.outputs.exit }}
+        run: |
+          bun --no-env-file --config=/dev/null --no-install run scripts/train-gate.ts train-record /tmp/paid-report --nonce "$NONCE" --head "$HEAD_SHA" \
+            --reconcile-exit "$RECONCILE_EXIT" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" \
+            --out "/tmp/train-record/${RECORD}.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the train record
+        if: always() && needs.plan-slices.outputs.mode == 'train'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ needs.plan-slices.outputs.record_artifact }}
+          path: /tmp/train-record
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90
+
       - name: Fail the workflow when reconciliation failed
-        if: steps.reconcile.outputs.exit != '0'
+        if: (steps.reconcile.outputs.exit || steps.reused.outputs.exit) != '0'
         run: exit 1
+
+  # GSTA-49 T1b: the check run gstack-ship-queue requires on the train head,
+  # published only for a complete GREEN census. Its own job with checks:
+  # write and no repository code (the same split as slices-comment).
+  train-check:
+    runs-on: ubuntu-24.04
+    needs: [plan-slices, slices-report]
+    if: ${{ !cancelled() && needs.plan-slices.outputs.mode == 'train' && needs.slices-report.result == 'success' }}
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ needs.plan-slices.outputs.record_artifact }}
+          path: /tmp/train-record
+
+      - name: Publish the full-gate check on the train head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECK: ${{ needs.plan-slices.outputs.full_gate_check }}
+          RECORD: ${{ needs.plan-slices.outputs.record_artifact }}
+          NONCE: ${{ inputs.nonce }}
+          HEAD_SHA: ${{ inputs.expected_sha }}
+        run: |
+          record="/tmp/train-record/${RECORD}.json"
+          if ! jq -e --arg nonce "$NONCE" --arg head "$HEAD_SHA" \
+            '.schema == 1 and .kind == "train-gate" and .verdict == "GREEN" and .census.complete == true and .nonce == $nonce and .head_sha == $head' \
+            "$record" >/dev/null 2>&1; then
+            echo "::error::the train record is not a complete GREEN census of ${HEAD_SHA} (nonce ${NONCE}); no ${CHECK} check run"
+            exit 1
+          fi
+          summary=$(jq -r '"rule \(.census.executed.rule)/\(.census.planned.rule), judge \(.census.executed.judge)/\(.census.planned.judge); prefixes T1..T\(.prefixes | length)"' "$record")
+          gh api "repos/${GITHUB_REPOSITORY}/check-runs" -X POST -f name="$CHECK" -f head_sha="$HEAD_SHA" -f status=completed -f conclusion=success \
+            -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f "output[title]=Train ${NONCE}: complete GREEN census" -f "output[summary]=${summary}" >/dev/null
+          echo "- ${CHECK}: success on ${HEAD_SHA} (${summary})" >> "$GITHUB_STEP_SUMMARY"
 
   # PR comment in its OWN job with the write token and ZERO repo code: no
   # checkout, no bun install — only downloaded artifacts, jq, and gh. See the
@@ -613,7 +1388,8 @@ jobs:
   slices-comment:
     runs-on: ubicloud-standard-2
     needs: slices-report
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped' }}
+    # A dispatched screen comments on its PR too (screen_pr was validated by the route job, or nothing ran).
+    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.screen_pr != '') && needs.slices-report.result != 'skipped' }}
     timeout-minutes: 5
     permissions:
       pull-requests: write
@@ -622,12 +1398,12 @@ jobs:
       # `issues` permission, not `pull-requests` (#1802 CI fix).
       issues: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: paid-plan
           path: /tmp/paid-report
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: report-verdict-a${{ github.run_attempt }}
           path: /tmp/verdict
@@ -642,8 +1418,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RECONCILE_EXIT: ${{ needs.slices-report.outputs.reconcile-exit }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.screen_pr }}
+          SCREEN_POLICY: ${{ inputs.screen_policy }}
+          SCREEN_MERGE_SHA: ${{ inputs.screen_merge_sha }}
         run: |
           # shellcheck disable=SC2086,SC2059
+          # R2a/R2: a confirmed verdict reuse ran no case; say which run,
+          # which head and why, with the receipt or own-diff signature.
+          REUSE=/tmp/paid-report/gate-reuse.json
+          if [ "${RECONCILE_EXIT:-1}" = "0" ] && [ -f "$REUSE" ] \
+            && jq -e '.schema == 1 and (.kind == "restamp-only" or .kind == "main-moved")' "$REUSE" >/dev/null 2>&1; then
+            BODY=$(jq -r --arg repo "$GITHUB_REPOSITORY" '"## E2E Evals: ✅ PASS (reused: \(if .kind == "restamp-only" then "restamp-only, R2a" else "main moved, R2" end))\n\nNo paid case ran on `\(.current_head)`. It carries the GREEN verdict of [run \(.reused_run_id)](https://github.com/\($repo)/actions/runs/\(.reused_run_id)) at `\(.gated_head)`, because \(.why).\(if ((.reused_flaky // []) | length) > 0 then " That gate was green with flaky case(s) that failed once and passed on their one rule-16 rerun: \(.reused_flaky | join(", "))." else "" end)\n\n```\n\(if .kind == "restamp-only" then "TREE: same-modulo-stamps receipt=\(.receipt_sha256)" else "OWN DIFF: identical sha256=\(.own_diff_sha256) (merge-base \(.gated_merge_base) -> \(.merge_base))" end)\nbase: \(.gated_base) -> \(.base_sha)\nselection: \(.selection_sha256) (identical to the reused gate)\n```\n\n---\n*Verdict reuse (R2a restamp-only, R2 main moved): a changed own diff, a non-stamp byte, a changed selection, a newer red or unbound gate, or a missing binding or receipt runs the full gate; the evals-fresh label opts out. Free Tests and every other check still ran on this head.*"' "$REUSE")
+          else
           TOTAL=0; PASSED=0; FAILED=0; MANUAL=0; EXECUTED=0; REUSED=0; COST="0"
           SUITE_LINES=""
           VERIFIED=/tmp/verdict/paid-report/collector-outcomes.json
@@ -652,6 +1438,8 @@ jobs:
             .version == 2 and (.files | type == "array") and (.totals | type == "object") and
             (.headline | type == "array") and (.failures | type == "array") and (.panels | type == "array") and
             (.verdict.verdict == "GREEN" or .verdict.verdict == "RED") and
+            ((.flakyCollectorFailures // 0) | type == "number" and . >= 0 and floor == .) and
+            ((.flakyCollectorFailures // 0) <= .totals.failed) and
             ([.files[] | .total == (.passed + .failed + .manual_accepted) and
               (.total == (.executed + .reused)) and
               ([.total,.passed,.failed,.manual_accepted,.executed,.reused,.attempts,.flaky] | all(. >= 0 and (floor == .))) ] | all) and
@@ -664,6 +1452,8 @@ jobs:
           fi
           HEADLINE='(no verified report headline)'
           FAILURES=""
+          FLAKY=""
+          FLAKY_FAILED=0
           if [ -n "$VERIFIED" ]; then
             while IFS=$'\t' read -r _FILE T P F M _FLAKY EX RE _ATTEMPTS C TIER SHARD; do
               [ "$T" -eq 0 ] && continue
@@ -679,6 +1469,10 @@ jobs:
             # Report-sanitized lines (no @-mentions, one capped line each), fenced here.
             HEADLINE=$(jq -r '.headline[]' "$VERIFIED")
             FAILURES=$(jq -r '.failures[]' "$VERIFIED")
+            # Rule 16: report-sanitized lines of cases that failed once and passed on their one rerun.
+            FLAKY=$(jq -r '(.flakyLines // [])[]' "$VERIFIED")
+            # Their first-attempt collector failures, the only failed records a green report may carry.
+            FLAKY_FAILED=$(jq -r '.flakyCollectorFailures // 0' "$VERIFIED")
           fi
 
           COVERAGE=$(jq -r '"Profile: \(.profile // "full") / mode `\(.prCoverage.mode // "broad")`; selected behaviors: \(.selection.e2e | if . == null then "all" else length end), judges: \(.selection.judges | if . == null then "all" else length end). Deferred to scheduled/release coverage: \(.prCoverage.deferred // [] | length) behaviors and \(.prCoverage.deferredPromptFiles // [] | length) changed prompt files. Deferred checks did not run and receive no PR-pass credit."' /tmp/paid-report/manifest.json) || COVERAGE='Coverage manifest unavailable; no coverage claim.'
@@ -698,9 +1492,10 @@ jobs:
           ${DERIVED}"; fi
 
           STATUS="✅ PASS"
-          if [ "${RECONCILE_EXIT:-1}" != "0" ] || [ "$FAILED" -gt 0 ] \
+          if [ "${RECONCILE_EXIT:-1}" != "0" ] || [ "$FAILED" -gt "$FLAKY_FAILED" ] \
             || { [ -n "$VERIFIED" ] && [ "$(jq -r '.verdict.verdict' "$VERIFIED")" != "GREEN" ]; }; then STATUS="❌ FAIL"; fi
           if [ "$STATUS" = '✅ PASS' ] && [ "$MANUAL" -gt 0 ]; then STATUS='⚠ MANUAL ACCEPTED (unscored)'; fi
+          if [ "$STATUS" = '✅ PASS' ] && [ -n "$FLAKY" ]; then STATUS="✅ PASS (flaky: $(grep -c . <<<"$FLAKY") case(s) passed on their one rerun)"; fi
           if [ -z "$VERIFIED" ]; then STATUS='❌ FAIL (verified report unavailable)'; fi
 
           BODY="## E2E Evals: ${STATUS}
@@ -739,7 +1534,25 @@ jobs:
           \`\`\`"
           fi
 
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+          if [ -n "$FLAKY" ]; then
+            BODY="${BODY}
+
+          ### Flaky: failed once, passed on its one rerun (rule 16)
+          \`\`\`
+          ${FLAKY}
+          \`\`\`
+          Each failed and passed on its rerun in [run ${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) at the attempts named above. Logged for the daily flaky-fix pass in this run's \`flake-records-a${GITHUB_RUN_ATTEMPT}\` artifact (docs/TESTING_INTERNALS.md#flaky-reruns)."
+          fi
+
+          fi
+
+          if [ -n "$SCREEN_POLICY" ]; then
+            BODY="${BODY}
+
+          *Dispatched ${SCREEN_POLICY} screen (gstack-ship-queue ready --screen) of merge commit \`${SCREEN_MERGE_SHA}\`.*"
+          fi
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
             --jq '.[] | select(.body | startswith("## E2E Evals")) | .id' | tail -1)
 
           if [ -n "$COMMENT_ID" ]; then
@@ -749,6 +1562,6 @@ jobs:
             # REST, not gh's pr-comment subcommand: this job runs with NO
             # checkout (the token/exec split), and that subcommand resolves
             # the repo FROM git — it dies with "not a git repository" here.
-            gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
               -X POST -f body="$BODY"
           fi

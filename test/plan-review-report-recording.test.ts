@@ -8,6 +8,7 @@ import { isPreTurnInfraFailure, recordE2E } from './helpers/e2e-helpers';
 import { EvalCollector, isFinalizedEvalResultFile, listEvalJsonFiles, type EvalTestEntry } from './helpers/eval-store';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 import { isPaidTestFile } from './helpers/paid-test-set';
+import { resolveEvalModel } from '../lib/eval-model';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const source = fs.readFileSync(path.join(ROOT, 'test/skill-e2e-plan.test.ts'), 'utf8');
@@ -45,7 +46,7 @@ async function exercise(scenarios: Scenario[], opts: { deadline?: boolean; sibli
   for (const declaration of source.matchAll(/^import[\s\S]*?;\n/gm)) executable = executable.replace(declaration[0], '');
   const js = new Bun.Transpiler({ loader: 'ts', target: 'bun' }).transformSync(executable);
   const args: Record<string, any> = {
-    expect, ROOT, runId: 'public-report-free', evalsEnabled: true, CAPTURE_LONG_MS,
+    expect, ROOT, runId: 'public-report-free', evalsEnabled: true, CAPTURE_LONG_MS, resolveEvalModel,
     OFFICE_HOURS_BUN_GRACE_MS, EvalCollector: BoundCollector, recordE2E,
     createEvalCollector: (tier: string) => new BoundCollector(tier),
     finalizeEvalCollector: async (collector: EvalCollector | null) => {
@@ -208,7 +209,7 @@ test('canonical reports preserve both successful exits, terminal forms, metadata
   expect(actual.helperOptions).toHaveLength(2);
   for (const options of actual.helperOptions) expect(options.budgetMs).toBe(CAPTURE_LONG_MS);
   for (const call of actual.calls) {
-    expect(call).toMatchObject({ testName: 'plan-review-report', model: 'claude-opus-4-7', maxTurns: 20,
+    expect(call).toMatchObject({ testName: 'plan-review-report', model: 'claude-opus-5-5', maxTurns: 20,
       timeout: CAPTURE_LONG_MS, runId: 'public-report-free' });
     expect(call.signal).toBeInstanceOf(AbortSignal);
     expect(call.prompt).toContain('Read plan-eng-review/SKILL.md and plan-eng-review/sections/review-sections.md');
@@ -222,7 +223,7 @@ test('canonical reports preserve both successful exits, terminal forms, metadata
   for (const outcome of actual.outcomes) {
     expect(outcome.entries).toHaveLength(1);
     expect(outcome.entries[0]).toMatchObject({ name: '/plan-review-report', suite: 'Plan Review Report E2E', tier: 'e2e', passed: true,
-      duration_ms: 25, cost_usd: 0.12, model: 'claude-opus-4-7', first_response_ms: 3, max_inter_turn_ms: 7 });
+      duration_ms: 25, cost_usd: 0.12, model: 'claude-opus-5-5', first_response_ms: 3, max_inter_turn_ms: 7 });
     expect(outcome.entries[0].output).toHaveLength(2000);
     expect(outcome.entries[0].transcript).toEqual(outcome.result.transcript);
   }

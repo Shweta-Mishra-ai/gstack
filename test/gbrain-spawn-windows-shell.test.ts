@@ -58,7 +58,10 @@ describe("#1731 gbrain spawns carry the Windows shell flag", () => {
 });
 
 describe("bashScriptInvocation", () => {
-  const WIN_BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
+  // Forward-slashed: the one resolver (lib/script-invocation.ts) normalizes
+  // every candidate, because Bun's spawnSync on Windows returns ENOENT for a
+  // backslash exe path containing spaces.
+  const WIN_BASH = "C:/Program Files/Git/bin/bash.exe";
 
   test("POSIX execs the script directly, no interpreter needed", () => {
     const inv = bashScriptInvocation("/home/u/.claude/skills/gstack/bin/gstack-brain-sync", ["--once"], {
@@ -106,16 +109,18 @@ describe("bashScriptInvocation", () => {
     const custom = "D:\\tools\\git\\bin\\bash.exe";
     const inv = bashScriptInvocation("C:\\x\\gstack-brain-sync", [], {
       platform: "win32",
-      exists: (p) => p === custom || p === WIN_BASH,
+      exists: (p) => p === "D:/tools/git/bin/bash.exe" || p === WIN_BASH,
       env: { GSTACK_BASH: custom },
     });
-    expect(inv?.cmd).toBe(custom);
+    expect(inv?.cmd).toBe("D:/tools/git/bin/bash.exe");
   });
 
   test("returns null when Windows has no bash, so the caller can say why", () => {
     const inv = bashScriptInvocation("C:\\x\\gstack-brain-sync", [], {
       platform: "win32",
       exists: () => false,
+      gitExecPath: () => null,
+      which: () => null,
       env: {},
     });
     expect(inv).toBeNull();

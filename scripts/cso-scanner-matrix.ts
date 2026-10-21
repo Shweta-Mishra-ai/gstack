@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Validate reviewed scanner inputs before any image is built or published. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

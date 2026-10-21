@@ -4,13 +4,13 @@
 # Runs as user `ubi` (passwordless sudo) from the synced checkout.
 set -euo pipefail
 
-BUN_VERSION=1.4.0
+BUN_VERSION=1.4.2
 NODE_VERSION=22.20.0
 
 export DEBIAN_FRONTEND=noninteractive
 sudo -E apt-get update -qq
 sudo -E apt-get install -y -qq --no-install-recommends \
-  git curl unzip xz-utils ca-certificates build-essential clang python3-venv jq \
+  git curl unzip zip xz-utils ca-certificates build-essential clang python3-venv jq \
   xvfb x11-utils poppler-utils fonts-noto-color-emoji zsh >/dev/null
 
 # Ubuntu 24.04 blocks unprivileged user namespaces, which Chromium's sandbox
@@ -22,11 +22,21 @@ if ! command -v node >/dev/null; then
     | sudo tar -xJ -C /usr/local --strip-components=1
 fi
 
+# The exact release archive, verified by SHA-256 before it is unpacked, as in
+# .github/docker/Dockerfile.ci (test/ci-image-cli-pin.test.ts keeps them equal).
 if [ ! -x "$HOME/.bun/bin/bun" ]; then
-  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION" >/dev/null
+  bun_tmp=$(mktemp -d)
+  curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL \
+    "https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-linux-x64.zip" -o "$bun_tmp/bun.zip"
+  echo "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  $bun_tmp/bun.zip" | sha256sum -c - >/dev/null
+  unzip -q "$bun_tmp/bun.zip" -d "$bun_tmp"
+  install -D -m 0755 "$bun_tmp/bun-linux-x64/bun" "$HOME/.bun/bin/bun"
+  ln -sf bun "$HOME/.bun/bin/bunx"
+  rm -rf "$bun_tmp"
 fi
 grep -q '.bun/bin' "$HOME/.profile" || echo 'export PATH="$HOME/.bun/bin:$PATH"' >>"$HOME/.profile"
 export PATH="$HOME/.bun/bin:$PATH"
+test "$(bun --version)" = "$BUN_VERSION"
 
 git config --global user.email "free-tests@gstack.test"
 git config --global user.name "Free Tests"
@@ -36,7 +46,7 @@ git config --global --add safe.directory '*'
 bun install --frozen-lockfile
 bunx playwright install --with-deps chromium
 
-chrome=$(bun -e 'import { chromium } from "playwright"; import { realpathSync } from "node:fs"; console.log(realpathSync(chromium.executablePath()))')
+chrome=$(bun --no-env-file --config=/dev/null -e 'import { chromium } from "playwright"; import { realpathSync } from "node:fs"; console.log(realpathSync(chromium.executablePath()))')
 sudo install -T -o root -g root -m 4755 "${chrome%/*}/chrome_sandbox" "${chrome%/*}/chrome-sandbox"
 
 {

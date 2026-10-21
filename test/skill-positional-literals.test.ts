@@ -75,7 +75,7 @@ for (const host of ['claude', 'codex'] as const) for (const args of [[], tenArgu
     const file = backslashPath ? join(root, 'checksum\\path', 'install-script') : join(root, 'install-script');
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, 'synthetic installer bytes\n');
-    for (const name of ['open-gstack-browser', 'pair-agent', 'setup-browser-cookies']) {
+    for (const name of ['open-gstack-browser', 'pair-agent']) {
       const lines = apply(skill(host, name)).split('\n').filter(line => line.includes('actual_sha=$('));
       expect(lines.map(line => line.trim())).toEqual([
         literals.checksum,

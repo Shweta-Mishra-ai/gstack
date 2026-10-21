@@ -21,6 +21,7 @@ import { hermeticChildEnv } from './hermetic-env';
 import { extractSkillSections } from './skill-fixture';
 import { killProcessGroup } from '../../scripts/test-strict-output';
 import { CODEX_FRONTIER_MODEL } from '../../scripts/resolvers/constants';
+import { estimateCostUsd, hasPricing } from '../../lib/pricing';
 
 // --- Interfaces ---
 
@@ -34,6 +35,47 @@ export interface CodexResult {
   sessionId: string | null; // Thread ID for session continuity
   rawLines: string[];       // Raw JSONL lines for debugging
   stderr: string;           // Stderr output (skill loading errors, auth failures)
+  usage?: CodexTokenUsage | null; // Summed turn.completed usage; null when no turn completed
+  model?: string;           // The --model this session ran
+}
+
+/**
+ * Token classes of Codex `turn.completed` usage. `cached_input` (cache reads)
+ * and `cache_write_input` are subsets of `input`; `reasoning_output` is a
+ * subset of `output`.
+ */
+export interface CodexTokenUsage {
+  input: number;
+  cached_input: number;
+  cache_write_input: number;
+  output: number;
+  reasoning_output: number;
+}
+
+export const NO_CODEX_USAGE: CodexTokenUsage = Object.freeze({ input: 0, cached_input: 0, cache_write_input: 0, output: 0, reasoning_output: 0 });
+
+const count = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0);
+
+/** Add one `turn.completed` usage object to a running total. */
+export function addCodexTurnUsage(total: CodexTokenUsage, usage: Record<string, unknown> | undefined): CodexTokenUsage {
+  return {
+    input: total.input + count(usage?.input_tokens),
+    cached_input: total.cached_input + count(usage?.cached_input_tokens),
+    cache_write_input: total.cache_write_input + count(usage?.cache_write_input_tokens),
+    output: total.output + count(usage?.output_tokens),
+    reasoning_output: total.reasoning_output + count(usage?.reasoning_output_tokens),
+  };
+}
+
+/**
+ * A session's cost at lib/pricing.ts rates: cache reads at the cached-input
+ * rate, all other input (cache writes included) at the input rate, output at
+ * the output rate. Null when the model has no price row.
+ */
+export function codexUsageCostUsd(usage: CodexTokenUsage, model: string | undefined): number | null {
+  if (!hasPricing(model)) return null;
+  const cached = Math.min(usage.cached_input, usage.input);
+  return estimateCostUsd({ input: usage.input - cached, cached, output: usage.output }, model);
 }
 
 /** Existing pipe-drain allowance, separate from the model's work budget. */
@@ -54,6 +96,7 @@ export interface ParsedCodexJSONL {
   toolCalls: string[];
   tokens: number;
   sessionId: string | null;
+  usage: CodexTokenUsage | null;
 }
 
 /**
@@ -71,6 +114,7 @@ export function parseCodexJSONL(lines: string[]): ParsedCodexJSONL {
   const toolCalls: string[] = [];
   let tokens = 0;
   let sessionId: string | null = null;
+  let usage: CodexTokenUsage | null = null;
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -95,9 +139,9 @@ export function parseCodexJSONL(lines: string[]): ParsedCodexJSONL {
           if (cmd) toolCalls.push(cmd);
         }
       } else if (t === 'turn.completed') {
-        const usage = obj.usage || {};
-        const turnTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0);
-        tokens += turnTokens;
+        const turn = obj.usage || {};
+        tokens += (turn.input_tokens || 0) + (turn.output_tokens || 0);
+        usage = addCodexTurnUsage(usage ?? NO_CODEX_USAGE, turn);
       }
     } catch { /* skip malformed lines */ }
   }
@@ -108,6 +152,7 @@ export function parseCodexJSONL(lines: string[]): ParsedCodexJSONL {
     toolCalls,
     tokens,
     sessionId,
+    usage,
   };
 }
 
@@ -166,6 +211,192 @@ export function installSkillToTempHome(
   return home;
 }
 
+// --- Spawn core ---
+
+/**
+ * Spawn `codex <args>` in its own process group and collect its JSONL until
+ * exit, the deadline or an abort, with the existing drain grace. Shared by
+ * runCodexSkill and the Codex host (codex-host-runner.ts). `onLine` sees each
+ * JSONL line as it arrives with the elapsed milliseconds since `startTime`.
+ */
+export async function execCodex(args: string[], opts: {
+  cwd: string;
+  env: Record<string, string>;
+  startTime: number;
+  deadline: number;
+  signal?: AbortSignal;
+  onLine?: (line: string, elapsedMs: number) => void;
+  /** Called with the group-owning pid right after spawn; a throw kills the group. */
+  onSpawn?: (pid: number) => void;
+}): Promise<CodexResult> {
+  const { cwd, env, startTime, deadline, signal, onLine } = opts;
+  const proc = spawn('codex', args, {
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+    env,
+  });
+  if (opts.onSpawn) {
+    try {
+      if (proc.pid === undefined) throw new Error('Codex did not start');
+      opts.onSpawn(proc.pid);
+    } catch (error) {
+      killProcessGroup(proc, 'SIGKILL');
+      proc.stdout!.destroy();
+      proc.stderr!.destroy();
+      throw error;
+    }
+  }
+  const collectedLines: string[] = [];
+  // work --exit--> drain (<=5s) --> result
+  //   \--timeout/abort--> kill group + close pipes --> timeout result
+  // Exit status comes from 'exit'; a forced drain after exit 0 is an error.
+  let stdoutBuffer = '';
+  let stderr = '';
+  let exitCode: number | undefined;
+  let timedOut = false;
+  let drainExpired = false;
+  let streamError: { stream: 'stdout' | 'stderr'; error: Error } | undefined;
+  let spawnError: Error | undefined;
+  let stdoutDone = false;
+  let stderrDone = false;
+  let stdoutEnded = false;
+  let stderrEnded = false;
+  let finalized = false;
+  const stdoutDecoder = new StringDecoder('utf8');
+  const stderrDecoder = new StringDecoder('utf8');
+  let workTimer: ReturnType<typeof setTimeout> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  let finish!: () => void;
+  const finished = new Promise<void>((resolve) => { finish = resolve; });
+
+  const maybeFinish = () => {
+    if (exitCode !== undefined && stdoutDone && stderrDone) finish();
+  };
+  const closePipes = () => {
+    // Destroy both streams: canceling stdout alone cannot release an
+    // inherited stderr pipe held by a descendant in another process group.
+    proc.stdout!.destroy();
+    proc.stderr!.destroy();
+  };
+  const expireDrain = () => {
+    drainExpired = !stdoutDone || !stderrDone;
+    killProcessGroup(proc, 'SIGKILL');
+    closePipes();
+    // Also bound the rare case where a failed group kill produces no exit.
+    finish();
+  };
+  const stopRun = () => {
+    // A real auth/crash exit that preceded a pipe stall stays a real exit.
+    if (exitCode === undefined) timedOut = true;
+    else drainExpired ||= !stdoutDone || !stderrDone;
+    killProcessGroup(proc, 'SIGKILL');
+    closePipes();
+    clearTimeout(drainTimer);
+    drainTimer = setTimeout(expireDrain, CODEX_DRAIN_GRACE_MS);
+    maybeFinish();
+  };
+  const onExit = (code: number | null, exitSignal: NodeJS.Signals | null) => {
+    exitCode = code ?? (exitSignal ? 128 + (os.constants.signals[exitSignal] ?? 0) : 1);
+    clearTimeout(workTimer);
+    clearTimeout(drainTimer);
+    // 'exit' means the child is gone; 'close' also waits for descendant
+    // pipes. Start the drain allowance at actual exit, never at close.
+    drainTimer = setTimeout(expireDrain, CODEX_DRAIN_GRACE_MS);
+    maybeFinish();
+  };
+  const onSpawnError = (error: Error) => {
+    if (finalized) return;
+    spawnError = error;
+    exitCode = 1;
+    closePipes();
+    finish();
+  };
+  // Closure releases lifecycle waits, but only 'end' proves all bytes were
+  // drained. A destroyed pipe can emit 'close' without either EOF or error.
+  const onStdoutDone = () => { if (!finalized) { stdoutDone = true; maybeFinish(); } };
+  const onStderrDone = () => { if (!finalized) { stderrDone = true; maybeFinish(); } };
+  const onStdoutEnd = () => { if (!finalized) { stdoutBuffer += stdoutDecoder.end(); stdoutEnded = true; onStdoutDone(); } };
+  const onStderrEnd = () => { if (!finalized) { stderr += stderrDecoder.end(); stderrEnded = true; onStderrDone(); } };
+  const onStreamError = (stream: 'stdout' | 'stderr', error: Error) => {
+    if (!finalized) streamError ??= { stream, error };
+  };
+  const onStdout = (chunk: Buffer) => {
+    if (finalized) return;
+    stdoutBuffer += stdoutDecoder.write(chunk);
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      collectedLines.push(line);
+      onLine?.(line, Date.now() - startTime);
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'item.completed' && event.item) {
+          const item = event.item;
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          if (item.type === 'command_execution' && item.command) {
+            process.stderr.write(`  [codex ${elapsed}s] ran: ${item.command.slice(0, 100)}\n`);
+          } else if (item.type === 'agent_message' && item.text) {
+            process.stderr.write(`  [codex ${elapsed}s] message: ${item.text.slice(0, 100)}\n`);
+          }
+        }
+      } catch { /* malformed JSONL is ignored by parseCodexJSONL too */ }
+    }
+  };
+  const onStderr = (chunk: Buffer) => { if (!finalized) stderr += stderrDecoder.write(chunk); };
+
+  proc.on('exit', onExit);
+  proc.on('error', onSpawnError);
+  proc.stdout!.on('data', onStdout);
+  proc.stderr!.on('data', onStderr);
+  proc.stdout!.on('end', onStdoutEnd).on('close', onStdoutDone).on('error', error => onStreamError('stdout', error));
+  proc.stderr!.on('end', onStderrEnd).on('close', onStderrDone).on('error', error => onStreamError('stderr', error));
+  signal?.addEventListener('abort', stopRun, { once: true });
+  workTimer = setTimeout(stopRun, Math.max(0, deadline - Date.now()));
+  if (signal?.aborted || Date.now() >= deadline) stopRun();
+
+  try {
+    await finished;
+    if (stdoutBuffer.trim()) collectedLines.push(stdoutBuffer);
+    const parsed = parseCodexJSONL(collectedLines);
+    const result: CodexResult = {
+      ...parsed,
+      exitCode: timedOut ? 124 : exitCode ?? 1,
+      durationMs: Date.now() - startTime,
+      rawLines: collectedLines,
+      stderr,
+    };
+    if (stderr.trim()) process.stderr.write(`  [codex stderr] ${stderr.trim().slice(0, 200)}\n`);
+    if (spawnError) throw new CodexHarnessError(`Could not start Codex: ${spawnError.message}`, result);
+    const incompleteStreams = [!stdoutEnded && 'stdout', !stderrEnded && 'stderr'].filter(Boolean).join(' and ');
+    if (result.exitCode === 0 && (drainExpired || streamError || incompleteStreams)) {
+      throw new CodexHarnessError(
+        drainExpired ? `Codex output drain exceeded ${CODEX_DRAIN_GRACE_MS}ms after exit 0`
+          : streamError ? `Codex ${streamError.stream} stream failed: ${streamError.error.message}`
+          : `Codex ${incompleteStreams} closed before EOF after exit 0`,
+        result,
+      );
+    }
+    return result;
+  } finally {
+    finalized = true;
+    clearTimeout(workTimer);
+    clearTimeout(drainTimer);
+    signal?.removeEventListener('abort', stopRun);
+    // Child exit and closed pipes do not prove its descendants exited:
+    // background tools may redirect both streams. Reap the owned group on
+    // every result, including ordinary success and genuine process failure.
+    killProcessGroup(proc, 'SIGKILL');
+    closePipes();
+    proc.removeListener('exit', onExit);
+    // Retain the harmless error listener through stream teardown so a late
+    // OS spawn error cannot turn into an unhandled event after cleanup.
+    proc.stdout!.removeListener('data', onStdout);
+    proc.stderr!.removeListener('data', onStderr);
+  }
+}
+
 // --- Main runner ---
 
 /**
@@ -209,7 +440,7 @@ export async function runCodexSkill(opts: {
 
   const emptyResult = (exitCode: number, output = ''): CodexResult => ({
     output, reasoning: [], toolCalls: [], tokens: 0, exitCode,
-    durationMs: Date.now() - startTime, sessionId: null, rawLines: [], stderr: '',
+    durationMs: Date.now() - startTime, sessionId: null, rawLines: [], stderr: '', usage: null,
   });
   if (signal?.aborted || Date.now() >= deadline) return emptyResult(124);
 
@@ -257,7 +488,8 @@ export async function runCodexSkill(opts: {
     // exactly that. Empirically verified against codex on this machine.
     const args = ['exec', '--json', '-s', sandbox, '--skip-git-repo-check'];
     if (ignoreUserConfig) args.push('--ignore-user-config');
-    args.push('--model', model ?? process.env.GSTACK_CODEX_MODEL ?? CODEX_FRONTIER_MODEL);
+    const sessionModel = model ?? process.env.GSTACK_CODEX_MODEL ?? CODEX_FRONTIER_MODEL;
+    args.push('--model', sessionModel);
     for (const override of configOverrides) args.push('-c', override);
     args.push(prompt);
 
@@ -275,162 +507,17 @@ export async function runCodexSkill(opts: {
     // dir beside CODEX_HOME instead of the shard TMPDIR that holds tempHome.
     const tempTmpDir = path.join(tempHome, 'tmp');
     fs.mkdirSync(tempTmpDir, { recursive: true });
-    const proc = spawn('codex', args, {
-      cwd: cwd || skillDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
+    const result = await execCodex(args, {
+      cwd: cwd || skillDir, startTime, deadline, signal,
       env: hermeticChildEnv(
         { HOME: tempHome, CODEX_HOME: tempCodexDir, TMPDIR: tempTmpDir },
         { extraAllow: ['OPENAI_API_KEY', 'CODEX_*'] },
       ),
+    }).catch((error: unknown) => {
+      if (error instanceof CodexHarnessError && error.result) error.result.model = sessionModel;
+      throw error;
     });
-    const collectedLines: string[] = [];
-    // work --exit--> drain (<=5s) --> result
-    //   \--timeout/abort--> kill group + close pipes --> timeout result
-    // Exit status comes from 'exit'; a forced drain after exit 0 is an error.
-    let stdoutBuffer = '';
-    let stderr = '';
-    let exitCode: number | undefined;
-    let timedOut = false;
-    let drainExpired = false;
-    let streamError: { stream: 'stdout' | 'stderr'; error: Error } | undefined;
-    let spawnError: Error | undefined;
-    let stdoutDone = false;
-    let stderrDone = false;
-    let stdoutEnded = false;
-    let stderrEnded = false;
-    let finalized = false;
-    const stdoutDecoder = new StringDecoder('utf8');
-    const stderrDecoder = new StringDecoder('utf8');
-    let workTimer: ReturnType<typeof setTimeout> | undefined;
-    let drainTimer: ReturnType<typeof setTimeout> | undefined;
-    let finish!: () => void;
-    const finished = new Promise<void>((resolve) => { finish = resolve; });
-
-    const maybeFinish = () => {
-      if (exitCode !== undefined && stdoutDone && stderrDone) finish();
-    };
-    const closePipes = () => {
-      // Destroy both streams: canceling stdout alone cannot release an
-      // inherited stderr pipe held by a descendant in another process group.
-      proc.stdout!.destroy();
-      proc.stderr!.destroy();
-    };
-    const expireDrain = () => {
-      drainExpired = !stdoutDone || !stderrDone;
-      killProcessGroup(proc, 'SIGKILL');
-      closePipes();
-      // Also bound the rare case where a failed group kill produces no exit.
-      finish();
-    };
-    const stopRun = () => {
-      // A real auth/crash exit that preceded a pipe stall stays a real exit.
-      if (exitCode === undefined) timedOut = true;
-      else drainExpired ||= !stdoutDone || !stderrDone;
-      killProcessGroup(proc, 'SIGKILL');
-      closePipes();
-      clearTimeout(drainTimer);
-      drainTimer = setTimeout(expireDrain, CODEX_DRAIN_GRACE_MS);
-      maybeFinish();
-    };
-    const onExit = (code: number | null, exitSignal: NodeJS.Signals | null) => {
-      exitCode = code ?? (exitSignal ? 128 + (os.constants.signals[exitSignal] ?? 0) : 1);
-      clearTimeout(workTimer);
-      clearTimeout(drainTimer);
-      // 'exit' means the child is gone; 'close' also waits for descendant
-      // pipes. Start the drain allowance at actual exit, never at close.
-      drainTimer = setTimeout(expireDrain, CODEX_DRAIN_GRACE_MS);
-      maybeFinish();
-    };
-    const onSpawnError = (error: Error) => {
-      if (finalized) return;
-      spawnError = error;
-      exitCode = 1;
-      closePipes();
-      finish();
-    };
-    // Closure releases lifecycle waits, but only 'end' proves all bytes were
-    // drained. A destroyed pipe can emit 'close' without either EOF or error.
-    const onStdoutDone = () => { if (!finalized) { stdoutDone = true; maybeFinish(); } };
-    const onStderrDone = () => { if (!finalized) { stderrDone = true; maybeFinish(); } };
-    const onStdoutEnd = () => { if (!finalized) { stdoutBuffer += stdoutDecoder.end(); stdoutEnded = true; onStdoutDone(); } };
-    const onStderrEnd = () => { if (!finalized) { stderr += stderrDecoder.end(); stderrEnded = true; onStderrDone(); } };
-    const onStreamError = (stream: 'stdout' | 'stderr', error: Error) => {
-      if (!finalized) streamError ??= { stream, error };
-    };
-    const onStdout = (chunk: Buffer) => {
-      if (finalized) return;
-      stdoutBuffer += stdoutDecoder.write(chunk);
-      const lines = stdoutBuffer.split('\n');
-      stdoutBuffer = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        collectedLines.push(line);
-        try {
-          const event = JSON.parse(line);
-          if (event.type === 'item.completed' && event.item) {
-            const item = event.item;
-            const elapsed = Math.round((Date.now() - startTime) / 1000);
-            if (item.type === 'command_execution' && item.command) {
-              process.stderr.write(`  [codex ${elapsed}s] ran: ${item.command.slice(0, 100)}\n`);
-            } else if (item.type === 'agent_message' && item.text) {
-              process.stderr.write(`  [codex ${elapsed}s] message: ${item.text.slice(0, 100)}\n`);
-            }
-          }
-        } catch { /* malformed JSONL is ignored by parseCodexJSONL too */ }
-      }
-    };
-    const onStderr = (chunk: Buffer) => { if (!finalized) stderr += stderrDecoder.write(chunk); };
-
-    proc.on('exit', onExit);
-    proc.on('error', onSpawnError);
-    proc.stdout!.on('data', onStdout);
-    proc.stderr!.on('data', onStderr);
-    proc.stdout!.on('end', onStdoutEnd).on('close', onStdoutDone).on('error', error => onStreamError('stdout', error));
-    proc.stderr!.on('end', onStderrEnd).on('close', onStderrDone).on('error', error => onStreamError('stderr', error));
-    signal?.addEventListener('abort', stopRun, { once: true });
-    workTimer = setTimeout(stopRun, Math.max(0, deadline - Date.now()));
-    if (signal?.aborted || Date.now() >= deadline) stopRun();
-
-    try {
-      await finished;
-      if (stdoutBuffer.trim()) collectedLines.push(stdoutBuffer);
-      const parsed = parseCodexJSONL(collectedLines);
-      const result: CodexResult = {
-        ...parsed,
-        exitCode: timedOut ? 124 : exitCode ?? 1,
-        durationMs: Date.now() - startTime,
-        rawLines: collectedLines,
-        stderr,
-      };
-      if (stderr.trim()) process.stderr.write(`  [codex stderr] ${stderr.trim().slice(0, 200)}\n`);
-      if (spawnError) throw new CodexHarnessError(`Could not start Codex: ${spawnError.message}`, result);
-      const incompleteStreams = [!stdoutEnded && 'stdout', !stderrEnded && 'stderr'].filter(Boolean).join(' and ');
-      if (result.exitCode === 0 && (drainExpired || streamError || incompleteStreams)) {
-        throw new CodexHarnessError(
-          drainExpired ? `Codex output drain exceeded ${CODEX_DRAIN_GRACE_MS}ms after exit 0`
-            : streamError ? `Codex ${streamError.stream} stream failed: ${streamError.error.message}`
-            : `Codex ${incompleteStreams} closed before EOF after exit 0`,
-          result,
-        );
-      }
-      return result;
-    } finally {
-      finalized = true;
-      clearTimeout(workTimer);
-      clearTimeout(drainTimer);
-      signal?.removeEventListener('abort', stopRun);
-      // Child exit and closed pipes do not prove its descendants exited:
-      // background tools may redirect both streams. Reap the owned group on
-      // every result, including ordinary success and genuine process failure.
-      killProcessGroup(proc, 'SIGKILL');
-      closePipes();
-      proc.removeListener('exit', onExit);
-      // Retain the harmless error listener through stream teardown so a late
-      // OS spawn error cannot turn into an unhandled event after cleanup.
-      proc.stdout!.removeListener('data', onStdout);
-      proc.stderr!.removeListener('data', onStderr);
-    }
+    return { ...result, model: sessionModel };
 
   } finally {
     // Clean up temp HOME

@@ -54,6 +54,7 @@ static int wait_bounded(pid_t child,int *status,int seconds){
   for(int i=0;i<10;i++){pid_t r=waitpid(child,status,WNOHANG);if(r==child)return -1;if(r<0&&errno!=EINTR)return -1;while(nanosleep(&delay,&delay)&&errno==EINTR){}delay.tv_sec=0;delay.tv_nsec=100000000;}
   return -1;
 }
+/* argv[0] is "docker", not the canonical path: OrbStack's docker is a multicall binary that dispatches on argv[0]. */
 static int resource_present(const char *run_dir,const char *docker,const char *endpoint,const char *id){
   char output[4096];if(snprintf(output,sizeof output,"%s/watchdog.ps.%ld",run_dir,(long)getpid())>=(int)sizeof output)return -1;
   int fd=open(output,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);if(fd<0)return -1;
@@ -63,7 +64,7 @@ static int resource_present(const char *run_dir,const char *docker,const char *e
     close(fd);
     int nullfd=open("/dev/null",O_WRONLY);if(nullfd>=0){(void)dup2(nullfd,STDERR_FILENO);close(nullfd);}
     char filter[80];if(snprintf(filter,sizeof filter,"id=%s",id)>=(int)sizeof filter)_exit(127);
-    char *const argv[]={(char*)docker,"--host",(char*)endpoint,"ps","--all","--quiet","--no-trunc","--filter",filter,NULL};
+    char *const argv[]={"docker","--host",(char*)endpoint,"ps","--all","--quiet","--no-trunc","--filter",filter,NULL};
     char *const envp[]={"PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",NULL};execve(docker,argv,envp);_exit(127);
   }
   close(fd);int status=0;if(wait_bounded(child,&status,10)!=0){unlink(output);return -1;}
@@ -74,7 +75,7 @@ static int resource_present(const char *run_dir,const char *docker,const char *e
 static int remove_container(const char *docker, const char *endpoint, const char *id) {
   pid_t child=fork(); if(child<0)return -1;
   if(child==0){
-    char *const argv[]={(char*)docker,"--host",(char*)endpoint,"rm","--force","--volumes",(char*)id,NULL};
+    char *const argv[]={"docker","--host",(char*)endpoint,"rm","--force","--volumes",(char*)id,NULL};
     char *const envp[]={"PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",NULL};
     execve(docker,argv,envp); _exit(127);
   }
@@ -84,7 +85,7 @@ static int remove_container(const char *docker, const char *endpoint, const char
 static int cleanup_label(const char *run_dir,const char *docker,const char *endpoint,const char *label){
   char output[4096],filter[160];if(snprintf(output,sizeof output,"%s/watchdog.labels.%ld",run_dir,(long)getpid())>=(int)sizeof output||snprintf(filter,sizeof filter,"label=com.gstack.cso.run=%s",label)>=(int)sizeof filter)return -1;
   int fd=open(output,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);if(fd<0)return -1;pid_t child=fork();if(child<0){close(fd);unlink(output);return -1;}
-  if(child==0){if(dup2(fd,STDOUT_FILENO)<0)_exit(127);close(fd);int nullfd=open("/dev/null",O_WRONLY);if(nullfd>=0){(void)dup2(nullfd,STDERR_FILENO);close(nullfd);}char *const argv[]={(char*)docker,"--host",(char*)endpoint,"ps","--all","--quiet","--no-trunc","--filter",filter,NULL};char *const envp[]={"PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",NULL};execve(docker,argv,envp);_exit(127);}
+  if(child==0){if(dup2(fd,STDOUT_FILENO)<0)_exit(127);close(fd);int nullfd=open("/dev/null",O_WRONLY);if(nullfd>=0){(void)dup2(nullfd,STDERR_FILENO);close(nullfd);}char *const argv[]={"docker","--host",(char*)endpoint,"ps","--all","--quiet","--no-trunc","--filter",filter,NULL};char *const envp[]={"PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",NULL};execve(docker,argv,envp);_exit(127);}
   close(fd);int status=0;if(wait_bounded(child,&status,10)!=0||!WIFEXITED(status)||WEXITSTATUS(status)!=0){unlink(output);return -1;}
   FILE *f=fopen(output,"r");if(!f){unlink(output);return -1;}char line[256];int failed=0;while(fgets(line,sizeof line,f)){line[strcspn(line,"\r\n")]=0;if(!is_id(line)||remove_container(docker,endpoint,line)!=0)failed=1;}fclose(f);unlink(output);return failed?-1:0;
 }

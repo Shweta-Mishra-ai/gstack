@@ -37,6 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GSTACK_CONFIG="$SCRIPT_DIR/gstack-config"
 . "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+. "$(dirname "$0")/gstack-claude-root.sh" || { echo "$0: $(dirname "$0")/gstack-claude-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade" >&2; exit 1; }
 gstack_state_root_select
 STATE_DIR="$_gstack_sr_root"
 SETTINGS_FILE="${GSTACK_SETTINGS_FILE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}"
@@ -53,12 +54,8 @@ VENDOR_OWN_RE='[Mm]emorable.*hook\s+user-prompt'
 
 # Canonical install root — the hook command MUST point at the stable install,
 # never at the tree this CLI happens to run from (setup's phantom-hooks rule).
-# Copied from setup:2481-2489; TODO D24 extracts a shared helper.
-CANONICAL_GSTACK_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gstack"
-if [ ! -x "$CANONICAL_GSTACK_ROOT/bin/gstack-session-update" ] \
-   && [ -x "$HOME/.claude/skills/gstack/bin/gstack-session-update" ]; then
-  CANONICAL_GSTACK_ROOT="$HOME/.claude/skills/gstack"
-fi
+# Setup registers through the same helper, so both write one path.
+CANONICAL_GSTACK_ROOT="$(gstack_canonical_claude_root)"
 HOOK_CMD_PATH="$CANONICAL_GSTACK_ROOT/$HOOK_REL"
 # Mutations go through the CANONICAL hook manager so the code that registers
 # is the code that will run. Every verb falls back to this tree's copy when the
@@ -377,7 +374,7 @@ status_bridge() {
     # JSON; a failed query is reported as unknown, never as an empty history.
     local egress_json
     if egress_json="$("$EGRESS_BIN" list --sink "$SINK" --json 2>/dev/null)"; then
-      n="$(printf '%s' "$egress_json" | bun -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8")||"[]");console.log(Array.isArray(a)?a.length:0)' 2>/dev/null)"
+      n="$(printf '%s' "$egress_json" | bun --no-env-file --config=/dev/null -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8")||"[]");console.log(Array.isArray(a)?a.length:0)' 2>/dev/null)"
       case "$n" in *[!0-9]*|"") n="unknown (could not parse gstack-egress output)" ;; esac
     else
       n="unknown (gstack-egress list failed; run it yourself)"

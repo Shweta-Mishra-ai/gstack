@@ -37,8 +37,19 @@ const PREPUSH = path.resolve(import.meta.dir, "..", "bin", "gstack-redact-prepus
 let repo: string;
 let remote: string;
 
+// Same blanking as test/redact-prepush-scan-range.test.ts (#2967). A
+// hooksPath written into the fixture repo still runs.
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_COUNT = "0";
+  delete env.GIT_CONFIG_PARAMETERS;
+  return env;
+}
+
 function git(args: string[], cwd = repo): string {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000 });
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000, env: gitEnv() });
   if (r.status !== 0) throw new Error(`git ${args.join(" ")}\n${r.stderr}`);
   return r.stdout?.trim() ?? "";
 }
@@ -116,7 +127,7 @@ describe("rebased force-push does not re-scan upstream commits (#2573)", () => {
     // The rebased tip exists locally and is NOT an ancestor of HEAD — the
     // exact condition #2573 identified as the untested third branch.
     expect(git(["cat-file", "-t", preRebaseTip])).toBe("commit");
-    const isAncestor = spawnSync("git", ["merge-base", "--is-ancestor", preRebaseTip, "HEAD"], { cwd: repo, timeout: 30_000 });
+    const isAncestor = spawnSync("git", ["merge-base", "--is-ancestor", preRebaseTip, "HEAD"], { cwd: repo, timeout: 30_000, env: gitEnv() });
     expect(isAncestor.status).not.toBe(0);
     // What the OLD range would scan: upstream's published fixture included.
     const oldDiff = git(["diff", "--unified=0", `${preRebaseTip}..HEAD`]);
@@ -151,5 +162,56 @@ describe("rebased force-push does not re-scan upstream commits (#2573)", () => {
     expect(narrowed).toHaveLength(1); // the rebased copy of "my clean work"
     const subject = git(["log", "-1", "--format=%s", narrowed[0]]);
     expect(subject).toBe("my clean work");
+  });
+});
+
+describe("fixture git ignores inherited hook config (#2967)", () => {
+  test("global, system, and environment-injected hooksPath cannot reject the push", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "prepush-rebase-inherited-"));
+    const hooks = path.join(root, "hooks");
+    fs.mkdirSync(hooks);
+    fs.writeFileSync(path.join(hooks, "pre-push"), "#!/bin/sh\necho inherited-hook >&2\nexit 1\n", { mode: 0o755 });
+    const config = path.join(root, "gitconfig");
+    fs.writeFileSync(config, `[core]\n\thooksPath = ${JSON.stringify(hooks)}\n`);
+    const prev = {
+      GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+      GIT_CONFIG_SYSTEM: process.env.GIT_CONFIG_SYSTEM,
+      GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+      GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS,
+    };
+    try {
+      process.env.GIT_CONFIG_GLOBAL = config;
+      process.env.GIT_CONFIG_SYSTEM = config;
+      delete process.env.GIT_CONFIG_NOSYSTEM;
+      process.env.GIT_CONFIG_COUNT = "1";
+      process.env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+      process.env.GIT_CONFIG_VALUE_0 = hooks;
+      process.env.GIT_CONFIG_PARAMETERS = `'core.hooksPath=${hooks}'`;
+      commit("again.txt", "again\n", "again");
+      git(["push", "-q", "origin", "main"]);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a repo-local hooksPath still rejects the fixture push", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "prepush-rebase-local-hook-"));
+    const hooks = path.join(root, "hooks");
+    fs.mkdirSync(hooks);
+    fs.writeFileSync(path.join(hooks, "pre-push"), "#!/bin/sh\necho inherited-hook >&2\nexit 1\n", { mode: 0o755 });
+    try {
+      git(["config", "core.hooksPath", hooks]);
+      commit("local-hook.txt", "x\n", "local hook");
+      expect(() => git(["push", "-q", "origin", "main"])).toThrow(/inherited-hook/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

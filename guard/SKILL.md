@@ -17,6 +17,11 @@ hooks:
         - type: command
           command: 'bash -c "exec bash \"$HOME/.claude/skills/gstack/careful/bin/check-careful.sh\""'
           statusMessage: "Checking for destructive commands..."
+    - matcher: "PowerShell"
+      hooks:
+        - type: command
+          command: 'bash -c "exec bash \"$HOME/.claude/skills/gstack/careful/bin/check-careful.sh\""'
+          statusMessage: "Checking for destructive commands..."
     - matcher: "Edit"
       hooks:
         - type: command
@@ -27,17 +32,14 @@ hooks:
         - type: command
           command: 'bash -c "exec bash \"$HOME/.claude/skills/gstack/freeze/bin/check-freeze.sh\""'
           statusMessage: "Checking freeze boundary..."
+    - matcher: "NotebookEdit"
+      hooks:
+        - type: command
+          command: 'bash -c "exec bash \"$HOME/.claude/skills/gstack/freeze/bin/check-freeze.sh\""'
+          statusMessage: "Checking freeze boundary..."
 ---
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
-
-
-## When to invoke this skill
-
-Combines /careful (warns before rm -rf, DROP TABLE, force-push, etc.) with
-/freeze (blocks edits outside a specified directory). Use for maximum safety
-when touching prod or debugging live systems. Use when asked to "guard mode",
-"full safety", "lock it down", or "maximum safety".
 
 # /guard — Full Safety Mode
 

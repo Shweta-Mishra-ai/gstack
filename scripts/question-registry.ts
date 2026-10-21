@@ -206,6 +206,14 @@ export const QUESTIONS = {
     options: ['fix-now', 'investigate'],
     description: "LLM trust boundary violation — fix before merge?",
   },
+  'review-gate-disposition': {
+    id: 'review-gate-disposition',
+    skill: 'review',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['restore', 'keep-justified', 'keep-other', 'leave-open'],
+    description: "Gate edit (test, threshold, CI or suppression relaxed) — restore the gate, keep it with a reason, or leave it open for a later human?",
+  },
 
   // -----------------------------------------------------------------------
   // /office-hours — YC diagnostic + builder brainstorm
@@ -327,6 +335,14 @@ export const QUESTIONS = {
     options: ['reduce', 'hold'],
     signal_key: 'scope-appetite',
     description: "Plan touches 8+ files — reduce scope or hold?",
+  },
+  'plan-eng-review-structure': {
+    id: 'plan-eng-review-structure',
+    skill: 'plan-eng-review',
+    category: 'routing',
+    door_type: 'two-way',
+    options: ['original-arrangement', 'smaller-arrangement'],
+    description: "Complexity gate — Original arrangement or Smaller arrangement (file/class layout only)?",
   },
   'plan-eng-review-test-gap': {
     id: 'plan-eng-review-test-gap',

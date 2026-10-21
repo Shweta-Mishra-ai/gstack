@@ -101,7 +101,7 @@ IMPORTED=0
 SKIPPED_NO_ANSWER=0
 
 for SESSION_FILE in "${SESSION_FILES[@]}"; do
-  COUNT_LINE=$(SESSION_FILE_PATH="$SESSION_FILE" QLOG_BIN="$SCRIPT_DIR/gstack-question-log" bun -e '
+  COUNT_LINE=$(SESSION_FILE_PATH="$SESSION_FILE" QLOG_BIN="$SCRIPT_DIR/gstack-question-log" bun --no-env-file --config=/dev/null -e '
     const fs = require("fs");
     const path = require("path");
     const { spawnSync } = require("child_process");

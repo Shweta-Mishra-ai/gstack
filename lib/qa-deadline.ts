@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { bunIsolationArgs } from './bun-isolation';
 import { constants as osConstants } from 'node:os';
 import { initializeWindowsReviewJob } from './claude-code-windows-job';
 
@@ -116,6 +117,7 @@ export function qaDeadlineStatus(state: QaDeadline) {
 export interface QaCommandCapture {
   write(stream: 'stdout' | 'stderr', chunk: Buffer): void;
   complete(result: QaCommandResult): void;
+  spawn?: { cwd?: string; env?: Record<string, string> };
 }
 
 export async function runQaDeadlineCommand(file: string, command: string, args: string[], emit: Emit, capture?: QaCommandCapture): Promise<number> {
@@ -142,7 +144,8 @@ export async function runQaDeadlineCommand(file: string, command: string, args: 
     }
     let outcome: number | undefined;
     let settled = false;
-    const child = spawn(command, args, { detached: process.platform !== 'win32', stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true });
+    const child = spawn(command, args, { detached: process.platform !== 'win32', stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true,
+      cwd: capture?.spawn?.cwd, env: capture?.spawn?.env });
     const kill = () => {
       if (!child.pid) return;
       try {
@@ -213,7 +216,7 @@ export async function runQaWindowsWorker(args: string[], emit: Emit, entrypoint:
   captureFiles?: { stdout: number; stderr: number }): Promise<number> {
   try { await initializeWindowsReviewJob(); } catch { throw new QaDeadlineError('Windows process containment is unavailable; no command was started'); }
   return new Promise<number>(resolve => {
-    const worker = spawn(process.execPath, [...process.execArgv, entrypoint, '--receipt-worker', ...args], {
+    const worker = spawn(process.execPath, [...bunIsolationArgs(), ...process.execArgv, entrypoint, '--receipt-worker', ...args], {
       stdio: ['inherit', captureFiles?.stdout ?? 'inherit', captureFiles?.stderr ?? 'inherit', 'ipc'], windowsHide: true,
     });
     const kill = () => { worker.kill('SIGKILL'); };

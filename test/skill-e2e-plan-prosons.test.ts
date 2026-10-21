@@ -28,7 +28,9 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { CAPTURE_MS } from './helpers/eval-budgets';
+import { NEUTRAL_POSTURE_RE } from './helpers/prosons-posture';
 import { runSkillTest } from './helpers/session-runner';
+import { resolveEvalModel } from '../lib/eval-model';
 import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
 import {
   ROOT, runId,
@@ -51,7 +53,6 @@ const RECOMMENDATION_RE = /[Rr]ecommendation:/;
 const PROS_CONS_HEADER_RE = /Pros\s*\/\s*cons:/i;
 const NET_LINE_RE = /^Net:/m;
 const HARD_STOP_ESCAPE_RE = /✅\s+No cons\s+—\s+this is a hard-stop choice/;
-const NEUTRAL_POSTURE_RE = /taste call/i;
 const RECOMMENDED_LABEL_RE = /\(recommended\)/;
 
 function countChars(text: string, char: string): number {
@@ -134,7 +135,7 @@ function setupPlanDir(tmpPrefix: string, planContent: string, skillName: string)
 }
 
 function captureInstruction(outFile: string): string {
-  return `Write the verbatim text of the single AskUserQuestion you would have made to ${outFile} (full text including D<N> header, ELI10, Stakes, Recommendation, Pros/cons, and Net line — the complete rich markdown body). Do NOT call any tool to ask the user. Do NOT paraphrase. This is a format-capture test.`;
+  return `Write the text of the single AskUserQuestion you would have made to ${outFile} (full text including D<N> header, ELI10, Stakes, Recommendation, Pros/cons, and Net line — the complete rich markdown body). Do NOT call any tool to ask the user.`;
 }
 
 // --- Case 1: Format positive — all v1.7.0.0 tokens present ---
@@ -155,7 +156,7 @@ describeIfSelected('Plan Prosons — Format Positive', ['plan-review-prosons-for
   testConcurrentIfSelected('plan-review-prosons-format', async () => {
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-review-prosons-format', suite: 'Plan Prosons — Format Positive',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       run: signal => runSkillTest({
         signal,
         prompt: `Read plan-ceo-review/SKILL.md for the review workflow.
@@ -170,7 +171,7 @@ After writing the file, stop.`,
         timeout: CAPTURE_MS,
         testName: 'plan-review-prosons-format',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-review prosons format positive', result);
@@ -217,7 +218,7 @@ describeIfSelected('Plan Prosons — Hard-stop Negative', ['plan-review-prosons-
   testConcurrentIfSelected('plan-review-prosons-hardstop-neg', async () => {
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-review-prosons-hardstop-neg', suite: 'Plan Prosons — Hard-stop Negative',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       run: signal => runSkillTest({
         signal,
         prompt: `Read plan-ceo-review/SKILL.md.
@@ -232,7 +233,7 @@ After writing the file, stop.`,
         timeout: CAPTURE_MS,
         testName: 'plan-review-prosons-hardstop-neg',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-review prosons hard-stop negative', result);
@@ -270,7 +271,7 @@ describeIfSelected('Plan Prosons — Neutral-posture Negative', ['plan-review-pr
   testConcurrentIfSelected('plan-review-prosons-neutral-neg', async () => {
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-review-prosons-neutral-neg', suite: 'Plan Prosons — Neutral Negative',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       run: signal => runSkillTest({
         signal,
         prompt: `Read plan-ceo-review/SKILL.md.
@@ -285,7 +286,7 @@ After writing the file, stop.`,
         timeout: CAPTURE_MS,
         testName: 'plan-review-prosons-neutral-neg',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-review prosons neutral negative', result);
@@ -324,7 +325,7 @@ describeIfSelected('Plan Prosons — Hard-stop Positive', ['plan-ceo-review-pros
   testConcurrentIfSelected('plan-ceo-review-prosons-cadence', async () => {
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-ceo-review-prosons-cadence', suite: 'Plan Prosons — Hard-stop Positive',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       run: signal => runSkillTest({
         signal,
         prompt: `Read plan-ceo-review/SKILL.md.
@@ -339,7 +340,7 @@ After writing the file, stop.`,
         timeout: CAPTURE_MS,
         testName: 'plan-ceo-review-prosons-cadence',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-review prosons hard-stop positive', result);

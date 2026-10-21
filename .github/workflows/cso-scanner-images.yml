@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Prove scanner normalization and fail-closed behavior
         run: |
           set -eu
@@ -64,7 +64,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Require native Docker and the declared architecture
         env:
           CSO_ARCH: ${{ matrix.arch }}
@@ -75,7 +75,7 @@ jobs:
             *) echo 'Native architecture mismatch; emulation cannot qualify a scanner.' >&2; exit 1 ;;
           esac
           docker --host unix:///var/run/docker.sock info
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -128,7 +128,7 @@ jobs:
           printf 'tag=%s:%s-%s\n' "$name" "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Build native scanner wrapper with SBOM and provenance
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: lib/cso
           file: lib/cso/scanner-images/scanner.Dockerfile
@@ -145,16 +145,17 @@ jobs:
           CSO_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           set -eu
-          docker buildx imagetools inspect "$CSO_IMAGE" --format '{{ json .SBOM.SPDX }}' > sbom.spdx.json
-          jq -e '.spdxVersion == "SPDX-2.3" and (.packages | type == "array")' sbom.spdx.json
+          docker buildx imagetools inspect "$CSO_IMAGE" --format '{{ json .SBOM.SPDX }}' > sbom.full.spdx.json
+          jq -c -f scripts/cso-sbom-packages.jq sbom.full.spdx.json > sbom.spdx.json
+          jq -e -f scripts/cso-sbom-packages-check.jq sbom.spdx.json >/dev/null
       - name: Sign build provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
       - name: Sign the image SBOM
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -252,7 +253,7 @@ jobs:
           printf '%s\n' "$CSO_UPSTREAM" > upstream-evidence.json
           printf '%s\n' "$CSO_SBOM_GENERATOR" > sbom-generator-evidence.json
           sha256sum "$output" staged-profile.json version.sha256 declared-assets.json public-image.json sbom.spdx.json provenance-verification.json sbom-verification.json upstream-evidence.json sbom-generator-evidence.json upstream-base-*-verification.json sbom-generator-*-verification.json > evidence.sha256
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cso-scanner-profile-${{ matrix.scanner }}-${{ matrix.arch }}
           path: |
@@ -288,8 +289,8 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: cso-scanner-profile-*
           path: qualified-artifacts
@@ -304,7 +305,7 @@ jobs:
           image_prefix="ghcr.io/${GITHUB_REPOSITORY,,}/cso-scanners/"
           bun run scripts/cso-scanner-catalog.ts assemble qualified-fragments lib/cso/scanner-images/catalog.json catalog-proposal.json --revision "$revision" --source-commit "$GITHUB_SHA" --workflow "$workflow" --image-prefix "$image_prefix"
           bun run scripts/cso-scanner-catalog.ts validate catalog-proposal.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cso-scanner-catalog-proposal
           path: catalog-proposal.json
@@ -328,8 +329,8 @@ jobs:
           persist-credentials: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cso-scanner-catalog-proposal
           path: promotion

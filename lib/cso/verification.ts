@@ -6,6 +6,7 @@ import {
   AssertionWitnessBinding,
   AssertionWitnessReceipt,
   CsoError,
+  MAX_VERIFICATION_ATTEMPT_MS,
   PreparationProof,
   RepairBundle,
   RepairReviewArtifact,
@@ -1034,7 +1035,9 @@ export function preparePatchedSource(snapshot: string, target: string, request: 
       );
     const mode = exists ? fs.statSync(file).mode & 0o777 : 0o600;
     secureDirectory(dirname(file));
+    if (exists) fs.chmodSync(file, mode | 0o200);
     fs.writeFileSync(file, change.after, { mode });
+    fs.chmodSync(file, mode);
   }
 }
 export function certify(params: {
@@ -1216,14 +1219,21 @@ export function certify(params: {
       beforeReceipt.observationHash !== witnessObservationHash(beforeObservation) ||
       afterReceipt.observationHash !== witnessObservationHash(afterObservation) ||
       params.before.existingTests !== beforeReceipt.diagnosticTestsPassed ||
-      params.after.existingTests !== afterReceipt.diagnosticTestsPassed ||
-      !beforeReceipt.externalAssertionsPassed ||
-      !afterReceipt.externalAssertionsPassed
+      params.after.existingTests !== afterReceipt.diagnosticTestsPassed
     )
       throw new CsoError(
         'INCOMPATIBLE_INPUT',
         'Authenticated assertion witness receipts do not match the verifier observations',
       );
+    for (const [phase, receipt] of [
+      ['before', beforeReceipt],
+      ['after', afterReceipt],
+    ] as const)
+      if (!receipt.externalAssertionsPassed)
+        throw new CsoError(
+          'ASSERTION_FAILED',
+          `External assertions failed in the ${phase} phase: booted ${params[phase].booted}, legitimate ${params[phase].legitimate}, security ${params[phase].security}`,
+        );
     const stableExecutions = (receipt: AssertionWitnessReceipt) =>
       receipt.executions.map(({ outputHash: _, ...execution }) => execution);
     if (canonical(stableExecutions(beforeReceipt)) !== canonical(stableExecutions(afterReceipt)))
@@ -1571,7 +1581,7 @@ export class DockerVerificationExecutor implements VerificationExecutor {
     private runExecutionDeadline = Date.now() + 300_000,
     private onExecutionStarted?: () => void | Promise<void>,
   ) {
-    this.attemptDeadline = Math.min(Date.now() + 300_000, runExecutionDeadline);
+    this.attemptDeadline = Math.min(Date.now() + MAX_VERIFICATION_ATTEMPT_MS, runExecutionDeadline);
   }
   async observe(
     source: string,
@@ -1718,7 +1728,7 @@ export class DockerVerificationExecutor implements VerificationExecutor {
           command: ['/opt/cso/run-app', '/bin/sleep', '2147483647'],
           readonlyDirectories: [{ host: fixtures, container: '/fixtures' }],
         });
-        await group.start(app);
+        await group.startHeldApplication(app);
         await dbPrepare(app);
         await group.execDetached(app, [request.start.executable, ...request.start.args]);
       } else {
@@ -1784,7 +1794,7 @@ export class DockerVerificationExecutor implements VerificationExecutor {
         });
         let testResult: { code: number; output: string };
         if (rails) {
-          await group.start(testId);
+          await group.startHeldApplication(testId);
           await dbPrepare(testId);
           const result = await group.execCapture(testId, cleanCommand([test.executable, ...test.args]), {
             workdir: '/work',
@@ -1898,7 +1908,10 @@ export async function verifyRepair(params: {
   }
   let guardedCleanup: (() => Promise<void>) | undefined;
   if (params.watchdogPath) {
-    const deadline = Math.min(params.attemptDeadline ?? Date.now() + 300_000, Date.now() + 300_000);
+    const deadline = Math.min(
+      params.attemptDeadline ?? Date.now() + 300_000,
+      Date.now() + MAX_VERIFICATION_ATTEMPT_MS,
+    );
     guardedCleanup = await attemptGuard(params.runDir, work, params.watchdogPath, deadline);
   }
   secureDirectory(observations);
@@ -1957,7 +1970,7 @@ export async function verifyRepair(params: {
       },
       session = new AssertionWitnessSession(
         observations,
-        Math.min(params.attemptDeadline ?? Date.now() + 300_000, Date.now() + 300_000),
+        Math.min(params.attemptDeadline ?? Date.now() + 300_000, Date.now() + MAX_VERIFICATION_ATTEMPT_MS),
       ),
       stable = (
         phase: 'before' | 'after',

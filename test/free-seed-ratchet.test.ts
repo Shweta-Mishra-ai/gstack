@@ -95,6 +95,7 @@ describe('seed ceiling and shrink-only allowlist', () => {
   });
 
   test('the committed seed holds the ceiling and the allowlist only shrinks', () => {
+    expect(SEED_ALLOWLIST_FILE).toBe('scripts/free-test-seed-allowlist.json');
     const seed = JSON.parse(fs.readFileSync(path.join(ROOT, FREE_TEST_DURATIONS_FILE), 'utf8')) as { durations: Record<string, number> };
     const allowlist = parseSeedAllowlist(fs.readFileSync(path.join(ROOT, SEED_ALLOWLIST_FILE), 'utf8'));
     const explicitBase = process.env.GSTACK_FREE_SEED_BASE;

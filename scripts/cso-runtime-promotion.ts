@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Generate a reviewable catalog candidate from authenticated qualification statements. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -339,10 +339,10 @@ if (import.meta.main) {
       const catalog = validateEvaluationCandidate(readCatalogArtifact(args[1]), buildInputs);
       process.stdout.write(`EVALUATION-ONLY ${catalog.revision}\n`);
     } else if (args[0] === 'evaluation-candidate') {
-      if (args.length !== 5 || args[1] !== '--staged-root' || args[3] !== '--output') {
-        throw new Error('Usage: cso-runtime-promotion.ts evaluation-candidate --staged-root <directory> --output <new-file>');
+      if (![5, 7].includes(args.length) || args[1] !== '--staged-root' || args[3] !== '--output' || (args.length === 7 && args[5] !== '--created-at')) {
+        throw new Error('Usage: cso-runtime-promotion.ts evaluation-candidate --staged-root <directory> --output <new-file> [--created-at <ISO time>]');
       }
-      const candidate = evaluationCandidateCatalog(committedCatalog, buildInputs, collectEvidence(args[2], 'staged-image.json'), new Date().toISOString());
+      const candidate = evaluationCandidateCatalog(committedCatalog, buildInputs, collectEvidence(args[2], 'staged-image.json'), args[6] ?? new Date().toISOString());
       const output = path.resolve(args[4]);
       fs.writeFileSync(output, JSON.stringify(candidate, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
       process.stdout.write(`${output}\n`);

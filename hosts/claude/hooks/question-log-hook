@@ -4,4 +4,4 @@
 # references this file directly.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-exec bun "$HERE/question-log-hook.ts"
+exec bun --no-env-file --config=/dev/null "$HERE/question-log-hook.ts"

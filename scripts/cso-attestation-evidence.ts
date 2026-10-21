@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Bind cryptographically verified `gh attestation verify --format json` output to reviewed statements. */
 import * as fs from 'node:fs';
 import { resolve } from 'node:path';

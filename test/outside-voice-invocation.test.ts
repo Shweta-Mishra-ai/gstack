@@ -22,19 +22,27 @@ const PROMPT_TEXT = 'review this literal text: $(touch NEVER) `touch NEVER` "\'\
 fs.writeFileSync(PROMPT, PROMPT_TEXT);
 
 const fakeSource = `
-import {writeFileSync} from 'node:fs';
+import {existsSync,writeFileSync} from 'node:fs';
 const args = process.argv.slice(2);
 // The free sandbox preflight (\`codex sandbox ... true\`) succeeds unless a test plants its failure.
 if (args[0] === 'sandbox') { if (process.env.FAKE_SANDBOX_STDERR) { console.error(process.env.FAKE_SANDBOX_STDERR); process.exit(1); } process.exit(0); }
 const claude = process.env.FAKE_PROVIDER === 'claude-code';
 const prompt = claude || (args[0] === 'exec' && args[1] === '-') ? await Bun.stdin.text() : args[0] === 'exec' ? args[1] : '';
 writeFileSync(process.env.CAPTURE!, JSON.stringify({args,prompt,cwd:process.cwd()}));
+if (process.env.FAKE_NOTICE_ACK) {
+  const deadline = Date.now() + 1500;
+  while (!existsSync(process.env.FAKE_NOTICE_ACK)) {
+    if (Date.now() >= deadline) { console.error('policy notice was not forwarded before provider execution'); process.exit(17); }
+    await Bun.sleep(10);
+  }
+  writeFileSync(process.env.FAKE_PAID_MARKER!, 'provider execution started');
+}
 if (process.env.FAKE_MODE === 'timeout') {
   if (!claude) console.log('Partial finding before timeout');
   await new Promise(() => {});
 }
 if (process.env.FAKE_MODE === 'auth') { console.error('authentication_error: please log in'); process.exit(1); }
-const response = process.env.FAKE_RESPONSE || 'Recommendation: fix the seeded defect because changed.ts loses data.';
+const response = process.env.FAKE_RESPONSE || 'Medium: changed.ts loses data on retry.\\nRecommendation: fix the seeded defect because changed.ts loses data.';
 if (claude) {
   if (process.env.FAKE_MODE === 'malformed') {console.log('{broken');process.exit(0);}
   console.log(JSON.stringify({result:response,session_id:'outside-session',modelUsage:{'model-a':{inputTokens:4},'model-b':{inputTokens:8}}}));
@@ -86,6 +94,45 @@ function invoke(host: 'codex' | 'claude', options: Partial<OutsideCommandOptions
 function capture() { return JSON.parse(fs.readFileSync(CAPTURE,'utf8')); }
 
 describe('generated outside-review dispatch', () => {
+  test('Claude policy notice reaches the caller before provider execution, while diagnostics remain available', async () => {
+    const state = fs.mkdtempSync(path.join(TMP, 'notice-state-'));
+    const ack = path.join(state, 'caller-saw-notice');
+    const paid = path.join(state, 'provider-started');
+    const diagnostics = path.join(state, 'provider-stderr');
+    fs.writeFileSync(diagnostics, 'provider diagnostic retained\n');
+    const ctx: TemplateContext = { skillName: 'plan-eng-review', tmplPath: 'plan-eng-review/SKILL.md.tmpl', host: 'codex', paths: HOST_PATHS.codex };
+    const command = outsideVoiceCommand(ctx, { promptFile: PROMPT, timeoutMs: 3000, role: 'plan-review' });
+    const child = Bun.spawn(['bash', '-c', command], {
+      cwd: DIR, env: { ...environment('codex'), HOME: TMP, CLAUDE_CONFIG_DIR: path.join(TMP, '.claude'),
+        GSTACK_STATE_ROOT: state, GSTACK_CLAUDE_MODEL: '', FAKE_NOTICE_ACK: ack, FAKE_PAID_MARKER: paid, FAKE_STDERR_FILE: diagnostics },
+      stdout: 'pipe', stderr: 'pipe', timeout: 8000,
+    });
+    const stdout = new Response(child.stdout).text();
+    let stderr = '';
+    const reader = child.stderr.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        stderr += decoder.decode(chunk.value, { stream: true });
+        if (stderr.includes('NOTICE: gstack') && !fs.existsSync(ack)) {
+          expect(fs.existsSync(paid)).toBe(false);
+          fs.writeFileSync(ack, 'notice observed');
+        }
+      }
+      expect(await child.exited).toBe(0);
+      expect(await stdout).toContain('OUTSIDE_STATUS: completed provider=claude-code host=codex');
+      expect(fs.existsSync(paid)).toBe(true);
+      expect(stderr.match(/NOTICE: gstack/g)).toHaveLength(1);
+      expect(stderr).toContain('CLAUDE_MODEL: plan-review via anthropic: claude-fable-5-1');
+      expect(stderr).toContain('provider diagnostic retained');
+    } finally {
+      reader.releaseLock();
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
   for (const host of ['codex', 'claude'] as const) {
     test(`${host}: creative direction retains the completed recommendation gate`, () => {
       const options = { purpose: 'design-direction' as const };
@@ -332,13 +379,15 @@ describe('generated outside-review dispatch', () => {
   test('autoplan retains its Codex timeout event and hang record', () => {
     const events = path.join(TMP, 'autoplan-events');
     const probe = path.join(BIN, 'gstack-codex-probe');
-    fs.writeFileSync(probe, `_gstack_codex_select_model() { _GSTACK_CODEX_SEL=gpt-6-astra; _GSTACK_CODEX_SANDBOX=read-only; }
-_gstack_codex_sandbox_preflight() { return 0; }
-_gstack_codex_first_use_notice() { :; }
-_gstack_codex_timeout_wrapper() { echo 'Partial finding'; return 124; }
-_gstack_codex_log_event() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
-_gstack_codex_log_hang() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
-`);
+    fs.writeFileSync(probe, `#!/usr/bin/env bash
+case "$1" in
+  select-model) printf 'CODEX_SEL: gpt-6-astra\\nCODEX_SEL_KIND: exec\\nCODEX_SANDBOX: read-only\\n' ;;
+  check-sandbox|show-first-use-notice) ;;
+  run-with-timeout) echo 'Partial finding'; exit 124 ;;
+  log-event|log-hang) printf '%s %s\\n' "$2" "$3" >> "$FAKE_EVENTS" ;;
+  *) exit 64 ;;
+esac
+`, { mode: 0o755 });
     const ctx: TemplateContext = { skillName: 'autoplan', tmplPath: 'autoplan/SKILL.md.tmpl', host: 'claude',
       paths: { ...HOST_PATHS.claude, binDir: BIN, skillRoot: ROOT } };
     const command = outsideVoiceCommand(ctx, { promptFile: PROMPT, timeoutMs: 600000 });
@@ -357,7 +406,7 @@ _gstack_codex_log_hang() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
     '### Recommendation: fix the guard because it loses data.',
   ]) {
     test(`formatted completion remains valid: ${response}`, () => {
-      expect(invoke('claude', {}, { FAKE_RESPONSE: response }).status).toBe(0);
+      expect(invoke('claude', {}, { FAKE_RESPONSE: `[P2] the guard drops one write.\n${response}` }).status).toBe(0);
     });
   }
 
@@ -416,7 +465,8 @@ echo 'Recommendation: approve because the late answer arrived.'
         const rendered = outsideVoiceInvocation(ctx, { timeoutMs: requested });
         const gates = [...rendered.matchAll(/timeout: (\d+)/g)].map(m => Number(m[1]));
         expect(gates).toEqual([provider + 60000]);
-        expect(rendered).toContain(host === 'claude' ? `_gstack_codex_timeout_wrapper ${provider / 1000} codex` : `--timeout-ms ${provider}`);
+        if (host === 'claude') expect(rendered).toMatch(new RegExp(`run-with-timeout (?:--effort \\w+ )?${provider / 1000} codex`));
+        else expect(rendered).toContain(`--timeout-ms ${provider}`);
       }
     }
   });

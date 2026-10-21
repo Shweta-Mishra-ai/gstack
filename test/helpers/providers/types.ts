@@ -49,6 +49,14 @@ export type RunError =
   | 'binary_missing' // CLI not found on PATH.
   | 'unknown';   // Catch-all with reason populated.
 
+export interface ToolTimelineEntry {
+  atMs: number;
+  /** Set when the call's tool_result arrived; absent for a call still running when the stream ended. */
+  endMs?: number;
+  tool: string;
+  agent: 'main' | 'subagent';
+}
+
 export interface RunResult {
   /** Provider's textual output for the prompt. */
   output: string;
@@ -58,6 +66,8 @@ export interface RunResult {
   durationMs: number;
   /** Count of tool/function calls made during the run (0 if unsupported). */
   toolCalls: number;
+  /** Tool calls in start order: name, start and end offsets from run start, and thread; no inputs or outputs. Unset if unsupported. */
+  toolTimeline?: ToolTimelineEntry[];
   /** Actual model ID the provider reports using (may be a variant of the family). */
   modelUsed: string;
   /** If the run failed, error code + human reason. output/tokens may be partial. */

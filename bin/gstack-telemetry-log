@@ -205,7 +205,7 @@ ERR_FIELD="null"
 # look like a JSON string, the whole message becomes null — never raw.
 ERR_MSG_FIELD="null"
 if [ -n "$ERROR_MESSAGE" ]; then
-  ERR_MSG_FIELD="$(printf '%s' "$ERROR_MESSAGE" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun -e "
+  ERR_MSG_FIELD="$(printf '%s' "$ERROR_MESSAGE" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun --no-env-file --config=/dev/null -e "
 const { redactFindingSpans } = await import(process.env.GSTACK_LIB_DIR + '/redact-engine.ts');
 const input = await Bun.stdin.text();
 const out = redactFindingSpans(input, { repoVisibility: 'private' });

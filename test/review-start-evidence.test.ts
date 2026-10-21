@@ -1,18 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { findFilesBySuffix, gitArgvIn } from './helpers/scratch-repo';
-import { canReuseSharedLibsAdvisory, sharedLibsFingerprint } from '../lib/review-evidence';
+import { canReuseSharedLibsAdvisory, sharedLibsFingerprint, stampGateFindings } from '../lib/review-evidence';
 
 const ROOT = resolve(import.meta.dir, '..');
 let repo: string;
 let home: string;
 
-function cli(name: string, args: string[] = [], cwd = repo) {
+function cli(name: string, args: string[] = [], cwd = repo, extraEnv: Record<string, string | undefined> = {}) {
   return execFileSync(join(ROOT, 'bin', name), args, {
-    cwd, env: { ...process.env, GSTACK_HOME: home }, encoding: 'utf8', timeout: 10_000,
+    cwd, env: { ...process.env, GSTACK_HOME: home, ...extraEnv }, encoding: 'utf8', timeout: 10_000,
   }).trim();
 }
 
@@ -49,6 +49,69 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
+});
+
+// Gate findings: the logger, not the caller, says who dispositioned a gate
+// edit. A child that relaxed a test cannot log `actor: interactive, action:
+// kept` about itself; only a human-present session keeps a disposition.
+describe('gate finding actor stamping', () => {
+  const gate = (overrides: Record<string, any> = {}) => ({
+    fingerprint: 'test/a.test.ts:12:gate-integrity', severity: 'CRITICAL',
+    gate: 'RH-15', gate_id: 'g-0001', action: 'kept', reason: 'measured in ship-measure report', ...overrides,
+  });
+  const sessionEnv = (kind: 'interactive' | 'spawned' | 'headless') => ({
+    GSTACK_SESSION_KIND: kind === 'spawned' ? 'spawned' : undefined,
+    GSTACK_HEADLESS: kind === 'headless' ? '1' : undefined,
+    OPENCLAW_SESSION: undefined,
+    CLAUDE_CODE_ENTRYPOINT: kind === 'interactive' ? 'cli' : undefined,
+  });
+  const logWith = (kind: 'interactive' | 'spawned' | 'headless', findings: Record<string, any>[]) => {
+    const token = cli('gstack-review-log', ['--start', 'review'], repo, sessionEnv(kind));
+    const record = {
+      skill: 'review', status: 'issues_found', timestamp: new Date().toISOString(),
+      commit: git('rev-parse', '--short', 'HEAD'), completed: true, converged: true, cycles: 0,
+      issues_found: findings.length, critical: findings.length, informational: 0, findings,
+    };
+    cli('gstack-review-log', [JSON.stringify(record), '--finish', token], repo, sessionEnv(kind));
+    return rows().at(-1)!.findings as Record<string, any>[];
+  };
+
+  test('an interactive session keeps the disposition and the logger replaces a caller-supplied actor', () => {
+    const [kept, restored, open, plain] = logWith('interactive', [
+      gate({ actor: 'human' }), gate({ action: 'restored', reason: undefined }),
+      gate({ action: 'open', reason: 'should be dropped' }),
+      { fingerprint: 'src/a.ts:3:sql', severity: 'CRITICAL', action: 'skipped', actor: 'human' },
+    ]);
+    expect(kept).toMatchObject({ actor: 'interactive', action: 'kept', reason: 'measured in ship-measure report' });
+    expect(restored).toMatchObject({ actor: 'interactive', action: 'restored' });
+    expect(open).toMatchObject({ actor: 'interactive', action: 'open' });
+    expect(open.reason).toBeUndefined();
+    expect(plain.actor).toBe('human');
+    expect(plain.action).toBe('skipped');
+  });
+
+  for (const kind of ['spawned', 'headless'] as const) {
+    test(`a ${kind} session cannot record kept or restored on a gate finding`, () => {
+      const [kept, restored, plain] = logWith(kind, [
+        gate({ actor: 'interactive' }), gate({ action: 'restored', reason: undefined }),
+        { fingerprint: 'src/a.ts:3:sql', severity: 'CRITICAL', action: 'skipped' },
+      ]);
+      expect(kept).toMatchObject({ actor: kind, action: 'open' });
+      expect(kept.reason).toBeUndefined();
+      expect(restored).toMatchObject({ actor: kind, action: 'open' });
+      expect(plain.actor).toBeUndefined();
+      expect(plain.action).toBe('skipped');
+    });
+  }
+
+  test('a malformed gate action is a missing disposition, not a kept gate', () => {
+    const findings = [gate({ action: 'skipped' }), gate({ action: 'fixed' }), gate({ action: 'auto-fixed' })];
+    stampGateFindings(findings, 'interactive');
+    for (const finding of findings) expect(finding).toMatchObject({ actor: 'interactive', action: 'open' });
+    const ignored = [{ gate: '', action: 'kept', actor: 'human' }, 'not a record', null];
+    stampGateFindings(ignored, 'spawned');
+    expect(ignored[0]).toEqual({ gate: '', action: 'kept', actor: 'human' });
+  });
 });
 
 describe('review start/end binding (#2803)', () => {
@@ -240,4 +303,116 @@ describe('review start/end binding (#2803)', () => {
     expect(row.review_freshness.status).toBe('UNVERIFIED');
     expect(row.review_freshness.reason).toContain('telemetry');
   });
+});
+
+// E4: Codex's sandbox mounts .git read-only, so `git add -A` could not write
+// the fingerprint's blobs and /review lost its start capture. gstack-wtree now
+// writes new objects to a private directory owned by the review-log operation,
+// which keeps it until bindReview/checkSharedLibsReuse have read the tree.
+const asRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+describe.skipIf(process.platform === 'win32' || asRoot)('review fingerprint under a read-only .git (E4)', () => {
+  let scratch: string;
+  beforeEach(() => { scratch = mkdtempSync(join(tmpdir(), 'review-ro-tmp-')); });
+  afterEach(() => {
+    spawnSync('chmod', ['-R', 'u+w', join(repo, '.git')], { timeout: 10_000 });
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  const run = (name: string, args: string[], cwd: string, opts: { input?: string; env?: Record<string, string> } = {}) =>
+    spawnSync(join(ROOT, 'bin', name), args, {
+      cwd, input: opts.input, encoding: 'utf8', timeout: 20_000,
+      env: { ...process.env, GSTACK_HOME: home, TMPDIR: scratch, ...opts.env },
+    });
+  const finding = {
+    advisory: true, severity: 'INFORMATIONAL', action: 'skipped',
+    evidence_paths: ['source.ts', 'untracked.ts'], helper_target: { path: 'lib/shared.ts', symbol: 'readValue' },
+  };
+  const readOnlyGit = () => {
+    const r = spawnSync('chmod', ['-R', 'a-w', join(repo, '.git')], { timeout: 10_000 });
+    expect(r.status).toBe(0);
+  };
+
+  for (const where of ['main checkout', 'linked worktree']) {
+    test(`--start -> --finish -> shared-libs reuse with dirty and untracked files (${where})`, () => {
+      let cwd = repo;
+      if (where === 'linked worktree') {
+        cwd = join(scratch, 'linked wt');
+        git('worktree', 'add', '-q', '-b', 'linked', cwd);
+      }
+      writeFileSync(join(cwd, 'source.ts'), 'export const value = 42;\n');
+      writeFileSync(join(cwd, 'untracked.ts'), 'export const fresh = true;\n');
+      readOnlyGit();
+      const before = spawnSync('find', [join(repo, '.git', 'objects'), '-type', 'f'], { encoding: 'utf8', timeout: 10_000 }).stdout;
+
+      const start = run('gstack-review-log', ['--start', 'review'], cwd);
+      expect(start.stderr).toBe('');
+      expect(start.status).toBe(0);
+      const token = start.stdout.trim();
+      expect(token).toMatch(/^[0-9a-f-]{36}$/);
+      const record = { skill: 'review', status: 'clean', timestamp: new Date().toISOString(), completed: true, converged: true, findings: [finding] };
+      const finish = run('gstack-review-log', [JSON.stringify(record), '--finish', token], cwd);
+      expect(finish.status).toBe(0);
+      const logged = JSON.parse(run('gstack-review-read', [], cwd).stdout.split('---CONFIG---')[0].trim().split('\n').at(-1)!);
+      expect(logged.review_binding.state).toBe('verified');
+      expect(logged.wtree).toMatch(/^[0-9a-f]{40}$/);
+      // The consumer read the private tree and blobs before cleanup.
+      expect(logged.findings[0].snapshot_covered_paths).toEqual(['source.ts', 'untracked.ts']);
+
+      const again = run('gstack-review-log', ['--start', 'review'], cwd).stdout.trim();
+      const reuse = run('gstack-review-log', ['--check-shared-libs', again], cwd, { input: JSON.stringify(finding) });
+      expect(reuse.status).toBe(0);
+      expect(JSON.parse(reuse.stdout).reusable).toBe(true);
+
+      expect(spawnSync('find', [join(repo, '.git', 'objects'), '-type', 'f'], { encoding: 'utf8', timeout: 10_000 }).stdout).toBe(before);
+      expect(readdirSync(scratch).filter((name) => name.startsWith('gstack-wtree'))).toEqual([]);
+
+      // Same fingerprint as a writable .git.
+      spawnSync('chmod', ['-R', 'u+w', join(repo, '.git')], { timeout: 10_000 });
+      expect(run('gstack-wtree', [], cwd).stdout.trim()).toBe(logged.wtree);
+    }, 60_000);
+  }
+
+  test('the private directory is 0700 and alive while the consumer runs, then removed', () => {
+    writeFileSync(join(repo, 'untracked.ts'), 'export const fresh = true;\n');
+    readOnlyGit();
+    const shim = join(scratch, 'shim');
+    const probe = join(scratch, 'probe.log');
+    mkdirSync(shim);
+    writeFileSync(join(shim, 'bun'), [
+      '#!/usr/bin/env bash',
+      'first="${GIT_ALTERNATE_OBJECT_DIRECTORIES%%:*}"',
+      `[ -n "$first" ] && ls -ld "$first" | cut -c1-10 >> '${probe}'`,
+      `exec '${process.execPath}' "$@"`,
+    ].join('\n') + '\n', { mode: 0o755 });
+    const env = { PATH: `${shim}:${process.env.PATH}` };
+    const token = run('gstack-review-log', ['--start', 'review'], repo, { env }).stdout.trim();
+    const record = { skill: 'review', status: 'clean', timestamp: new Date().toISOString(), completed: true, converged: true };
+    expect(run('gstack-review-log', [JSON.stringify(record), '--finish', token], repo, { env }).status).toBe(0);
+    expect(readFileSync(probe, 'utf8').trim().split('\n')).toEqual(['drwx------', 'drwx------']);
+    expect(readdirSync(scratch).filter((name) => name.startsWith('gstack-wtree'))).toEqual([]);
+  }, 60_000);
+
+  test('a failed object write exits 1 with one stderr line and no partial hash', () => {
+    writeFileSync(join(repo, 'untracked.ts'), 'export const fresh = true;\n');
+    const objects = join(scratch, 'objects');
+    mkdirSync(objects, { mode: 0o500 });
+    const r = run('gstack-wtree', [], repo, { env: { GSTACK_WTREE_OBJECT_DIR: objects } });
+    chmodSync(objects, 0o700);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe('');
+    expect(r.stderr.trim().split('\n')).toHaveLength(1);
+    expect(r.stderr).toStartWith('gstack-wtree: cannot stage the working tree: ');
+  });
+
+  test('an unwritable TMPDIR is named, and review-log reports it on stderr while stdout stays clean', () => {
+    const missing = join(scratch, 'no such dir');
+    const wtree = run('gstack-wtree', [], repo, { env: { TMPDIR: missing } });
+    expect(wtree.status).toBe(1);
+    expect(wtree.stdout).toBe('');
+    expect(wtree.stderr.trim()).toBe(`gstack-wtree: cannot create a temp index under ${missing}; set TMPDIR to a writable directory`);
+    const start = run('gstack-review-log', ['--start', 'review'], repo, { env: { TMPDIR: missing } });
+    expect(start.status).not.toBe(0);
+    expect(start.stdout).toBe('');
+    expect(start.stderr).toContain(`gstack-review-log: cannot create a private object directory under ${missing}; no working-tree fingerprint.`);
+  }, 30_000);
 });

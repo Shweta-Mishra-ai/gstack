@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -9,6 +9,7 @@ import {
   ApplicationModel,
   CoverageRecord,
   CsoError,
+  MAX_VERIFICATION_ATTEMPT_MS,
   FindingV3,
   PreparationProof,
   RunPolicy,
@@ -34,9 +35,18 @@ import {
   validateFinding,
   validateVerificationRequest,
 } from './contracts';
-import { capture, containedFile, assertSnapshot } from './snapshot';
+import {
+  capture,
+  containedFile,
+  assertSnapshot,
+  inAuditPaths,
+  noReadPath,
+  OUTSIDE_AUDIT_PATHS,
+  readSnapshotManifest,
+} from './snapshot';
 import {
   assertStateOutside,
+  boundedList,
   event,
   finalizeReplayTemporary,
   loadReport,
@@ -45,7 +55,9 @@ import {
   publicReport,
   PUBLIC_SOURCE_ROOT,
   readJson,
+  reclaimDeadAttemptScratch,
   repoId,
+  executionDeadline,
   requireTime,
   retention,
   runDirectory,
@@ -164,7 +176,7 @@ const GENERATION_LOCK_FD = (() => {
 void GENERATION_LOCK_FD;
 const HELP = `gstack-cso ${VERSION} (helper ABI ${ABI})
 Usage:
-  gstack-cso start --repo PATH [--comprehensive] [--diff] [--base REF] [--budget SECONDS] [--offline] [--infra|--code|--skills|--supply-chain|--owasp|--scope DOMAIN]
+  gstack-cso start --repo PATH [--comprehensive] [--diff] [--base REF] [--budget SECONDS] [--offline] [--paths PREFIX[,PREFIX...]] [--infra|--code|--skills|--supply-chain|--owasp|--scope DOMAIN]
   gstack-cso doctor --repo PATH
   gstack-cso provision-images [--setup-summary] [--per-image-seconds 5..300]
   gstack-cso resume RUN
@@ -187,6 +199,7 @@ Usage:
   gstack-cso inspect-v2 IMPORT_ID
   gstack-cso schema
 
+--paths audits only source under the listed repo-relative prefixes; every other path is never captured and is reported as a snapshot-inputs gap.
 Static runs never execute application code. Target and scanner execution is Docker-only and requires a qualified immutable catalog.`;
 
 const SCHEMA = {
@@ -468,46 +481,80 @@ function planned(scope: string): CoverageRecord[] {
     evidence: [],
   }));
 }
-function snapshotCoverage(manifest: Awaited<ReturnType<typeof capture>>, scope: string): CoverageRecord {
+// One 256 KiB budget for the per-entry snapshot lists in report.json, split so
+// material gaps keep the largest share; findings and events keep the rest.
+const SNAPSHOT_DISCLOSURE_BUDGET = { gaps: 128 * 1024, transformations: 96 * 1024, exclusions: 32 * 1024 };
+const UNLISTED = "to keep report.json within its 1 MiB bound; the run's snapshot manifest keeps every entry";
+function snapshotCoverage(
+  manifest: Awaited<ReturnType<typeof capture>>,
+  scope: string,
+  auditPaths?: string[],
+): CoverageRecord {
   const omitted = manifest.entries.filter((entry) => !entry.executionHash),
-    excluded = omitted.filter((entry) => entry.transformation?.startsWith('excluded:'));
+    excluded = omitted.filter((entry) => entry.transformation?.startsWith('excluded:')),
+    excludedSet = new Set(excluded);
   // Classify every unexplained omission as a material coverage gap. Coverage
   // must not depend on transformation prose retaining a particular prefix.
-  const unread = omitted.filter((entry) => !excluded.includes(entry));
-  const deleted = manifest.deletedPaths ?? [],
-    captured = manifest.entries.filter((entry) => entry.executionHash).length,
-    missing = unread.length + deleted.length;
+  // Out-of-scope --paths entries are listed last so they never crowd material
+  // in-scope gaps out of the bounded list.
+  const unread = omitted.filter((entry) => !excludedSet.has(entry)),
+    inScope = unread.filter((entry) => entry.transformation !== OUTSIDE_AUDIT_PATHS),
+    allDeleted = manifest.deletedPaths ?? [],
+    deleted = allDeleted.filter((item) => !auditPaths || inAuditPaths(item.path, auditPaths)),
+    outside = [
+      ...unread.filter((entry) => entry.transformation === OUTSIDE_AUDIT_PATHS),
+      ...allDeleted.filter((item) => !deleted.includes(item)),
+    ];
+  const captured = manifest.entries.length - omitted.length,
+    missing = unread.length + allDeleted.length;
   return {
     domain: 'snapshot-inputs',
     scope,
     status: missing ? (captured ? 'partial' : 'not_assessed') : 'assessed',
     method: 'fail-closed captured source inventory',
-    gaps: [
-      ...unread.map(
-        (entry) =>
-          `${publicSnapshotPath(manifest, entry.path).path}: in-scope source payload was unread and withheld from static and runtime assessment`,
-      ),
-      ...deleted.map(
-        (item) =>
-          `${publicSnapshotPath(manifest, item.path).path}: tracked source is deleted from the worktree; only retained history is available for assessment`,
-      ),
-    ],
-    exclusions: excluded.map(
-      (entry) => `${publicSnapshotPath(manifest, entry.path).path}: ${entry.transformation}`,
+    gaps: boundedList(
+      missing,
+      (index) =>
+        index < inScope.length
+          ? `${publicSnapshotPath(manifest, inScope[index].path, inScope[index].pathId).path}: in-scope source payload was unread and withheld from static and runtime assessment`
+          : index < inScope.length + deleted.length
+            ? `${publicSnapshotPath(manifest, deleted[index - inScope.length].path, deleted[index - inScope.length].pathId).path}: tracked source is deleted from the worktree; only retained history is available for assessment`
+            : `${publicSnapshotPath(manifest, outside[index - inScope.length - deleted.length].path, outside[index - inScope.length - deleted.length].pathId).path}: outside the --paths audit scope; payload was not captured or assessed`,
+      { bytes: SNAPSHOT_DISCLOSURE_BUDGET.gaps },
+      4,
+      (count) =>
+        outside.length
+          ? `${count} more unread, deleted or out-of-scope inputs are not listed ${UNLISTED}`
+          : `${count} more unread or deleted in-scope inputs are not listed ${UNLISTED}`,
+    ),
+    exclusions: boundedList(
+      excluded.length,
+      (index) =>
+        `${publicSnapshotPath(manifest, excluded[index].path, excluded[index].pathId).path}: ${excluded[index].transformation}`,
+      { bytes: SNAPSHOT_DISCLOSURE_BUDGET.exclusions },
+      4,
+      (count) => `${count} more explicit exclusions are not listed ${UNLISTED}`,
     ),
     evidence: [
-      `${captured} sanitized execution input${captured === 1 ? '' : 's'} captured; ${excluded.length} explicit non-executable exclusion${excluded.length === 1 ? '' : 's'}; ${unread.length} unread in-scope input${unread.length === 1 ? '' : 's'}; ${deleted.length} tracked deletion${deleted.length === 1 ? '' : 's'}`,
+      `${captured} sanitized execution input${captured === 1 ? '' : 's'} captured; ${excluded.length} explicit non-executable exclusion${excluded.length === 1 ? '' : 's'}; ${inScope.length} unread in-scope input${inScope.length === 1 ? '' : 's'}; ${deleted.length} tracked deletion${deleted.length === 1 ? '' : 's'}${auditPaths ? `; audit limited by --paths to ${auditPaths.join(', ')}, so ${outside.length} source file${outside.length === 1 ? ' was' : 's were'} skipped` : ''}`,
     ],
   };
 }
-function historyCoverage(status: any, scope: string): CoverageRecord {
+function historyCoverage(status: any, scope: string, auditPaths?: string[]): CoverageRecord {
   return status?.status === 'captured'
     ? {
         domain: 'history-inputs',
         scope,
-        status: 'assessed',
+        status: auditPaths || status.truncated ? 'partial' : 'assessed',
         method: 'bounded helper-retained Git history',
-        gaps: [],
+        gaps: [
+          ...(auditPaths
+            ? [
+                `History outside the --paths audit scope (${auditPaths.join(', ')}) was not retained or assessed`,
+              ]
+            : []),
+          ...(typeof status.truncated === 'string' ? [`History truncated: ${status.truncated}`] : []),
+        ],
         exclusions: [],
         evidence: [
           `Captured ${String(status.commits ?? 'bounded commits')} from ${String(status.range ?? 'the pinned source range')}`,
@@ -537,11 +584,36 @@ function helperOwnedCoverage(domain: string): boolean {
     domain.startsWith('execution:')
   );
 }
+function auditPaths(raw: string): string[] {
+  const values = [...new Set(raw.split(',').map((value) => value.replace(/\/+$/, '')))].sort();
+  if (raw.length > 1024 || values.length > 32)
+    throw new CsoError('INVALID_ARGUMENT', '--paths accepts at most 32 prefixes in 1024 characters');
+  for (const value of values)
+    if (
+      !value ||
+      value.length > 256 ||
+      value.startsWith('-') ||
+      value.startsWith('/') ||
+      /[\\\u0000-\u001f\u007f]/.test(value) ||
+      value.split('/').some((part) => !part || part === '.' || part === '..')
+    )
+      throw new CsoError(
+        'INVALID_ARGUMENT',
+        `Invalid --paths entry ${JSON.stringify(value.slice(0, 80))}: use repo-relative path prefixes of at most 256 characters, without empty, '.' or '..' segments, a leading '-' or '/', backslashes, or control characters`,
+      );
+    else if (sanitizeHelperForJson(value) !== value)
+      throw new CsoError(
+        'INVALID_ARGUMENT',
+        '--paths entry would be altered by report redaction; choose a shorter or broader prefix',
+      );
+  return values;
+}
 function parseStart(args: string[]): { repo: string; policy: RunPolicy; comparisonBase?: string } {
   const repo = callerPath(need(args, '--repo')),
     comprehensive = take(args, '--comprehensive'),
     diff = take(args, '--diff'),
-    offline = take(args, '--offline');
+    offline = take(args, '--offline'),
+    paths = args.includes('--paths') ? auditPaths(need(args, '--paths')) : undefined;
   const scopeFlags = ['--infra', '--code', '--skills', '--supply-chain', '--owasp'].filter((f) =>
     args.includes(f),
   );
@@ -573,6 +645,7 @@ function parseStart(args: string[]): { repo: string; policy: RunPolicy; comparis
       budgetSeconds,
       maxWorkers: 3,
       maxRepairs: 3,
+      ...(paths ? { paths } : {}),
     },
     ...(diff || explicitBase ? { comparisonBase: base } : {}),
   };
@@ -598,13 +671,40 @@ async function start(
   const run = newRun(repo);
   let manifest: Awaited<ReturnType<typeof capture>>;
   try {
-    manifest = await capture(repo, run.dir, comparisonBase, requiredAncestor, {
-      deadlineMs: createdAt.getTime() + policy.budgetSeconds * 1000 - 60_000,
-    });
+    manifest = await capture(
+      repo,
+      run.dir,
+      comparisonBase,
+      requiredAncestor,
+      { deadlineMs: createdAt.getTime() + policy.budgetSeconds * 1000 - 60_000 },
+      policy.paths,
+    );
+    if (policy.diff && policy.paths) {
+      const scoped = policy.paths,
+        outside = (manifest.changedPaths ?? []).filter(
+          (path) => !noReadPath(path) && !inAuditPaths(path, scoped),
+        );
+      if (outside.length)
+        throw new CsoError(
+          'INVALID_ARGUMENT',
+          `--diff found ${outside.length} changed path${outside.length === 1 ? '' : 's'} outside --paths (${scoped.join(', ')}): ${outside
+            .slice(0, 20)
+            .map((path) => publicSnapshotPath(manifest, path).path)
+            .join(
+              ', ',
+            )}${outside.length > 20 ? `, and ${outside.length - 20} more` : ''}. ${parent ? 'A recheck keeps the original --diff and --paths policy, so start a new audit with them added to --paths or without --diff' : 'Add them to --paths or run without --diff'}; a changed path is never left silently out of scope.`,
+        );
+    }
   } catch (error) {
     fs.rmSync(run.dir, { recursive: true, force: true });
     throw error;
   }
+  const transformed = manifest.entries.filter(
+      (entry) => entry.transformation && entry.transformation !== OUTSIDE_AUDIT_PATHS,
+    ),
+    deletedPaths = (manifest.deletedPaths ?? []).filter(
+      (item) => !policy.paths || inAuditPaths(item.path, policy.paths),
+    );
   const report: RunReportV3 = {
     schemaVersion: 3,
     runId: run.runId,
@@ -619,18 +719,25 @@ async function start(
       snapshotHash: manifest.executionHash,
       originalHash: manifest.originalHash,
       baseCommit: manifest.baseCommit,
-      transformations: [
-        ...manifest.entries
-          .filter((entry) => entry.transformation)
-          .map((entry) => ({
-            path: publicSnapshotPath(manifest, entry.path).path,
-            handling: entry.transformation!,
-          })),
-        ...(manifest.deletedPaths ?? []).map((item) => ({
-          path: publicSnapshotPath(manifest, item.path).path,
-          handling: 'tracked source deleted; retained history only',
-        })),
-      ],
+      transformations: boundedList(
+        transformed.length + deletedPaths.length,
+        (index) =>
+          index < transformed.length
+            ? {
+                path: publicSnapshotPath(manifest, transformed[index].path, transformed[index].pathId).path,
+                handling: transformed[index].transformation!,
+              }
+            : {
+                path: publicSnapshotPath(manifest, deletedPaths[index - transformed.length].path).path,
+                handling: 'tracked source deleted; retained history only',
+              },
+        { bytes: SNAPSHOT_DISCLOSURE_BUDGET.transformations },
+        3,
+        (count) => ({
+          path: '[not listed]',
+          handling: `${count} more transformations are not listed ${UNLISTED}`,
+        }),
+      ),
     },
     application: {
       actors: [],
@@ -641,8 +748,8 @@ async function start(
       invariants: [],
     },
     coverage: [
-      snapshotCoverage(manifest, policy.scope),
-      historyCoverage(readJson(join(run.dir, 'history-status.json')), policy.scope),
+      snapshotCoverage(manifest, policy.scope, policy.paths),
+      historyCoverage(readJson(join(run.dir, 'history-status.json')), policy.scope, policy.paths),
       ...planned(policy.scope),
     ],
     findings: [],
@@ -653,7 +760,7 @@ async function start(
   event(
     report,
     'snapshot',
-    `Captured ${manifest.entries.length} source entries; ${manifest.entries.filter((e) => e.transformation).length + (manifest.deletedPaths?.length ?? 0)} transformations disclosed`,
+    `Captured ${manifest.entries.length} source entries; ${transformed.length + deletedPaths.length} transformations disclosed`,
   );
   if (policy.mode === 'comprehensive') {
     const plan = inspectPreparation(join(run.dir, 'snapshot'));
@@ -956,9 +1063,9 @@ function recoveryEvents(dir: string): string[] {
 function publicSnapshotPath(
   manifest: SnapshotManifest,
   path: string,
+  pathId = manifest.entries.find((item) => item.path === path)?.pathId,
 ): { path: string; displayPath?: string } {
-  const entry = manifest.entries.find((item) => item.path === path),
-    handle = snapshotPathHandle(entry?.pathId ?? snapshotPathId(manifest.root, path));
+  const handle = snapshotPathHandle(pathId ?? snapshotPathId(manifest.root, path));
   let displayPath: string;
   try {
     displayPath = redact(path);
@@ -972,8 +1079,8 @@ function publicSnapshotManifest(manifest: SnapshotManifest): Record<string, unkn
     ...manifest,
     root: PUBLIC_SOURCE_ROOT,
     entries: manifest.entries.map((entry) => {
-      const { path, pathId: _, ...rest } = entry;
-      return { ...rest, ...publicSnapshotPath(manifest, path) };
+      const { path, pathId, ...rest } = entry;
+      return { ...rest, ...publicSnapshotPath(manifest, path, pathId) };
     }),
     ...(manifest.deletedPaths?.length
       ? { deletedPaths: manifest.deletedPaths.map((item) => publicSnapshotPath(manifest, item.path)) }
@@ -1057,7 +1164,7 @@ function originalBoundary(report: RunReportV3): {
     throw new CsoError('INVALID_SCHEMA', 'Recheck evidence requires a linked original finding');
   const dir = runDirectory(report.parent.runId),
     original = loadReport(dir),
-    manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest,
+    manifest = readSnapshotManifest(dir),
     finding = original.findings.find((item) => item.id === report.parent!.findingId);
   if (report.repoId !== original.repoId)
     throw new CsoError('INCOMPATIBLE_INPUT', 'Recheck repository identity differs from the original audit');
@@ -1293,7 +1400,7 @@ function submit(args: string[]) {
   const input = rawInput as SubmissionV3;
   return withLock(dir, () => {
     const report = loadReport(dir),
-      manifest = readJson(join(dir, 'snapshot.json'));
+      manifest = readSnapshotManifest(dir);
     assertSnapshot(dir, manifest);
     requireReportingTime(report);
     if (report.status !== 'running')
@@ -1319,6 +1426,11 @@ function submit(args: string[]) {
         throw new CsoError(
           'INVALID_SCHEMA',
           `Diff-scope finding root cause is outside the captured changed paths: ${sourceFinding.location.path}`,
+        );
+      if (report.policy.paths && !inAuditPaths(sourceLocation.path, report.policy.paths))
+        throw new CsoError(
+          'INVALID_SCHEMA',
+          `Finding root cause is outside the --paths audit scope: ${sourceFinding.location.path}`,
         );
       const safeRaw = object(sanitizeForJson(raw), 'finding'),
         safeLocation = object(safeRaw.location, 'location');
@@ -1399,8 +1511,9 @@ function finish(args: string[]) {
   if (args.length) throw new CsoError('INVALID_ARGUMENT', 'finish takes only a run ID');
   return withLock(dir, () => {
     const report = loadReport(dir),
-      manifest = readJson(join(dir, 'snapshot.json'));
+      manifest = readSnapshotManifest(dir);
     assertSnapshot(dir, manifest);
+    reclaimDeadAttemptScratch(dir);
     for (const c of report.coverage)
       if (
         c.status === 'not_assessed' &&
@@ -1475,7 +1588,7 @@ async function inspect(args: string[]) {
   const { dir } = run(args);
   if (args.length) throw new CsoError('INVALID_ARGUMENT', 'inspect takes one run ID');
   const report = loadReport(dir),
-    manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+    manifest = readSnapshotManifest(dir);
   assertSnapshot(dir, manifest);
   const rawSensitive = readJson(join(dir, 'sensitive-evidence.json')),
     sensitiveEvidence = Array.isArray(rawSensitive)
@@ -1500,12 +1613,13 @@ async function inspect(args: string[]) {
       ? readJson(join(dir, 'preparation.json'))
       : undefined,
     recovery: recoveryEvents(dir),
+    remainingSeconds: remainingSeconds(report.deadline),
   });
 }
 async function read(args: string[]) {
   const { dir } = run(args);
   if (args.length !== 1) throw new CsoError('INVALID_ARGUMENT', 'read requires one path or opaque handle');
-  const manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+  const manifest = readSnapshotManifest(dir);
   assertSnapshot(dir, manifest);
   const selected = resolveSnapshotPath(manifest, args[0], true),
     full = containedFile(join(dir, 'readable'), selected.path),
@@ -1514,12 +1628,18 @@ async function read(args: string[]) {
 }
 async function history(args: string[]) {
   const { dir } = run(args),
-    manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+    manifest = readSnapshotManifest(dir);
   assertSnapshot(dir, manifest);
   let selected: string | undefined;
   if (args.length) selected = resolveSnapshotPath(manifest, args.shift(), false, 'History path', true).path;
   if (args.length)
     throw new CsoError('INVALID_ARGUMENT', 'history accepts at most one path or opaque handle');
+  const scoped = loadReport(dir).policy.paths;
+  if (selected !== undefined && scoped && !inAuditPaths(selected, scoped))
+    throw new CsoError(
+      'INVALID_ARGUMENT',
+      `History path is outside the --paths audit scope (${scoped.join(', ')}); its history was not retained`,
+    );
   const status = readJson(join(dir, 'history-status.json'));
   if (status.status !== 'captured' || !fs.existsSync(join(dir, 'history.txt')))
     throw new CsoError('MISSING_INPUT', status.gap || 'Historical evidence was not retained');
@@ -1537,13 +1657,16 @@ function resume(args: string[]) {
   if (args.length) throw new CsoError('INVALID_ARGUMENT', 'resume takes one run ID');
   return withLock(dir, () => {
     const report = loadReport(dir),
-      manifest = readJson(join(dir, 'snapshot.json'));
+      manifest = readSnapshotManifest(dir);
     if (report.status === 'finished')
       throw new CsoError('INVALID_SCHEMA', 'A finished audit cannot be resumed');
     assertSnapshot(dir, manifest);
-    for (const message of recoveryEvents(dir))
+    const recovery = recoveryEvents(dir);
+    for (const message of recovery)
       if (!report.events.some((e) => e.kind === 'watchdog-recovery' && e.message === message))
         event(report, 'watchdog-recovery', message);
+    saveReport(dir, report);
+    reclaimDeadAttemptScratch(dir);
     if (Date.now() >= Date.parse(report.deadline)) {
       report.status = 'interrupted';
       event(report, 'deadline', 'Original budget is exhausted; resume did not replenish it');
@@ -1557,7 +1680,7 @@ function resume(args: string[]) {
       runId: report.runId,
       deadline: report.deadline,
       policy: report.policy,
-      recovery: recoveryEvents(dir),
+      recovery,
     };
   });
 }
@@ -1671,7 +1794,7 @@ async function scanner(args: string[], sarif = false) {
         id,
         runId: report.runId,
         runDir: dir,
-        manifest: readJson(join(dir, 'snapshot.json')),
+        manifest: readSnapshotManifest(dir),
         policy: report.policy,
         executionDeadline: Date.parse(report.deadline) - 60_000,
         platform: platform(),
@@ -1822,7 +1945,7 @@ async function recheck(args: string[], dependencies: CsoCliDependencies) {
       throw new CsoError('INVALID_SCHEMA', 'Recheck requires a finished original audit');
     // Keep the original immutable while the fresh snapshot is captured and
     // until its child lineage report has been durably published.
-    const oldManifest = readJson(join(originalDir, 'snapshot.json'));
+    const oldManifest = readSnapshotManifest(originalDir);
     const preserveBase = original.policy.diff || Boolean(original.source.baseCommit),
       report = await start(
         [
@@ -1834,6 +1957,7 @@ async function recheck(args: string[], dependencies: CsoCliDependencies) {
           '--budget',
           String(original.policy.budgetSeconds),
           ...(original.policy.offline ? ['--offline'] : []),
+          ...(original.policy.paths ? ['--paths', original.policy.paths.join(',')] : []),
           ...(original.policy.scope === 'default'
             ? []
             : original.policy.scope.startsWith('domain:')
@@ -1922,7 +2046,7 @@ function testPlan(args: string[]) {
   if (args.length !== 1 || !['node', 'bun', 'python', 'rails'].includes(args[0]))
     throw new CsoError('INVALID_ARGUMENT', 'test-plan requires one supported stack');
   const stack = args[0] as 'node' | 'bun' | 'python' | 'rails',
-    manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+    manifest = readSnapshotManifest(dir);
   assertSnapshot(dir, manifest);
   const preparation = inspectPreparation(join(dir, 'snapshot'), stack);
   if (preparation.status !== 'ready')
@@ -1937,7 +2061,7 @@ function testPlan(args: string[]) {
     ...publicTestPlan(manifest, canonicalTestPlan(join(dir, 'snapshot'), stack)),
   };
 }
-function runtimePlan(args: string[]) {
+function runtimePlan(args: string[], dependencies: CsoCliDependencies) {
   const { dir } = run(args);
   if (!args.length || !['node', 'bun', 'python', 'rails'].includes(args[0]))
     throw new CsoError('INVALID_ARGUMENT', 'runtime-plan requires one supported stack and --port PORT');
@@ -1947,7 +2071,7 @@ function runtimePlan(args: string[]) {
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 1024 || port > 65535)
     throw new CsoError('INVALID_ARGUMENT', '--port must be an integer from 1024 to 65535');
-  const manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+  const manifest = readSnapshotManifest(dir);
   assertSnapshot(dir, manifest);
   const preparation = inspectPreparation(join(dir, 'snapshot'), stack);
   if (preparation.status !== 'ready')
@@ -1956,9 +2080,13 @@ function runtimePlan(args: string[]) {
       preparation.prerequisites.map((item) => item.message).join('; ') ||
         `${stack} preparation metadata is incomplete`,
     );
+  let runtimeProfile = preparation.runtimeProfile;
+  try {
+    runtimeProfile = selectRuntime(runtimeProfile, platform(), dependencies.runtimeCatalog).id;
+  } catch {}
   return {
     stack,
-    runtimeProfile: preparation.runtimeProfile,
+    runtimeProfile,
     start: publicStartPlan(manifest, canonicalStartPlan(join(dir, 'snapshot'), stack, port)),
     tests: publicTestPlan(manifest, canonicalTestPlan(join(dir, 'snapshot'), stack)),
   };
@@ -2180,7 +2308,7 @@ async function verify(args: string[], dependencies: CsoCliDependencies) {
     request = validateVerificationRequest(raw);
   return await withLock(dir, async () => {
     const report = loadReport(dir),
-      manifest = readJson(join(dir, 'snapshot.json')) as SnapshotManifest;
+      manifest = readSnapshotManifest(dir);
     assertSnapshot(dir, manifest);
     requireTime(report);
     if (report.policy.mode !== 'comprehensive' || report.status !== 'running')
@@ -2220,6 +2348,11 @@ async function verify(args: string[], dependencies: CsoCliDependencies) {
     } catch (error: any) {
       throw new CsoError('PREREQUISITE', error?.message || 'Qualified runtime is unavailable');
     }
+    if (request.runtimeProfile !== runtime.id)
+      throw new CsoError(
+        'INVALID_ARGUMENT',
+        `runtimeProfile must be the qualified runtime ID ${runtime.id} returned by runtime-plan`,
+      );
     const verifier = runtime;
     if (!['node', 'bun', 'python', 'rails'].includes(runtime.stack))
       throw new CsoError(
@@ -2236,7 +2369,10 @@ async function verify(args: string[], dependencies: CsoCliDependencies) {
     writeJson(join(dir, `preparation-${runtime.stack}.json`), plan);
     const endpoint = await dockerEndpoint(secureDirectory(join(dir, 'home'))),
       watchdogPath = dependencies.watchdogPath(),
-      attemptDeadline = Math.min(Date.now() + 300_000, Date.parse(report.deadline) - 60_000);
+      attemptDeadline = Math.min(
+        Date.now() + verificationAttemptMs(runtime.stack),
+        Date.parse(report.deadline) - 60_000,
+      );
     const admission = admitPreparationRuntime({
         plan,
         platform: targetPlatform,
@@ -2457,9 +2593,17 @@ function replayManifestValue(manifest: any): unknown {
     };
   return { ...stable, before: observation(before), after: observation(after) };
 }
+/**
+ * One bounded verification attempt (and one replay) prepares the application twice, before and after the
+ * patch. Rails offline preparation compiles native extensions, which takes about four minutes per phase on
+ * a 4-vCPU host, so a five-minute attempt could never finish for a Rails application.
+ */
+export function verificationAttemptMs(stack: string): number {
+  return stack === 'rails' ? MAX_VERIFICATION_ATTEMPT_MS : 300_000;
+}
 async function replay(args: string[], dependencies: CsoCliDependencies) {
   const replayStarted = Date.now(),
-    replayDeadline = replayStarted + 300_000;
+    replayDeadline = replayStarted + MAX_VERIFICATION_ATTEMPT_MS;
   retention(replayStarted, {
     deadlineMs: replayStarted + RETENTION_MAINTENANCE_MS,
     maxEntries: RETENTION_MAX_ENTRIES,
@@ -2485,7 +2629,15 @@ async function replay(args: string[], dependencies: CsoCliDependencies) {
         const temp = newRun(source);
         temporary = temp.dir;
         workDir = temp.dir;
-        manifest = await capture(source, workDir, undefined, undefined, { deadlineMs: replayDeadline });
+        const scoped = loadReport(stored.dir).policy.paths;
+        manifest = await capture(
+          source,
+          workDir,
+          undefined,
+          undefined,
+          { deadlineMs: replayDeadline },
+          scoped === undefined ? undefined : auditPaths(Array.isArray(scoped) ? scoped.join(',') : ''),
+        );
         if (
           manifest.executionHash !== bundle.requiredInputs.sourceHash ||
           manifest.originalHash !== bundle.requiredInputs.originalHash
@@ -2493,7 +2645,7 @@ async function replay(args: string[], dependencies: CsoCliDependencies) {
           throw new CsoError('INCOMPATIBLE_INPUT', 'Supplied source does not match the bundle input hashes');
       };
       if (fs.existsSync(retained)) {
-        manifest = readJson(join(stored.dir, 'snapshot.json'));
+        manifest = readSnapshotManifest(stored.dir);
         const expiresAt =
           typeof manifest?.expiresAt === 'string' ? Date.parse(manifest.expiresAt) : Number.NaN;
         if (!Number.isFinite(expiresAt) || new Date(expiresAt).toISOString() !== manifest.expiresAt)
@@ -2528,7 +2680,7 @@ async function replay(args: string[], dependencies: CsoCliDependencies) {
         throw new CsoError('INCOMPATIBLE_INPUT', 'Qualified runtime digest does not match the bundle');
       const endpoint = await dockerEndpoint(secureDirectory(join(workDir, 'home'))),
         watchdogPath = dependencies.watchdogPath(),
-        attemptDeadline = replayDeadline,
+        attemptDeadline = Math.min(replayDeadline, replayStarted + verificationAttemptMs(runtime.stack)),
         delegate = new DockerVerificationExecutor(endpoint, watchdogPath, attemptDeadline);
       let executor: VerificationExecutor = delegate,
         archives: string[] = [],
@@ -2649,12 +2801,31 @@ async function replay(args: string[], dependencies: CsoCliDependencies) {
   });
 }
 
+/** In-run replies that report the investigation time left; every one but `start` takes the run ID first. */
+const RUN_CLOCK_COMMANDS = new Set([
+  'start',
+  'resume',
+  'submit',
+  'scan',
+  'scanner-outcome',
+  'import-sarif',
+  'record-review',
+  'test-plan',
+  'runtime-plan',
+  'verify',
+]);
+/** Whole seconds until the investigation deadline (the final reporting minute excluded), or undefined if unknown. */
+function remainingSeconds(deadline: string): number | undefined {
+  const ends = executionDeadline({ deadline });
+  return Number.isFinite(ends) ? Math.max(0, Math.floor((ends - Date.now()) / 1000)) : undefined;
+}
 export async function dispatchCsoCommand(
   command: string,
   args: string[],
   dependencies: CsoCliDependencies,
 ): Promise<unknown> {
   args = [...args];
+  const runId = args[0];
   if (!['start', 'recheck', 'replay', 'doctor', 'provision-images'].includes(command)) {
     const started = Date.now();
     retention(started, { deadlineMs: started + RETENTION_MAINTENANCE_MS, maxEntries: RETENTION_MAX_ENTRIES });
@@ -2710,7 +2881,7 @@ export async function dispatchCsoCommand(
       result = testPlan(args);
       break;
     case 'runtime-plan':
-      result = runtimePlan(args);
+      result = runtimePlan(args, dependencies);
       break;
     case 'recheck':
       result = await recheck(args, dependencies);
@@ -2729,7 +2900,18 @@ export async function dispatchCsoCommand(
     default:
       throw new CsoError('INVALID_ARGUMENT', `Unknown command: ${command}`);
   }
-  return result;
+  if (!RUN_CLOCK_COMMANDS.has(command) || !result || typeof result !== 'object' || Array.isArray(result))
+    return result;
+  const deadline = (result as { deadline?: unknown }).deadline;
+  let seconds: number | undefined;
+  try {
+    seconds = remainingSeconds(
+      typeof deadline === 'string' ? deadline : loadReport(runDirectory(runId)).deadline,
+    );
+  } catch {
+    seconds = undefined;
+  }
+  return seconds === undefined ? result : { ...result, remainingSeconds: seconds };
 }
 const PRODUCTION_CLI_DEPENDENCIES: CsoCliDependencies = Object.freeze({
   runtimeCatalog: RUNTIME_CATALOG,

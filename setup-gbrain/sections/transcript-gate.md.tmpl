@@ -32,8 +32,8 @@ fi
 Size the question with two probes. `--sources transcript` makes the probe
 count transcripts even though none are consented yet:
 ```bash
-bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe --sources transcript
-bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe --sources transcript --all-history
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe --sources transcript
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe --sources transcript --all-history
 ```
 Read `Total files in window`, `Total bytes` and the estimate from each.
 
@@ -84,13 +84,13 @@ Then store the scope, then the mode value (never the letter; `new` stores
 ~/.claude/skills/gstack/bin/gstack-config set transcript_repos "$(git remote get-url origin)"  # only this repo
 ~/.claude/skills/gstack/bin/gstack-config unset transcript_repos                                 # every repo
 ~/.claude/skills/gstack/bin/gstack-config set transcript_ingest_mode <recent|all|off|new@$(date -u +%Y-%m-%dT%H:%M:%SZ)>
-bun run ~/.claude/skills/gstack/lib/transcript-consent.ts --describe
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/lib/transcript-consent.ts --describe
 ```
 Tell the user the `--describe` line: what will be ingested, in words.
 
 For `recent`, `all` or `new@…`, run the first sync now:
 ```bash
-bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync
 ```
 (`--no-brain-sync` because Step 7 already wired that path; this runs the
 code import and memory ingest stages, and `all` walks the full history.)

@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Validate committed image digests and complete platform matrix
         id: inputs
         run: |
@@ -46,7 +46,7 @@ jobs:
       - name: Record the requalification trigger inputs of this source commit
         run: bun run scripts/cso-requalification.ts triggers > requalification.json
       - if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cso-requalification-triggers
           path: requalification.json
@@ -69,8 +69,8 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.0
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+          bun-version: 1.4.2
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Require native Docker and verify reviewed source manifests
         env:
           CSO_ARCH: ${{ matrix.arch }}
@@ -98,7 +98,7 @@ jobs:
             --no-compile-autoload-package-json \
             lib/cso/preparation-container.ts --outfile lib/cso/images/gstack-cso-preparation
       - name: Build the reviewed runtime without publishing
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: lib/cso/images
           file: lib/cso/images/${{ matrix.stack }}.Dockerfile
@@ -144,7 +144,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Require the declared native architecture and Docker daemon
         env:
           CSO_ARCH: ${{ matrix.arch }}
@@ -155,7 +155,7 @@ jobs:
             *) echo 'Native architecture mismatch; emulation cannot qualify a runtime.' >&2; exit 1 ;;
           esac
           docker --host unix:///var/run/docker.sock info
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -192,7 +192,7 @@ jobs:
           printf 'tag=%s:%s-%s\n' "$image" "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Build native staging image with SBOM and provenance
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: lib/cso/images
           file: lib/cso/images/${{ matrix.stack }}.Dockerfile
@@ -209,16 +209,17 @@ jobs:
           CSO_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           set -eu
-          docker buildx imagetools inspect "$CSO_IMAGE" --format '{{ json .SBOM.SPDX }}' > sbom.spdx.json
-          jq -e '.spdxVersion == "SPDX-2.3" and (.packages | type == "array")' sbom.spdx.json
+          docker buildx imagetools inspect "$CSO_IMAGE" --format '{{ json .SBOM.SPDX }}' > sbom.full.spdx.json
+          jq -c -f scripts/cso-sbom-packages.jq sbom.full.spdx.json > sbom.spdx.json
+          jq -e -f scripts/cso-sbom-packages-check.jq sbom.spdx.json >/dev/null
       - name: Sign build provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
       - name: Sign the image SBOM
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -275,7 +276,7 @@ jobs:
             --arg commit "$GITHUB_SHA" --arg workflow "$workflow" --arg sbom "$sbom_digest" \
             --arg provenance "$provenance_digest" --argjson versions "$CSO_VERSIONS" \
             '{schemaVersion:1,helperAbi:3,state:"staged",buildRevision:$buildRevision,runtimeId:$runtimeId,image:$image,platform:$platform,stack:$stack,versions:$versions,sourceCommit:$commit,workflow:$workflow,sbomDigest:$sbom,provenanceDigest:$provenance,verifiedProvenance:true,qualification:"pending native and private release gates; no automatic promotion"}' > staged-image.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cso-staged-${{ matrix.stack }}-${{ matrix.arch }}
           path: |
@@ -307,13 +308,13 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cso-staged-${{ matrix.stack }}-${{ matrix.arch }}
           path: staged-application
       - if: matrix.stack == 'rails'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: cso-staged-postgresql-${{ matrix.arch }}
           path: staged-postgresql
@@ -365,7 +366,7 @@ jobs:
           bun run scripts/cso-native-evidence.ts --stack "$CSO_STACK" --platform "$CSO_PLATFORM" \
             --junit native-tests.junit.xml --staged staged-application/staged-image.json \
             --output qualification-evidence.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cso-qualification-gates-${{ matrix.stack }}-${{ matrix.arch }}
           path: |

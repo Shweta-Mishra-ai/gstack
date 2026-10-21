@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bun run
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-gbrain-detect — emit current gbrain/gstack-brain state as JSON.
  *

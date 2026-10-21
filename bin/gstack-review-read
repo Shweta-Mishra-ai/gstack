@@ -19,7 +19,7 @@ gstack_state_root_select
 GSTACK_HOME="$_gstack_sr_root"
 WTREE=$("$SCRIPT_DIR/gstack-wtree" 2>/dev/null || echo "unknown")
 if [ -f "$GSTACK_HOME/projects/$SLUG/$BRANCH-reviews.jsonl" ]; then
-  GSTACK_REVIEW_LIB="$SCRIPT_DIR/../lib/review-evidence.ts" GSTACK_REVIEW_WTREE="$WTREE" bun -e '
+  GSTACK_REVIEW_LIB="$SCRIPT_DIR/../lib/review-evidence.ts" GSTACK_REVIEW_WTREE="$WTREE" bun --no-env-file --config=/dev/null -e '
     const { reviewFreshness } = await import(process.env.GSTACK_REVIEW_LIB);
     for (const line of (await Bun.stdin.text()).split("\n").filter(Boolean)) {
       try {

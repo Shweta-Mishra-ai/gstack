@@ -13,7 +13,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { JSONOutputFormat } from '@anthropic-ai/sdk/resources/messages';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { CLAUDE_FRONTIER_EVAL_MODEL, DEFAULT_JUDGE_MAX_TOKENS, resolveEvalModel } from '../../lib/eval-model';
+import { CLAUDE_JUDGE_EVAL_MODEL, DEFAULT_JUDGE_MAX_TOKENS, resolveEvalModel } from '../../lib/eval-model';
 export { DEFAULT_JUDGE_MAX_TOKENS } from '../../lib/eval-model';
 
 export interface JudgeScore {
@@ -89,11 +89,12 @@ export interface RecommendationScore {
 /**
  * Call an Anthropic model with a prompt, extract JSON response.
  * Jittered exponential backoff over three 429 retries. Model resolves via
- * lib/eval-model's `judge` kind (frontier Claude default); pass a model id
+ * lib/eval-model's `judge` kind (CLAUDE_JUDGE_EVAL_MODEL); pass a model id
  * (e.g. claude-haiku-4-5-20251001) for cheaper bounded judgments like
  * judgeRecommendation.
  */
-// Default judge model: the current frontier Claude eval model. Override per run
+// Default judge model: CLAUDE_JUDGE_EVAL_MODEL, kept apart from the model under
+// test so calibration holds when the model under test moves. Override per run
 // with GSTACK_EVAL_MODEL_JUDGE; Haiku remains the right default for
 // classifier-grade duties (pty hung/working, warmup, distill — see
 // lib/eval-model.ts).
@@ -125,7 +126,7 @@ export async function callJudge<T>(
   const signal = opts?.signal;
   signal?.throwIfAborted();
   // Routed through the documented single resolution point: explicit arg >
-  // GSTACK_EVAL_MODEL_JUDGE > GSTACK_EVAL_MODEL > frontier default. The old
+  // GSTACK_EVAL_MODEL_JUDGE > GSTACK_EVAL_MODEL > judge default. The old
   // inline `GSTACK_EVAL_MODEL_JUDGE || sonnet` silently ignored the global
   // GSTACK_EVAL_MODEL override that every other eval call site honors.
   // opts support bounded judgments; cancellation covers both requests and
@@ -228,8 +229,10 @@ export const JUDGE_PANEL_SAMPLES = 3;
 /**
  * Judge panel (EVAL_POLICY.judge): every `judge`-kind entry draws a fixed number of
  * independent samples of the SAME prompt concurrently, inside its unchanged
- * JUDGE_MS budget. Numeric dimensions gate on the per-dimension panel mean
- * against the unchanged minimum; boolean fields gate on a strict majority.
+ * JUDGE_MS budget. Numeric dimensions gate on the per-dimension median of the
+ * three samples (at least 2 of 3 at or above the unchanged minimum,
+ * judgePanelMedian); the mean is reported for information only. Boolean
+ * fields gate on a strict majority.
  * A sample that errors (refusal, truncation, non-JSON, malformed field) fails
  * the whole panel and is never resampled. callJudge's 429 backoff happens
  * before any model output exists, so it is transport, not a verdict retry.
@@ -247,7 +250,23 @@ export async function judgePanel<T>(sample: () => Promise<T>): Promise<T[]> {
   throw first.reason;
 }
 
-/** Per-dimension mean over a panel; any non-finite sample value fails the panel. */
+/**
+ * The judge gate (EVAL_POLICY v3): per-dimension median of exactly
+ * JUDGE_PANEL_SAMPLES samples, so a dimension passes when at least 2 of 3
+ * samples meet its unchanged threshold. Any other sample count or a
+ * non-finite value fails the panel closed.
+ */
+export function judgePanelMedian<K extends string>(samples: ReadonlyArray<Record<K, unknown>>, keys: readonly K[]): Record<K, number> {
+  if (samples.length !== JUDGE_PANEL_SAMPLES) throw new Error(`Judge panel needs exactly ${JUDGE_PANEL_SAMPLES} samples, got ${samples.length}`);
+  return Object.fromEntries(keys.map(key => {
+    const values = samples.map(sample => sample && typeof sample === 'object' ? sample[key] : undefined);
+    const bad = values.findIndex(value => typeof value !== 'number' || !Number.isFinite(value));
+    if (bad !== -1) throw new Error(`Judge panel sample ${bad + 1} has non-numeric ${key}: ${JSON.stringify(values[bad])}`);
+    return [key, [...(values as number[])].sort((a, b) => a - b)[1]!];
+  })) as Record<K, number>;
+}
+
+/** Per-dimension mean over a panel, reported beside the median gate; any non-finite sample value fails the panel. */
 export function judgePanelMean<K extends string>(samples: ReadonlyArray<Record<K, unknown>>, keys: readonly K[]): Record<K, number> {
   if (samples.length === 0) throw new Error('Judge panel has no samples');
   return Object.fromEntries(keys.map(key => {
@@ -256,6 +275,11 @@ export function judgePanelMean<K extends string>(samples: ReadonlyArray<Record<K
     if (bad !== -1) throw new Error(`Judge panel sample ${bad + 1} has non-numeric ${key}: ${JSON.stringify(values[bad])}`);
     return [key, (values as number[]).reduce((sum, value) => sum + value, 0) / values.length];
   })) as Record<K, number>;
+}
+
+/** The median gate plus the informational mean, for panel reports. */
+export function judgePanelSummary<K extends string>(samples: ReadonlyArray<Record<K, unknown>>, keys: readonly K[]): { median: Record<K, number>; mean: Record<K, number> } {
+  return { median: judgePanelMedian(samples, keys), mean: judgePanelMean(samples, keys) };
 }
 
 /** Strict majority of a boolean field; any non-boolean sample value fails the panel. */
@@ -723,7 +747,7 @@ export interface ArmJudgeScore {
  * point of a research instrument; a per-run judge swap silently moves the
  * ruler.
  */
-export const ARM_JUDGE_MODEL = CLAUDE_FRONTIER_EVAL_MODEL;
+export const ARM_JUDGE_MODEL = CLAUDE_JUDGE_EVAL_MODEL;
 
 /**
  * Build the over-engineering rubric prompt. Exported (pure) so the free

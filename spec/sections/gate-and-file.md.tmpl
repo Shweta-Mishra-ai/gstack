@@ -25,15 +25,22 @@ AskUserQuestion: A) edit, B) acknowledge and proceed, C) cancel. **On a PUBLIC r
 option B is disabled** — force A or C. This pass is fail-soft (LLM judgment); the
 4.5b regex is the deterministic backstop and runs after it.
 
+**Write the final draft into a private file once.** The audit record, the
+redaction scans, the outside reviewer, the issue and the archive all read this
+one file; the draft never goes into a shell command:
+
+{{FREE_TEXT_FILE:REDACT_FILE=spec}}
+
 **Audit trail (always):** append a content-free record — no spec text, only the
-categories that fired plus a sha256 of the body:
+categories that fired plus a sha256 of the body. Substitute the printed name for
+`<redact-file-name>`:
 
 ```bash
-printf '%s' "<the final draft body>" > /tmp/spec-semantic-$$.txt
-bun ~/.claude/skills/gstack/lib/redact-audit-log.ts \
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+[ -s "$REDACT_FILE" ] || { echo "No audit record: $REDACT_FILE is missing or empty; write the draft into it first." >&2; exit 1; }
+bun --no-env-file --config=/dev/null ~/.claude/skills/gstack/lib/redact-audit-log.ts \
   "{\"repo_visibility\":\"$REDACT_VIS\",\"outcome\":\"<clean|flagged>\",\"categories_flagged\":[<...>],\"spec_archive_path\":\"\"}" \
-  /tmp/spec-semantic-$$.txt
-rm -f /tmp/spec-semantic-$$.txt
+  "$REDACT_FILE"
 ```
 
 ### Phase 4.5b: Fail-closed redaction (PRECEDES dispatch)
@@ -53,7 +60,7 @@ dispatch. `spec-quality-gate-secret-sink.test.ts` enforces this.
 
 **Dispatch (only when redaction passes):** No reviewer preflight/dispatch before the redaction decision. When blocked, STOP before Phase 5 and all downstream sinks. On --no-gate record skipped after redaction succeeds.
 
-{{OUTSIDE_PREFLIGHT:opt-in}}
+{{OUTSIDE_PREFLIGHT:opt-in:plan-review}}
 
 Write the prompt with the exact redaction-approved spec bytes using the Write tool; never shell-interpolate the raw draft. Keep hard delimiters and this boundary:
 
@@ -113,21 +120,39 @@ interrupt before the work happens.
 
 #### File the issue (always)
 
-**Re-scan before filing** (Phase 4 edits can introduce content the 4.5b scan
-never saw, and the issue is world-readable):
+If `gh` is available and authenticated, file from the scanned draft file. The title
+and the one-line approach for the decision log are free text too, so they go into their
+own private files:
 
-{{REDACT_INVOCATION_BLOCK:pre-issue:brief}}
+{{FREE_TEXT_FILE:TITLE_FILE=title:APPROACH_FILE=approach}}
 
-If `gh` is available and authenticated, file from the scanned temp file:
+Then file, substituting the three printed names. `gstack-post` scans the exact title
+and body it sends (Phase 4 edits can introduce content the 4.5b scan never saw, and the
+issue is world-readable) and passes both to `gh` as arguments:
 
 ```bash
-ISSUE_URL=$(gh issue create --title "<title>" --body-file "$REDACT_FILE")
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+APPROACH_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<approach-file-name>"
+[ -s "$REDACT_FILE" ] && [ -s "$TITLE_FILE" ] || { echo "Not filed: $REDACT_FILE or $TITLE_FILE is missing or empty. Write them, then file by hand: ~/.claude/skills/gstack/bin/gstack-post issue-create --title-file $TITLE_FILE --body-file $REDACT_FILE" >&2; exit 1; }
+POST_OUT=$(~/.claude/skills/gstack/bin/gstack-post issue-create --title-file "$TITLE_FILE" --body-file "$REDACT_FILE"); POST_CODE=$?
+printf '%s\n' "$POST_OUT"
+[ "$POST_CODE" = 0 ] || { echo "Not filed (gstack-post exit $POST_CODE)." >&2; exit "$POST_CODE"; }
+ISSUE_URL=$(printf '%s\n' "$POST_OUT" | grep -m1 -E '^https?://')
 ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
-echo "Filed: $ISSUE_URL"
-~/.claude/skills/gstack/bin/gstack-decision-log '{"decision":"Spec filed #ISSUE_NUMBER: TITLE","rationale":"APPROACH","scope":"issue","issue":"ISSUE_NUMBER","source":"skill","confidence":7}' 2>/dev/null || true
+echo "Filed: $ISSUE_URL (ISSUE_NUMBER: $ISSUE_NUMBER)"
+[ -s "$APPROACH_FILE" ] && ~/.claude/skills/gstack/bin/gstack-decision-log "$(jq -cn --arg n "$ISSUE_NUMBER" --rawfile t "$TITLE_FILE" --rawfile a "$APPROACH_FILE" \
+  '{decision: ("Spec filed #" + $n + ": " + ($t | rtrimstr("\n"))), rationale: ($a | rtrimstr("\n")), scope: "issue", issue: $n, source: "skill", confidence: 7}')" 2>/dev/null || true
+rm -f "$APPROACH_FILE"
 ```
 
-The last line records the spec as a durable, issue-scoped cross-session decision so a future session (or `/ship` closing the issue) inherits the core approach and why, not just the issue link. Non-interactive, best-effort (`|| true`). Substitute `ISSUE_NUMBER` (from the filed issue), `TITLE` (the issue title), and `APPROACH` (the one core approach/decision the spec settled). Only fires when the issue was actually filed.
+Exit 1 (HIGH): do NOT file; rotate and redact at source, no skip. Exit 2 (MEDIUM): ask
+per printed `RULE:` line exactly as in the 4.5b disposition (auto-redact rewrites
+`$REDACT_FILE`, which the archive then uses); when the user accepts a finding as it
+is, rerun the block with `--confirm <confirm-token>` after `--body-file "$REDACT_FILE"`.
+Any edit needs a new scan, so the token no longer applies. Exit 3: `gh` failed; report it.
+
+The last line records the spec as a durable, issue-scoped cross-session decision so a future session (or `/ship` closing the issue) inherits the core approach and why, not just the issue link. Non-interactive, best-effort (`|| true`). The approach file holds the one core approach/decision the spec settled. Only fires when the issue was actually filed.
 
 If `gh` is not available, print: "`gh` not authenticated — title and body below
 for paste into https://github.com/{owner}/{repo}/issues/new with zero
@@ -142,39 +167,45 @@ is consumed by `/ship` for auto-close.
 
 {{REDACT_INVOCATION_BLOCK:pre-archive:brief}}
 
-**Sanitized body to the archive.** If auto-redact fired, the `<body>` below
-MUST be the sanitized body (`$REDACT_FILE`), not the original draft — one body for
-all sinks. The user's on-disk source draft keeps the original.
+**Sanitized body to the archive.** If auto-redact fired, the archived body MUST be
+the sanitized body (`$REDACT_FILE`), not the original draft — one body for all sinks.
+The user's on-disk source draft keeps the original. Title and body are copied from
+their files, never expanded by the shell.
 
 Resolve the archive path via the existing `gstack-paths` helper (handles
-`GSTACK_HOME`, `CLAUDE_PLUGIN_DATA`, Windows fallback):
+`GSTACK_HOME`, `CLAUDE_PLUGIN_DATA`, Windows fallback). Substitute the printed file
+names and the filed issue number for `<issue-number>` (digits, or empty when no
+issue was filed):
 
 ```bash
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+[ -s "$REDACT_FILE" ] && [ -s "$TITLE_FILE" ] || { echo "Not archived: $REDACT_FILE or $TITLE_FILE is missing or empty." >&2; exit 1; }
+ISSUE_NUMBER=<issue-number>
+ISSUE_URL=$([ -n "$ISSUE_NUMBER" ] && gh issue view "$ISSUE_NUMBER" --json url -q .url 2>/dev/null)
 GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG)
 ARCHIVE_DIR="$GSTACK_STATE_ROOT/projects/$SLUG/specs"
 mkdir -p "$ARCHIVE_DIR"
-SLUG_TITLE=$(echo "<title>" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | tr A-Z a-z | cut -c1-60)
+SLUG_TITLE=$(head -1 "$TITLE_FILE" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | tr A-Z a-z | cut -c1-60)
 ARCHIVE_NAME="$(date +%Y%m%d-%H%M%S)-$$-${SLUG_TITLE}.md"
 ARCHIVE_PATH="$ARCHIVE_DIR/$ARCHIVE_NAME"
 # Atomic write: tmp → rename
-cat > "$ARCHIVE_PATH.tmp" <<EOF
----
-spec_issue_number: ${ISSUE_NUMBER:-}
-spec_issue_url: ${ISSUE_URL:-}
-spec_filed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-spec_branch: $(git branch --show-current 2>/dev/null || echo unknown)
-spec_plan_mode: ${GSTACK_PLAN_MODE:-unset}
-spec_executed: ${WILL_EXECUTE:-false}
-spec_worktree_path:
----
-
-# <title>
-
-<body>
-EOF
-mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH"
-echo "Archived: $ARCHIVE_PATH"
+{
+  printf -- '---\n'
+  printf 'spec_issue_number: %s\n' "$ISSUE_NUMBER"
+  printf 'spec_issue_url: %s\n' "$ISSUE_URL"
+  printf 'spec_filed_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'spec_branch: %s\n' "$(git branch --show-current 2>/dev/null || echo unknown)"
+  printf 'spec_plan_mode: %s\n' "${GSTACK_PLAN_MODE:-unset}"
+  printf 'spec_executed: %s\n' "${WILL_EXECUTE:-false}"
+  printf 'spec_worktree_path:\n---\n\n# '
+  head -1 "$TITLE_FILE"
+  printf '\n'
+  cat "$REDACT_FILE"
+} > "$ARCHIVE_PATH.tmp"
+mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH" && rm -f "$TITLE_FILE"
+echo "Archived: $ARCHIVE_PATH (SLUG_TITLE: $SLUG_TITLE)"
 ```
 
 The PID suffix and atomic rename prevent collisions when two `/spec` invocations
@@ -259,14 +290,19 @@ in-progress changes will be visible to the agent. Cancel with Ctrl+C if not
 desired." Then fall back to current dir (still spawn): set `SPAWN_PATH` to the
 repository root (`git rev-parse --show-toplevel`).
 
-If A and worktree created: spawn `claude -p` with the spec piped via stdin:
+If A and worktree created: spawn `claude -p` with the spec piped via stdin,
+followed by the coordinator contract every lane inherits word for word
+(`gstack-autoplan contract` prints exactly this block):
+
+{{COORDINATOR_CONTRACT}}
 
 ```bash
 [ -r "${ARCHIVE_PATH:?ARCHIVE_PATH is not set: substitute the archived spec path}" ] || { echo "ERROR: cannot read $ARCHIVE_PATH; nothing was spawned." >&2; exit 1; }
 cd -- "${SPAWN_PATH:?SPAWN_PATH is not set: substitute the printed worktree path}" || exit 1
-[ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ] || { echo "ERROR: $SPAWN_PATH is not a git worktree root; nothing was spawned." >&2; exit 1; }
+{ _p=$(git rev-parse --show-prefix 2>/dev/null) && [ -z "$_p" ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; } || { echo "ERROR: $SPAWN_PATH is not a git worktree root; nothing was spawned." >&2; exit 1; }
 SPAWN_PATH=$(pwd -P)
-cat "$ARCHIVE_PATH" | (cd "$SPAWN_PATH" && claude -p 2>&1) &
+CONTRACT=$(~/.claude/skills/gstack/bin/gstack-autoplan contract) || { echo "ERROR: gstack-autoplan contract failed; nothing was spawned." >&2; exit 1; }
+{ cat "$ARCHIVE_PATH"; printf '\n\n%s\n' "$CONTRACT"; } | (cd "$SPAWN_PATH" && GSTACK_SESSION_KIND=spawned claude -p 2>&1) &
 SPAWN_PID=$!
 echo "Spawned: PID $SPAWN_PID in $SPAWN_PATH (branch $SPAWN_BRANCH)"
 echo "Follow with: cd $SPAWN_PATH && claude --resume"

@@ -190,7 +190,7 @@ function deterministicPlanFloorFinding(input: PlanFloorReview): PlanFloorAssessm
   const firstLine = q.question.split(/\r?\n/)[0]!.trim();
   const brief = firstLine.replace(/^D\d+(?:\s*\(re-ask\))?\s*[—–:-]\s*/i, '');
   const currentQuestion = /^D\d+\s*\(re-ask\)/i.test(firstLine) ? brief.split(/\.\s+/).at(-1)! : brief;
-  const questionQuote = currentQuestion.match(/^(?:Which|What) (?:(?:time[- ]to[- ]first[- ]call|TTHW|time[- ]to[- ]hello[- ]world) target|yardstick) (?:should|fits)\b[^?]*\?$/i)?.[0];
+  const questionQuote = currentQuestion.match(/^(?:Which|What) (?:(?:time[- ]to[- ]first[- ](?:(?:SDK|API)[- ])?call|TTHW|time[- ]to[- ]hello[- ]world) target|yardstick|target(?= fits this journey\?$)) (?:should|fits)\b[^?]*\?$/i)?.[0];
   const optionIndex = q.options.findIndex(o => /^(?:(?:under|<)\s*10\s*min\b|(?:champion|competitive|current trajectory)(?=$|\s*[(,]))/i.test(o.label.replace(/^[A-D][).:]\s*/, '').trim()));
   const option = optionIndex >= 0 ? q.options[optionIndex] : undefined;
   const optionQuote = option?.label;

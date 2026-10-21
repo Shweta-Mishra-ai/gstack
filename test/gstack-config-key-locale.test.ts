@@ -47,13 +47,13 @@ afterEach(() => {
 });
 
 describe("gstack-config key validation is locale-independent", () => {
-  test("get, has, set and unset all validate ASCII ranges under the C locale", () => {
+  test("get, get --stored, has, set and unset all validate ASCII ranges under the C locale", () => {
     const source = fs.readFileSync(CONFIG, "utf8");
     const guardedValidators = source.match(
       /LC_ALL=C grep -qE '\^\[a-zA-Z0-9_\]\+\(@\[a-zA-Z0-9\]\+\)\?\$'/g,
     );
 
-    expect(guardedValidators).toHaveLength(4);
+    expect(guardedValidators).toHaveLength(5);
   });
 
   test("round-trips existing keys that contain i", () => {

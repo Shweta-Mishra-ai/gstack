@@ -77,7 +77,7 @@ For /qa and /qa-only:
 - Functional Full, Quick and Regression have no default total timer.
 Set SECONDS to the shorter mode/caller limit; an unlimited mode uses the caller's bound.
 Without a total time limit, do not create DEADLINE_FILE; announce finite command timeouts.
-Stop when scoped contracts are tested or blocked.
+Stop when scoped contracts are tested or blocked: each field's documented input rule needs a probe that breaks only it and satisfies every other rule; rules uncovered at a probe/time cap go in limits.
 Clocks/checkpoints use REPORT_DIR; mixed standalone runs use REPORT_DIR/browser and REPORT_DIR/functional, with one final report at REPORT_DIR. Caller paths win.
 Names used below (quote every path):
 - PROBE_DIR: this surface's owned probe directory per the line above. DEADLINE_FILE: \`PROBE_DIR/deadline.json\`, which exists only for a bounded run.
@@ -97,9 +97,6 @@ Never reset DEADLINE_FILE/bypass DEADLINE_TOOL. Expiry or an invalid/missing DEA
 
 Each probe is one native command/interaction plus checks, excluding bookkeeping.
 Never batch probes.
-How one probe works: (1) if bounded, check the clock and choose the next command;
-(2) publish a checkpoint naming it (functional: \`capture --after\` publishes it);
-(3) run exactly that command via DEADLINE_TOOL or EVIDENCE_TOOL, read its result, repeat.
 
 1. First demonstrate success: output AND durable effects. Guard if bounded; await completion.
 2. **Decide whether another probe is needed.** If bounded, run \`bun DEADLINE_TOOL status DEADLINE_FILE\`.
@@ -150,7 +147,7 @@ Never freeze buggy output, weaken tests or delete valid red tests.`}
 ## 4. Final report
 
 Use the surface report template; link each checkpoint. Separate browser scores, functional outcomes and proposed/executed tests.
-Write PROBE_DIR/annotations.json {evidence: [{capture, command, contract, expected, classification}], limits} (browser-only: evidence [], checkpoints in limits); before Markdown \`bun EVIDENCE_TOOL materialize PROBE_DIR annotations.json\` (fills observed/metadata; prints reportLinks; runs once per PROBE_DIR); you classify. Annotate every safe capture, including failures/replays: an omitted capture is withheld and keeps the verdict inconclusive. Classify a capture taken before an input change \`superseded\`; it closes when the same command reran on current inputs. Disclose withheld/incomplete evidence.
+Write PROBE_DIR/annotations.json {evidence: [{capture, command, contract, expected, classification}], limits: ["checkpoint 001"]} (limits: non-empty string array, not an object; browser-only: evidence []); before Markdown \`bun EVIDENCE_TOOL materialize PROBE_DIR annotations.json\` (fills observed/metadata; prints reportLinks; runs once per PROBE_DIR); you classify. Annotate every safe capture, including failures/replays: an omitted capture is withheld and keeps the verdict inconclusive. Classify a capture taken before an input change \`superseded\`; it closes when the same command reran on current inputs.${reportOnly ? '' : ' After a fix, every earlier capture is superseded, even from a client that prints no snapshot: rerun each one your verdict relies on, or report it as an open remainder.'} Disclose withheld/incomplete evidence.
 Evidence is invocation-local${reportOnly ? '.' : '; /ship reruns once per invocation.'}
 Missing prerequisites/expectations/observations, timeouts and refusal never pass.
 Pass requires all required current-input contracts to pass with no required remainder.
@@ -188,7 +185,7 @@ pass/fail/blocked/not run/inconclusive/not applicable (reason).
 | Contract | Observe |
 |---|---|
 | Successful execution | Expected return/output and final business effect, not just launch/acceptance |
-| Invalid/missing input | Declared rejection, correct status and no forbidden state change |
+| Invalid/missing input | One probe per documented input rule of each field (allowed characters, format, sign, range, arity) breaking only it: declared rejection, correct status and no forbidden state change |
 | Authentication/authorization | Valid identity, missing/invalid identity, wrong owner/role and durable no-effect boundary |
 | CLI process contract | Exact exit code, stdout and stderr separately; resulting file/state changes |
 | State transitions | Initial, intermediate and completed/failed states and their permitted transitions |
@@ -231,12 +228,13 @@ ${setup ? 'Read `sections/browser-setup.md` in full unless already completed;\n'
 
 export function generateQAReviewPreflight(ctx: TemplateContext): string {
   sectionPath(ctx, 'qa', 'exploratory');
-  return `> **STOP.** Before any probe, including plan checks, complete the ordered scope/method Reads below and await them. Templates cannot replace them.
+  return `> **STOP.** Before any probe, including plan checks, complete the ordered scope/method Reads in earlier responses. Never batch a probe (capture, guard start, plan check) with a Read.
 ${ctx.skillName === 'review' ? 'Step 4 is read-only: defer charters, setup and probes to Step 4.7.\n' : ''}
-{{QA_RESOURCE:exploratory}}
-Reading exploratory.md does not complete them: when it returns, Read the scope section and selected surface methods it lists, in order, and await them.
+1. {{QA_RESOURCE:exploratory}}
+2. Then Read QA's \`sections/scope.md\` in full; pick surfaces.
+3. Then Read each listed method in full; the entrypoint alone completes nothing.
 
-Resolve QA's \`sections/...\` and \`templates/...\` paths from that installed QA SKILL.md directory, not the caller or product directory.`;
+QA's \`sections/...\` and \`templates/...\` paths resolve from installed QA SKILL.md, not caller/product.`;
 }
 
 export function generateQAReview(ctx: TemplateContext): string {

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Trusted CI input validation. Qualification evidence is handled separately. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

@@ -28,7 +28,7 @@ test('every fixture owns one paid wrapper; public models/trials/concurrency/turn
   expect(isPaidTestFile('test/overlay-lifecycle.test.ts')).toBe(false);
   expect(OVERLAY_FIXTURES.every(f => f.trials === 10 && f.concurrency === 3)).toBe(true);
   expect(OVERLAY_FIXTURES.map(f => f.maxTurns ?? 5)).toEqual([15,8,15,15,15]);
-  expect(OVERLAY_FIXTURES.map(f => f.model)).toEqual([...Array(3).fill('claude-opus-4-7'), 'claude-sonnet-4-6', 'claude-opus-5-5']);
+  expect(OVERLAY_FIXTURES.map(f => f.model)).toEqual([...Array(3).fill('claude-opus-5-5'), 'claude-sonnet-5-5', 'claude-opus-5-5']);
   expect([OVERLAY_CASE_WORK_MS, OVERLAY_RECORD_GRACE_MS, OVERLAY_CASE_OUTER_MS, OVERLAY_MIN_FILE_WALL_MS]).toEqual([1_800_000, 5_000, 1_810_000, 1_830_000]);
 });
 

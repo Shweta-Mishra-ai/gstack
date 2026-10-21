@@ -16,6 +16,7 @@ import {
 } from './helpers/shared-libs-path-fixture';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import capturedChecker from './fixtures/shared-libs-index-flags-r59-checker-public.json';
+import loopRead from './fixtures/shared-libs-index-flags-loop-read-39173752116.json';
 
 const helper = path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log');
 const fixtures: SharedLibsFixture[] = [];
@@ -660,4 +661,29 @@ describe('native executable shared-code checker evidence', () => {
       }
       expect(hasTrustedSharedLibsCheck(run.events, run.expected)).toBe(false);
     });
+});
+
+// Gate 39173752116 slice 12: the skip-worktree review read every evidence file in one
+// literal for-loop that printed each path before its contents.
+describe('literal loop reads from the captured skip-worktree review', () => {
+  const loop = (events: any[]) => events.flatMap(event => event.message.content)
+    .find((block: any) => block.type === 'tool_use' && block.input?.command?.startsWith('for f in '));
+  const output = (events: any[], id: string) => events.flatMap(event => event.message.content)
+    .find((block: any) => block.type === 'tool_result' && block.tool_use_id === id);
+
+  test('a literal loop whose output names each evidence file counts as reading it', () => {
+    expect(hasTrustedSharedLibsCheck(structuredClone(loopRead.events), loopRead.expected)).toBe(true);
+  });
+
+  test.each(['variable list', 'file missing from output', 'path outside the repo'])('%s is still rejected', shape => {
+    const events = structuredClone(loopRead.events), call = loop(events), files = 'src/retry-worker.ts src/retry-route.ts lib/retry-after.ts';
+    expect(call.input.command).toContain(`for f in ${files} `);
+    if (shape === 'variable list') call.input.command = `FILES="${files}"; ${call.input.command.replace(files, '$FILES')}`;
+    if (shape === 'file missing from output') {
+      const result = output(events, call.id);
+      result.content = JSON.parse(JSON.stringify(result.content).replaceAll('src/retry-route.ts', 'src/omitted.ts'));
+    }
+    if (shape === 'path outside the repo') call.input.command = call.input.command.replace(' src/retry-route.ts ', ' ../outside/src/retry-route.ts ');
+    expect(hasTrustedSharedLibsCheck(events, loopRead.expected)).toBe(false);
+  });
 });

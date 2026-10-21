@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-memory-ingest — V1 memory ingest helper.
  *
@@ -2290,18 +2290,26 @@ async function ingestPassScoped(args: CliArgs, state: IngestState, scope: Transc
   // structured counts and per-file failures.
   // A4: one partition per gbrain source; a transcript source is registered
   // (non-federated) before its first import, or its pages stay local.
-  const listed: { ids: Set<string> | null } = { ids: null };
+  const catalog: { value: SourceCatalog | null } = { value: null };
   for (const batch of resumed ? [{ sourceId: resumed.sourceId, pages: [...resumed.staged.values()] }] : planBatches(toImport, state)) {
-    if (!resumed && batch.sourceId?.startsWith("gstack-transcripts")) {
+    let checkout: string | null = null;
+    // A resumed partition (a timeout checkpoint, possibly staged before the
+    // source had a checkout) is admitted the same way before it imports.
+    if (batch.sourceId?.startsWith("gstack-transcripts") && batch.pages.length > 0) {
       const repo = isUnattributed(batch.pages[0]) ? "(no repository)" : batch.pages[0].git_remote!;
-      const why = ensureTranscriptSource(state, batch.sourceId, repo, listed);
-      if (why) {
+      const admitted = admitTranscriptSource(state, batch.sourceId, repo, catalog);
+      if ("why" in admitted) {
         base.kept_local += batch.pages.length;
-        reportPage(`kept ${batch.pages.length} transcript page(s) for ${repo} on this machine: ${why}. They import once the source can be registered (upgrade gbrain with gstack-gbrain-install).`);
+        reportPage(`kept ${batch.pages.length} transcript page(s) for ${repo} on this machine: ${admitted.why}`);
+        // The pages were never stamped, so they are prepared again next run;
+        // a resumed stage is dropped rather than resumed into a refusal forever.
+        if (resumed) cleanupStagingDir(resumed.stagingDir);
         continue;
       }
+      checkout = admitted.checkout;
     }
     await importPartition(run, batch.pages, batch.sourceId, resumed);
+    if (checkout) snapshotTranscriptCheckout(batch.sourceId!, checkout);
     // Other sources still import after one source's import fails; only a
     // timeout (whose checkpoint a later import would overwrite) stops the run.
     if (run.stopImports) break;
@@ -2403,34 +2411,246 @@ function planBatches(pages: PreparedPage[], state: IngestState): Array<{ sourceI
 }
 
 /**
- * Register a transcript source before its first import: machine-local and
- * never federated. Registration is cached in state so it runs once per
- * repository. Returns null when the source is usable, else why it is not.
+ * Transcript source binding (#3097), against gbrain 0.60's managed persistence
+ * (src/core/persistence: import-mutations, source-lifecycle, ownership):
+ *
+ * - A managed import lands only when the source has an active worktree
+ *   binding owned by this host; a path-less source (`sources add <id>` with no
+ *   --path) never gets one, so every import into it is refused with
+ *   owner_unavailable.
+ * - A binding is a checkout: `sources add <id> --path <dir>` binds the git
+ *   root enclosing <dir> (any enclosing checkout, such as a brain-synced state
+ *   root, would be claimed whole), and requires committed content unless
+ *   --force. Re-running it on a path-less source of the same id attaches the
+ *   binding (the supported migration); a source that already has a path or a
+ *   binding is refused (source_id_taken). Claiming someone else's checkout
+ *   (`sources writer claim`, transfers, `sources set-path`) is the host
+ *   administrator's decision, so gstack never does it.
+ * - Every managed write is written through to <checkout>/<slug>.md, and a
+ *   `gbrain sync` of the source imports the files at the checkout's HEAD and
+ *   soft-deletes pages whose file HEAD does not track; on an unborn HEAD it
+ *   refuses and changes nothing.
+ *
+ * So each transcript source gets its own checkout under the state root,
+ * created by gstack and never shared. The checkout stays unborn until every
+ * page gbrain holds for the source has its file there, then holds exactly one
+ * commit: the current page files, amended after each import, with no reflog,
+ * so `git gc --auto` prunes superseded snapshots (retention: one file per live
+ * page plus one packed snapshot, never one copy per run).
  */
-function ensureTranscriptSource(
+const TRANSCRIPT_CHECKOUTS_DIR = join(GSTACK_HOME, "gbrain-transcript-sources");
+const TRANSCRIPT_TROUBLESHOOTING = "docs/troubleshooting.md#memory-ingest-transcript-checkout";
+
+export function transcriptCheckoutPath(id: string, root = TRANSCRIPT_CHECKOUTS_DIR): string {
+  return join(root, id);
+}
+
+/** What gstack knows about gbrain's sources, read once per run. */
+interface SourceCatalog {
+  rows: Map<string, { local_path?: string | null; page_count?: number }>;
+  managed: boolean;
+  hostId: string | null;
+  bindings: Map<string, { owner_host_id?: string | null; local_path?: string | null; relative_path?: string; state?: string }>;
+}
+
+function readSourceCatalog(): SourceCatalog {
+  const json = (args: string[]): any => {
+    const r = spawnGbrain(args, { timeout: 30_000 });
+    try {
+      return r.status === 0 ? JSON.parse(r.stdout || "null") : null;
+    } catch {
+      return null;
+    }
+  };
+  const rows = new Map(parseSourcesList(json(["sources", "list", "--json"])).filter((row) => typeof row.id === "string").map((row) => [row.id!, row as any]));
+  // gbrain before 0.60 has no writer status: it is never managed.
+  const status = json(["sources", "writer", "status", "--json"]);
+  const managed = status?.mode === "managed" || (status?.mode === undefined && status?.enabled === true);
+  const bindings = new Map<string, any>((Array.isArray(status?.bindings) ? status.bindings : []).map((b: any) => [b.source_id, b]));
+  return { rows, managed, hostId: status?.local_host_id ?? status?.host_id ?? null, bindings };
+}
+
+function samePath(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+function checkoutGit(dir: string, args: string[]) {
+  return spawnSync("git", ["-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], {
+    encoding: "utf-8",
+    timeout: 60_000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+/** Create (or reuse) the checkout gstack owns for one transcript source. Returns an error, or null. */
+function prepareTranscriptCheckout(dir: string): string | null {
+  try {
+    mkdirSync(dir, { recursive: true });
+    if (!existsSync(join(dir, ".git"))) {
+      const steps = [
+        ["init", "-q"],
+        ["config", "core.logAllRefUpdates", "false"],
+        ["config", "gc.auto", "256"],
+        ["config", "gc.pruneExpire", "now"],
+        ["config", "user.name", "gstack transcript ingest"],
+        ["config", "user.email", "gstack-transcripts@localhost"],
+      ];
+      for (const step of steps) {
+        const r = checkoutGit(dir, step);
+        if (r.status !== 0) return `git ${step[0]} failed in ${dir}: ${(r.stderr || "").trim().split("\n")[0]}`;
+      }
+    }
+    // gbrain's ownership markers are not pages; they stay out of the snapshot.
+    if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), ".gbrain-*\n", "utf-8");
+    return null;
+  } catch (err) {
+    return `could not create ${dir}: ${(err as Error).message}`;
+  }
+}
+
+/**
+ * Make a transcript source usable before an import into it: register it, and
+ * on a managed brain bind it to its own checkout (migrating a path-less source
+ * gstack registered earlier). Returns the bound checkout (null when the brain
+ * needs none), or why the partition must stay on this machine.
+ */
+function admitTranscriptSource(
   state: IngestState,
   id: string,
   repo: string,
-  listed: { ids: Set<string> | null },
-): string | null {
-  if (state.sources?.[id]) return null;
-  if (!listed.ids) {
-    const r = spawnGbrain(["sources", "list", "--json"], { timeout: 30_000 });
-    let raw: unknown = null;
-    try {
-      raw = r.status === 0 ? JSON.parse(r.stdout || "null") : null;
-    } catch {}
-    listed.ids = new Set(parseSourcesList(raw).map((row) => row.id).filter((x): x is string => typeof x === "string"));
-  }
-  if (!listed.ids.has(id)) {
-    const add = spawnGbrain(["sources", "add", id, "--no-federated", "--name", `gstack transcripts: ${repo}`], { timeout: 30_000 });
-    if (add.status !== 0) {
-      return `could not register gbrain source ${id} (${(add.stderr || add.stdout || `exit ${add.status}`).trim().split("\n")[0].slice(0, 200)})`;
+  catalog: { value: SourceCatalog | null },
+): { checkout: string | null } | { why: string } {
+  const c = (catalog.value ??= readSourceCatalog());
+  const row = c.rows.get(id);
+  const name = `gstack transcripts: ${repo}`;
+  const registered = () => {
+    (state.sources ??= {})[id] = { repo, registered_at: state.sources?.[id]?.registered_at ?? new Date().toISOString() };
+  };
+  const gbrainError = (r: { status: number | null; stdout?: string; stderr?: string }) =>
+    (r.stderr || r.stdout || `exit ${r.status}`).trim().split("\n").find((l) => /error|refus|fail/i.test(l))?.slice(0, 240) ??
+    (r.stderr || r.stdout || `exit ${r.status}`).trim().split("\n")[0].slice(0, 240);
+
+  if (!c.managed) {
+    if (!row) {
+      const add = spawnGbrain(["sources", "add", id, "--no-federated", "--name", name], { timeout: 30_000 });
+      if (add.status !== 0) {
+        return { why: `could not register gbrain source ${id} (${gbrainError(add)}). They import once the source can be registered (upgrade gbrain with gstack-gbrain-install)` };
+      }
+      c.rows.set(id, { local_path: null, page_count: 0 });
     }
-    listed.ids.add(id);
+    registered();
+    return { checkout: null };
   }
-  (state.sources ??= {})[id] = { repo, registered_at: new Date().toISOString() };
-  return null;
+
+  const checkout = transcriptCheckoutPath(id);
+  const binding = c.bindings.get(id);
+  if (binding || row?.local_path) {
+    const bound = binding?.local_path ? join(binding.local_path, binding.relative_path ?? "") : null;
+    const boundHere = bound !== null && (bound === checkout || samePath(bound, checkout));
+    const present = existsSync(join(checkout, ".git"));
+    if (boundHere && binding!.owner_host_id === c.hostId && binding!.state === "active" && present) {
+      registered();
+      return { checkout };
+    }
+    const inspect = `Inspect it with: gbrain sources writer status --source ${id} --json.`;
+    if (boundHere && binding!.owner_host_id === c.hostId) {
+      return {
+        why:
+          `gbrain source ${id} is bound to gstack's checkout ${checkout}, but ${present ? `the binding is ${binding!.state}` : "the checkout is missing"}, so gbrain would refuse the import. ` +
+          `${inspect} Restore the checkout from a backup of the state root, or ask gbrain how to recover it (gbrain doctor --json). See ${TRANSCRIPT_TROUBLESHOOTING}`,
+      };
+    }
+    const owner = !binding?.owner_host_id ? "no owning host" : binding.owner_host_id === c.hostId ? "this host" : `host ${binding.owner_host_id}`;
+    return {
+      why:
+        `gbrain source ${id} is held by another owner (${owner}, checkout ${bound ?? row?.local_path ?? "(none on this host)"}), not by gstack's checkout ${checkout}, so gstack leaves it alone. ` +
+        `${inspect} To hand it to gstack, its owner releases it (gbrain sources writer transfer prepare ${id}, on the owning host) or you re-bind it on this host with: ` +
+        `gbrain sources set-path ${id} ${checkout}. See ${TRANSCRIPT_TROUBLESHOOTING}`,
+    };
+  }
+
+  if (process.env.GSTACK_EPHEMERAL === "1") {
+    return {
+      why:
+        `gbrain source ${id} needs a checkout to accept imports, and this state root (${GSTACK_HOME}) is ephemeral (GSTACK_EPHEMERAL=1), ` +
+        `so gstack does not bind one: the brain would keep pointing at a directory that vanishes with this machine. ` +
+        `Fix: GSTACK_STATE_ROOT=<durable directory> gstack-memory-ingest --bulk (without GSTACK_EPHEMERAL=1). See ${TRANSCRIPT_TROUBLESHOOTING}`,
+    };
+  }
+  const prepared = prepareTranscriptCheckout(checkout);
+  if (prepared) return { why: `could not prepare the checkout for gbrain source ${id}: ${prepared}. See ${TRANSCRIPT_TROUBLESHOOTING}` };
+  // --force: the checkout is an ordinary directory until its first snapshot.
+  const add = spawnGbrain(["sources", "add", id, "--path", checkout, "--no-federated", "--force", "--name", name, "--json"], { timeout: 60_000 });
+  if (add.status !== 0) {
+    return {
+      why:
+        `could not bind gbrain source ${id} to ${checkout} (${gbrainError(add)}). ` +
+        `Inspect it with: gbrain sources writer status --source ${id} --json. See ${TRANSCRIPT_TROUBLESHOOTING}`,
+    };
+  }
+  c.bindings.set(id, { owner_host_id: c.hostId, local_path: checkout, relative_path: "", state: "active" });
+  if (row) {
+    // Pages that predate managed persistence have no file in the checkout yet;
+    // re-import them so each gets one and the checkout can be snapshotted.
+    let requeued = 0;
+    for (const [path, entry] of Object.entries(state.sessions)) {
+      if (entry.source_id !== id || !["ingested", "imported_unverified"].includes(entry.status)) continue;
+      setEntry(state, path, { ...entry, status: "refused", reason: `re-import into the checkout of ${id} (#3097)` });
+      requeued++;
+    }
+    reportPage(
+      `bound gbrain source ${id} to ${checkout}: it had no checkout, so gbrain refused every import into it (#3097)` +
+        (requeued ? `; ${requeued} page(s) imported before the binding are re-imported on the next run` : ""),
+    );
+  } else {
+    c.rows.set(id, { local_path: checkout, page_count: 0 });
+  }
+  registered();
+  return { checkout };
+}
+
+/**
+ * After an import into a bound transcript source: commit its page files as
+ * the checkout's single snapshot, once every page gbrain holds for the source
+ * has its file, so `gbrain sync` of the source never mistakes a page for a
+ * deleted file.
+ */
+function snapshotTranscriptCheckout(id: string, checkout: string): void {
+  let files = 0;
+  (function walk(dir: string) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === ".git") continue;
+      if (e.isDirectory()) walk(join(dir, e.name));
+      else if (e.name.endsWith(".md")) files++;
+    }
+  })(checkout);
+  const r = spawnGbrain(["sources", "list", "--json"], { timeout: 30_000 });
+  let pages: number | undefined;
+  try {
+    pages = parseSourcesList(JSON.parse(r.stdout || "null")).find((row) => row.id === id)?.page_count as number | undefined;
+  } catch {}
+  const hasHead = checkoutGit(checkout, ["rev-parse", "--verify", "-q", "HEAD"]).status === 0;
+  if (typeof pages !== "number" || files < pages) {
+    if (!hasHead) {
+      reportPage(
+        `left the checkout of ${id} uncommitted: gbrain holds ${pages ?? "an unknown number of"} page(s) for it and ${files} have a file in ${checkout}, ` +
+          `so a commit now would let gbrain sync soft-delete the rest. The missing files are written as their pages re-import.`,
+      );
+    }
+    return;
+  }
+  if (checkoutGit(checkout, ["add", "-A"]).status !== 0) return;
+  if (hasHead && checkoutGit(checkout, ["diff", "--cached", "--quiet"]).status === 0) return;
+  const commit = checkoutGit(checkout, ["commit", "-q", "--no-verify", ...(hasHead ? ["--amend"] : []), "-m", `gstack transcript pages (${files})`]);
+  if (commit.status !== 0) {
+    reportPage(`could not snapshot the checkout of ${id} (${(commit.stderr || "").trim().split("\n")[0]}); its pages are in the brain, and the snapshot is retried after the next import.`);
+    return;
+  }
+  checkoutGit(checkout, ["gc", "--auto", "--quiet"]);
 }
 
 /** Print even under --quiet: a page that did not land must never be silent (A1). */

@@ -144,7 +144,7 @@ do
   fi
 done
 
-bun run "$GENERATOR" --input "$APP_SOURCE" --output "$GENERATED_DIR"
+bun --no-env-file --config=/dev/null run "$GENERATOR" --input "$APP_SOURCE" --output "$GENERATED_DIR"
 
 # Stamp only after successful accessor generation. ios-sync uses this marker
 # to distinguish a complete current install from an interrupted regeneration.

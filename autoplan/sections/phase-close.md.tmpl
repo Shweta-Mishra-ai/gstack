@@ -2,13 +2,16 @@ Read this section afresh when the current phase's review work finishes. Use the
 phase, amendment checkpoint and methodology path bound at that phase's exit.
 This procedure owns readback, verification and publication as separate operations.
 On hosts that inline sections, reread this close block in the installed Autoplan
-SKILL.md at each exit; those hosts do not have a separate phase-close.md file.
+SKILL.md at each exit; they have no separate phase-close.md file.
 
 1. **Finish and save the review.** Require the phase's full methodology/section
    Reads, required outputs, successful writes and terminal reviewer results.
    Match a completed native review's INPUT to its voice snapshot. A pending
    reviewer keeps the phase open. Apply the phase's failure policy to failed
    native attempts; unavailable/disabled voices receive no completion credit.
+   Record wall time: `~/.claude/skills/gstack/bin/gstack-autoplan-timing close --run <RUN_ID>
+   --phase <PHASE> --out "$_AP" --outside-s <N> --native-s <N>` (timing.json; an
+   ephemeral state root skips the analytics append with a printed line).
 2. **Reconcile accepted requirements.** Record every accepted behavior, condition,
    test and manual checklist in this phase's accepted block. Taste remains
    provisional; User Challenges preserve the original requirements. A `None`
@@ -25,7 +28,7 @@ preparation does not perform them.
 4. **Read the complete current packet.** For every returned `readRanges` entry,
    issue a Read of `closePacketPath` with that entry's exact `offset` and `limit`.
    Finish all ranges through EOF. A Read of only the edited tail does not satisfy
-   this step; previous snapshots do not satisfy it. If a result is truncated, read
+   this step; neither do previous snapshots. If a result is truncated, read
    its missing ranges. If a Read fails, repair it and finish the missing ranges.
    Do not advance on a request without its result. After the final successful Read,
    perform step 5 here.
@@ -39,7 +42,9 @@ preparation does not perform them.
    implementation or accepted-decision edit returns to step 3, including after compaction.
 6. **Publish the parent report.** After successful verification, SEND the filled
    report below now as visible parent assistant text, using actual findings and voice
-   statuses. This message is the next operation before any next-phase tool call.
+   statuses, in its own message whose only tool call is the Bash no-op
+   `true autoplan-published <PHASE>` (no output). The guard counts a report only when a
+   later record follows it, so this message is the next operation before any next-phase tool call.
    Use the packet's `report` fields for this phase, the actual host's reviewer names,
    and N/A when either review voice is missing; confirmed counts require both voices.
    Include the DX metrics line only when `report.includeDxMetrics` is true. Resolve
@@ -52,7 +57,8 @@ Consensus: <N/A (voice coverage missing) | X/<report.total> native+outside confi
 Passing to <applicable report.next>.
 
 7. **Return to the driver.** After sending the actual parent report, continue to
-   the driver in the same turn. The driver alone advances phases and emits applicable
+   the driver in the same turn. Make the next guarded `Read` or `Agent` call (the next
+   phase driver, or the Phase 4 tasks aggregator after any skip messages) in a later message. The driver alone advances phases and emits applicable
    skip messages; a skip is never a completion. Do not wait for a “continue” reply.
 
 The sent conversation message is step 6's output. Saving it in ACTIVE_PLAN or

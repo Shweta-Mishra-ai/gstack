@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-decision-search — read active decisions (the curated "what did we decide" view).
  *

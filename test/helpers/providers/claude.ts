@@ -3,7 +3,6 @@ import {
   csoProducerHelperHome,
   csoProducerHelperLauncher,
   csoProducerProviderCommand,
-  csoProducerSourceDirectory,
   csoProducerStateDirectory,
   type ProviderAdapter,
   type RunOpts,
@@ -17,14 +16,15 @@ import * as path from 'path';
 import * as os from 'os';
 import { resolveClaudeCommand } from '../../../lib/claude-bin';
 import { resolveEvalModel } from '../../../lib/eval-model';
+import { runClaudeProducerStream } from './claude-stream';
 
 /**
  * Claude adapter — wraps the `claude` CLI via claude -p.
  *
  * For brevity and to avoid duplicating the full stream-json parser, this adapter
  * uses claude CLI in non-interactive mode (--print) with the simpler JSON output
- * format. If richer event-level metrics are needed (per-tool timing etc.),
- * swap to session-runner's full stream-json parser.
+ * format. CSO producers stream events instead (claude-stream.ts) so a timed-out
+ * run still reports its usage.
  */
 export class ClaudeAdapter implements ProviderAdapter {
   readonly name = 'claude';
@@ -78,13 +78,18 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     const model = opts.model ?? process.env.EVALS_MODEL ?? resolveEvalModel('capture');
     const stateDirectory = csoProducerStateDirectory(opts);
+    const args = claudeExecArgs(opts, model, resolved.argsPrefix);
+    const env = claudeExecEnvironment(opts, process.env);
     if (stateDirectory) {
       assertClaudeProducerPrerequisites();
+      assertClaudeProducerSandboxPolicy(args, env, csoProducerHelperLauncher(opts)!);
     }
 
     try {
-      if (stateDirectory) prepareClaudeProducerState(stateDirectory);
-      const args = claudeExecArgs(opts, model, resolved.argsPrefix);
+      if (stateDirectory) {
+        prepareClaudeProducerState(stateDirectory);
+        return await runClaudeProducerStream(resolved.command, args, { input: opts.prompt, cwd: claudeExecWorkingDirectory(opts), env, timeoutMs: opts.timeoutMs, model });
+      }
       const out = execFileSync(resolved.command, args, {
         input: opts.prompt,
         cwd: claudeExecWorkingDirectory(opts),
@@ -93,7 +98,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         maxBuffer: 32 * 1024 * 1024,
         // Default GSTACK_HEADLESS=1 so a benchmark run classifies as headless (an
         // AskUserQuestion failure BLOCKs rather than emitting unanswerable prose).
-        env: claudeExecEnvironment(opts, process.env),
+        env,
       });
       return resultFromClaudeOutput(out,{model,durationMs:Date.now()-start,producer:!!opts.csoProducer});
     } catch (err: unknown) {
@@ -186,13 +191,56 @@ export function claudeProducerTools(opts: RunOpts): string {
   return [`Bash(${launcher})`, `Bash(${launcher} *)`, 'Write'].join(',');
 }
 
+/** Built-in tools: users' /cso starts its independent reviewers with Agent; subagents inherit this whole policy. */
+export const CLAUDE_PRODUCER_BUILTIN_TOOLS = 'Bash,Write,Agent';
+
+/** Claude's sandbox wraps every Bash command except the trusted launcher, which must run where users run it. */
+export function claudeProducerSettings(launcher: string): { sandbox: Record<string, unknown> } {
+  return {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: false,
+      excludedCommands: [launcher, `${launcher} *`],
+    },
+  };
+}
+
+export function assertClaudeProducerSandboxPolicy(args: readonly string[], env: Record<string, string>, launcher: string): void {
+  const fail = (detail: string): never => { throw new Error(`CLAUDE_PRODUCER_SANDBOX_POLICY_MISMATCH: ${detail}`); };
+  const value = (flag: string): string => {
+    const positions = args.flatMap((arg, index) => arg === flag || arg.startsWith(`${flag}=`) ? [index] : []);
+    if (positions.length !== 1 || args[positions[0]] !== flag || positions[0] + 1 >= args.length) fail(`expected exactly one ${flag} <value>`);
+    return args[positions[0] + 1];
+  };
+  if (value('--tools') !== CLAUDE_PRODUCER_BUILTIN_TOOLS) fail(`--tools must be exactly ${CLAUDE_PRODUCER_BUILTIN_TOOLS}`);
+  if (value('--allowed-tools') !== `Bash(${launcher}),Bash(${launcher} *),Write`) fail('--allowed-tools must name only the launcher and Write');
+  if (value('--permission-mode') !== 'dontAsk') fail('--permission-mode must be dontAsk');
+  for (const flag of ['--restricted', '--safe-mode', '--strict-mcp-config']) if (args.filter(arg => arg === flag).length !== 1) fail(`expected exactly one ${flag}`);
+  const widening = args.find(arg => /^--(mcp-config|agents?|plugin-dir|dangerously-skip-permissions|allow-dangerously-skip-permissions|disallowed-tools|disallowedTools|setting-sources)(=|$)/.test(arg));
+  if (widening) fail(`${widening.split('=')[0]} would change what the agent and its subagents may do`);
+  const raw = value('--settings');
+  let settings: unknown;
+  try { settings = JSON.parse(raw); } catch { fail('--settings is not JSON'); }
+  const expected = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false, excludedCommands: [launcher, `${launcher} *`] };
+  const sandbox = (settings as { sandbox?: Record<string, unknown> } | null)?.sandbox;
+  if (!settings || typeof settings !== 'object' || Object.keys(settings).join() !== 'sandbox' || !sandbox || typeof sandbox !== 'object') fail('--settings must hold only a sandbox object');
+  if (Object.keys(sandbox!).sort().join() !== Object.keys(expected).sort().join()) fail('sandbox settings keys differ from the launcher-only exclusion policy');
+  for (const [key, wanted] of Object.entries(expected)) {
+    if (JSON.stringify(sandbox![key]) !== JSON.stringify(wanted)) fail(`sandbox.${key} must be ${JSON.stringify(wanted)}`);
+  }
+  if (env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB !== undefined) fail('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces every command, the launcher included, into the sandbox');
+}
+
 export function claudeExecArgs(opts: RunOpts, model: string, argsPrefix: readonly string[] = []): string[] {
-  const args = [...argsPrefix, '-p', '--output-format', 'json', '--model', model];
   const stateDirectory = csoProducerStateDirectory(opts);
+  // Producers stream events so a timed-out or killed run still reports the usage it spent.
+  const output = stateDirectory ? ['stream-json', '--verbose', '--include-partial-messages'] : ['json'];
+  const args = [...argsPrefix, '-p', '--output-format', ...output, '--model', model];
   if (stateDirectory) {
     if (opts.extraArgs?.length) throw new Error('CSO producer does not accept extra provider arguments');
     const tools = claudeProducerTools(opts);
-    const sourceDirectory = csoProducerSourceDirectory(opts)!;
     const helperHome = csoProducerHelperHome(opts)!;
     args.push(
       '--restricted',
@@ -200,11 +248,11 @@ export function claudeExecArgs(opts: RunOpts, model: string, argsPrefix: readonl
       '--no-session-persistence',
       '--permission-prompts', 'none',
       '--permission-mode', 'dontAsk',
-      '--tools', 'Bash,Write',
+      '--tools', CLAUDE_PRODUCER_BUILTIN_TOOLS,
       '--allowed-tools', tools,
       '--add-dir', claudeProducerPaths(stateDirectory).workdir,
-      '--add-dir', sourceDirectory,
       '--add-dir', helperHome,
+      '--settings', JSON.stringify(claudeProducerSettings(csoProducerHelperLauncher(opts)!)),
       '--strict-mcp-config',
       '--no-chrome',
     );
@@ -222,7 +270,6 @@ export function claudeExecEnvironment(
   return {
     ...(opts.csoProducer ? csoProducerChildEnvironment('claude', source) : source),
     ...(paths ? { HOME: paths.home, GSTACK_HOME: csoProducerHelperHome(opts)! } : {}),
-    ...(stateDirectory ? { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' } : {}),
     GSTACK_HEADLESS: '1',
   } as Record<string, string>;
 }

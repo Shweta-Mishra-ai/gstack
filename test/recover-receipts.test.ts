@@ -7,7 +7,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
-  collectRecovery, ghFailureReason, readCheckpoint, recoveryDecision, storeRunId,
+  acceptedScreenRun, collectRecovery, ghFailureReason, listGateRuns, readCheckpoint, recoveryDecision, screenRunPr, storeRunId,
   type GhRunner, type WorkflowRun,
 } from '../scripts/recover-receipts';
 import { selectPlanReceipts, writeNegativeReceipt, writePanelReceipt } from '../scripts/e2e-shard-reuse';
@@ -194,5 +194,32 @@ describe('dispatch reads PR receipts read-only (ENG-8)', () => {
     expect(result.checkpoint.mode).toBe('dispatch');
     expect(fs.existsSync(path.join(store, `${key}.json`))).toBe(true);
     expect(gh.calls.filter(c => c[0] === 'run').map(c => c[2])).toEqual(['300']);
+  });
+});
+
+describe('dispatched screens (GSTA-49 T1b): listed beside the PR\'s pull_request runs, filtered by PR and repository', () => {
+  const screen = (id: number, pr = 42, over: Partial<WorkflowRun> = {}) => run(id, 'completed', 'success', { event: 'workflow_dispatch', pull_requests: [],
+    display_title: `E2E Evals [eval-bg pr.screen.narrow-${'c'.repeat(12)}-${'d'.repeat(12)}-abc123] screen #${pr}`, ...over });
+
+  test('the run name names the PR only for a dispatched screen', () => {
+    expect(screenRunPr(screen(1))).toBe(42);
+    expect(screenRunPr({ event: 'pull_request', display_title: screen(1).display_title })).toBeNull();
+    expect(screenRunPr({ event: 'workflow_dispatch', display_title: 'E2E Evals [eval-bg gate.train-x]' })).toBeNull();
+    expect(screenRunPr({ event: 'workflow_dispatch', display_title: `${screen(1).display_title} extra` })).toBeNull();
+    expect(acceptedScreenRun(screen(1, 42, { head_repository: { full_name: 'fork/gstack' } }), { pr: 42, repo: REPO, selfRunId: 9 })).toBe(false);
+    expect(acceptedScreenRun(screen(9), { pr: 42, repo: REPO, selfRunId: 9 })).toBe(false);
+  });
+
+  test('a screen lists both events; a pull_request run lists only its own event, exactly as before', () => {
+    const calls: string[][] = [];
+    const runs = [run(10, 'completed', 'success'), run(11, 'completed', 'success', { pull_requests: [{ number: 43 }] }), screen(12), screen(13, 43), run(14, 'completed', 'success', { event: 'workflow_dispatch' })];
+    const gh: GhRunner = (args) => { calls.push(args); return { status: 0, stdout: JSON.stringify({ workflow_runs: runs }), stderr: '' }; };
+    const o = { repo: REPO, pr: 42, headRepo: REPO, branch: 'feature', selfRunId: 99 };
+    expect((listGateRuns(gh, { ...o, screens: false }, () => 1000) as { runs: WorkflowRun[] }).runs.map(r => r.id)).toEqual([10]);
+    expect(calls).toEqual([['api', '-X', 'GET', `repos/${REPO}/actions/workflows/evals.yml/runs`, '-f', 'event=pull_request', '-f', 'branch=feature', '-f', 'per_page=50']]);
+    expect((listGateRuns(gh, { ...o, screens: true }, () => 1000) as { runs: WorkflowRun[] }).runs.map(r => r.id)).toEqual([10, 12]);
+    expect(calls.at(-1)).toEqual(['api', '-X', 'GET', `repos/${REPO}/actions/workflows/evals.yml/runs`, '-f', 'event=workflow_dispatch', '-f', 'per_page=50']);
+    const down: GhRunner = (args, timeoutMs) => args.includes('event=workflow_dispatch') ? { status: 1, stdout: '', stderr: 'HTTP 502' } : gh(args, timeoutMs);
+    expect(listGateRuns(down, { ...o, screens: true }, () => 1000)).toHaveProperty('error');
   });
 });

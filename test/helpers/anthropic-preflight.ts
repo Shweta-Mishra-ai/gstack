@@ -11,9 +11,14 @@
  *
  * Lives in its own module (not e2e-helpers) so the runner can import it
  * without dragging in bun:test.
+ *
+ * On the Codex host (EVALS_HOST=codex) Codex is the agent and no session
+ * spawns `claude`, so the ping is skipped; Codex API failures surface per
+ * session as error_api.
  */
 
 import { spawnSync } from 'child_process';
+import { resolveEvalHost } from './e2e-hosts';
 
 export type PreflightResult = 'skipped' | 'ok';
 
@@ -21,7 +26,7 @@ export function preflightAnthropicApi(
   env: NodeJS.ProcessEnv = process.env,
   spawn: typeof spawnSync = spawnSync,
 ): PreflightResult {
-  if (env.EVALS_PREFLIGHT_OK === '1') return 'skipped';
+  if (env.EVALS_PREFLIGHT_OK === '1' || resolveEvalHost(env) === 'codex') return 'skipped';
   const check = spawn(
     'sh',
     ['-c', 'echo "ping" | claude -p --max-turns 1 --output-format stream-json --verbose --dangerously-skip-permissions'],

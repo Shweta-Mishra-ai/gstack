@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * test-free-shards — enumerate, shard, curate, and run the free test suite.
  *
@@ -73,6 +73,7 @@
  *   bun run scripts/test-free-shards.ts --wall-timeout 600         # override the kill deadline
  *   bun run scripts/test-free-shards.ts --verbose                  # forward the full child stream
  *   bun run scripts/test-free-shards.ts --quick                    # explicit fast subset, not acceptance
+ *   bun run scripts/test-free-shards.ts --files-from list.txt      # exactly these planned files (one per line)
  *   bun run scripts/test-free-shards.ts --attribute-home           # name real-home writers: each file alone, private HOME
  *   bun run scripts/test-free-shards.ts --ci-plan plan.json --shards 20
  *   bun run scripts/test-free-shards.ts --ci-run plan.json --shard 1 --result result.json
@@ -540,6 +541,7 @@ type CliOptions = {
   ciVerify: string | null;
   result: string | null;
   results: string | null;
+  filesFrom: string | null;
 };
 
 export function parseCliOptions(argv: string[]): CliOptions {
@@ -554,8 +556,8 @@ export function parseCliOptions(argv: string[]): CliOptions {
   let wallTimeoutExplicit = false;
   let quick = false;
   let attributeHome = false;
-  const paths: Record<'ciPlan' | 'ciRun' | 'ciVerify' | 'result' | 'results', string | null> = {
-    ciPlan: null, ciRun: null, ciVerify: null, result: null, results: null,
+  const paths: Record<'ciPlan' | 'ciRun' | 'ciVerify' | 'result' | 'results' | 'filesFrom', string | null> = {
+    ciPlan: null, ciRun: null, ciVerify: null, result: null, results: null, filesFrom: null,
   };
   const pathFlag = (flag: string, key: keyof typeof paths) => (next: () => string | undefined) => {
     const value = next();
@@ -576,6 +578,7 @@ export function parseCliOptions(argv: string[]): CliOptions {
     '--ci-verify': pathFlag('--ci-verify', 'ciVerify'),
     '--result': pathFlag('--result', 'result'),
     '--results': pathFlag('--results', 'results'),
+    '--files-from': pathFlag('--files-from', 'filesFrom'),
     '--shards': (next) => {
       const value = next();
       if (!value) throw new Error('Missing value for --shards');
@@ -595,11 +598,53 @@ export function parseCliOptions(argv: string[]): CliOptions {
   });
 
   const ciModes = [paths.ciPlan, paths.ciRun, paths.ciVerify].filter(Boolean).length;
+  if (paths.filesFrom && (quick || windowsOnly || listOnly || ciModes || recordDurations || attributeHome)) throw new Error('--files-from cannot be combined with --quick, --windows-only, --list, --record-durations, --attribute-home or the --ci-* modes');
   if (ciModes > 1 || (ciModes && (quick || listOnly || dryRun || recordDurations || attributeHome))) throw new Error('CI modes cannot be combined with other selection modes');
   if (paths.ciRun && (shardIndex === null || !paths.result)) throw new Error('--ci-run requires --shard and --result');
   if (paths.ciVerify && !paths.results) throw new Error('--ci-verify requires --results');
   if (quick && (recordDurations || windowsOnly || shardIndex !== null)) throw new Error('--quick cannot change recording, Windows or shard selection');
   return { dryRun, listOnly, recordDurations, windowsOnly, verbose, shardCount, shardIndex, wallTimeoutMs, wallTimeoutExplicit, quick, attributeHome, ...paths };
+}
+
+const describeLines = (lines: string[]) => `${lines.slice(0, 5).join(', ')}${lines.length > 5 ? ` (+${lines.length - 5} more)` : ''}`;
+
+/**
+ * `--files-from <path>`: one repo-relative path per line (LF or CRLF), blank
+ * lines ignored. Rejected before any planning: an unreadable file, a malformed
+ * or repeated line, an empty list, or a path outside the free planned set.
+ */
+export function readFilesFrom(file: string, planned: readonly string[]): string[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    throw new Error(`--files-from ${file}: cannot read it (${(error as NodeJS.ErrnoException).code ?? String(error)})`);
+  }
+  const files: string[] = [];
+  const malformed: string[] = [];
+  text.split(/\r?\n/).forEach((line, index) => {
+    if (line === '') return;
+    const segments = line.split('/');
+    if (line !== line.trim() || line.includes('\\') || line.startsWith('/') || /^[A-Za-z]:/.test(line)
+      || segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
+      malformed.push(`line ${index + 1} ${JSON.stringify(line)}`);
+    } else if (files.includes(line)) {
+      malformed.push(`line ${index + 1} repeats ${line}`);
+    } else {
+      files.push(line);
+    }
+  });
+  if (malformed.length) throw new Error(`--files-from ${file}: ${malformed.length} malformed line(s): ${describeLines(malformed)}; fix: one repo-relative path per line (forward slashes, no surrounding spaces, no ./ or ../, no repeats)`);
+  if (!files.length) throw new Error(`--files-from ${file}: the list is empty (blank lines are ignored); nothing to run`);
+  const plannedSet = new Set(planned);
+  const unknown = files.filter(f => !plannedSet.has(f));
+  if (unknown.length) throw new Error(`--files-from ${file}: ${unknown.length} path(s) not in the free planned set: ${describeLines(unknown)}; fix: use paths from \`bun run scripts/test-free-shards.ts --list\``);
+  return files;
+}
+
+/** sha256 of the sorted list, one path per line: the digest a remote gate compares against its upload. */
+export function filesDigest(files: readonly string[]): string {
+  return createHash('sha256').update([...files].sort().map(f => `${f}\n`).join('')).digest('hex');
 }
 
 function formatShardSummary(shards: string[][]): string[] {
@@ -676,6 +721,8 @@ export interface FreeRunReport {
   inFlight: string[];
   /** Planned files never observed in the stream (silent passers + never-flushed wedges). */
   filesWithNoOutput: number;
+  /** The last nonblank line either stream printed: a native abort's message when bun dies without a summary. */
+  lastOutputLine: string | null;
 }
 
 interface FileProgress {
@@ -711,6 +758,7 @@ export class FreeRunReporter {
   private testsRan: number | null = null;
   private filesRan: number | null = null;
   private sawSummary = false;
+  private lastOutputLine: string | null = null;
 
   constructor(
     private readonly plannedFiles: string[],
@@ -758,6 +806,7 @@ export class FreeRunReporter {
       unhandledErrors: [...this.unhandled],
       inFlight,
       filesWithNoOutput: this.plannedFiles.filter((f) => !this.progress.has(normalizeRelativePath(f))).length,
+      lastOutputLine: this.lastOutputLine,
     };
   }
 
@@ -768,6 +817,7 @@ export class FreeRunReporter {
     // (fail) lines land under a second phantom file (observed on the first
     // Linux run: 5 real failures reported as 10 across 2 files).
     const line = stripAnsiLine(rawLine).replace(/^::group::/, '');
+    if (line.trim() !== '') this.lastOutputLine = line.trim();
     let visible = false;
     const failedCount = this.failureSummary.consume(line, origin);
     if (failedCount !== null) {
@@ -902,6 +952,10 @@ export function buildRunEpilogue(
   }
   for (const u of report.unhandledErrors) {
     lines.push(`  ⚠ unhandled error between tests (around ${u.file ?? 'unknown file'})`);
+  }
+  if (status === 'failed' && !report.sawTerminalSummary) {
+    lines.push(`  ⚠ test process ended before its summary; in flight: ${report.inFlight.length > 0 ? report.inFlight.join(', ') : 'unknown'}`);
+    if (report.lastOutputLine) lines.push(`  ⚠ last output: ${report.lastOutputLine}`);
   }
   if (status === 'timed-out') {
     if (report.inFlight.length > 0) {
@@ -1481,6 +1535,24 @@ function logFreeRecovery(log: (line: string) => void, outcome: FreeShardOutcome,
   }
 }
 
+/**
+ * Backstop for fixtures that commit and then list, watch or remove `.git`:
+ * git's detached auto-maintenance child creates and deletes
+ * `.git/objects/maintenance.lock` after `git commit` has returned. Appends
+ * `maintenance.auto=false` and `gc.auto=0` after any inherited GIT_CONFIG_*
+ * pairs; a malformed inherited count is left untouched so git still rejects it.
+ */
+export function disableGitAutoMaintenance(env: NodeJS.ProcessEnv): void {
+  const inherited = (env.GIT_CONFIG_COUNT ?? '').trim();
+  if (inherited !== '' && !/^\d+$/.test(inherited)) return;
+  const count = inherited === '' ? 0 : Number(inherited);
+  env[`GIT_CONFIG_KEY_${count}`] = 'maintenance.auto';
+  env[`GIT_CONFIG_VALUE_${count}`] = 'false';
+  env[`GIT_CONFIG_KEY_${count + 1}`] = 'gc.auto';
+  env[`GIT_CONFIG_VALUE_${count + 1}`] = '0';
+  env.GIT_CONFIG_COUNT = String(count + 2);
+}
+
 /** One line per shard, printed after the run: `[test:free] shard i/N: M files, XXs, pass|fail|timed-out`. */
 function shardEpilogue(outcome: FreeShardOutcome, totalShards: number): string {
   return `[test:free] shard ${outcome.shard}/${totalShards}: ${outcome.files.length} files, `
@@ -1550,6 +1622,7 @@ export async function runFreeShard(
   // shards and prior daemons replace each other's state; override inherited state.
   env.BROWSE_STATE_FILE = path.join(stateDir, '.gstack', 'browse.json');
   env.GSTACK_FREE_SHARD_ID = randomUUID();
+  disableGitAutoMaintenance(env);
   const home = options.homeGuard ? options.homeGuard(files, env, stateDir) : guardFreeHome(files, env);
 
   const startedAt = Date.now();
@@ -1679,13 +1752,21 @@ export function exitCodeFor(status: FreeShardStatus): number {
   return status === 'timed-out' ? 124 : 1;
 }
 
+/** Per-file deadline for `--record-durations`: an explicit --wall-timeout, else the one-file default. */
+export function recordingWallTimeoutMs(options: Pick<CliOptions, 'wallTimeoutExplicit' | 'wallTimeoutMs'>): number {
+  return options.wallTimeoutExplicit ? options.wallTimeoutMs : wallTimeoutForShard(1);
+}
+
 /**
  * `--record-durations`: time every file in its own child (exact per-file wall,
  * immune to bun's stream buffering) and write the committed seed atomically.
  * Uses the same isolated, strictly classified children as a normal run.
  * Run against an immutable checkout; never time while editing its inputs.
+ * An explicit --wall-timeout sets the per-file deadline, so a file slower than
+ * the default deadline is timed in full instead of being killed and recorded
+ * at the deadline.
  */
-async function recordFreeTestDurations(files: string[], jobs: number): Promise<number> {
+async function recordFreeTestDurations(files: string[], jobs: number, wallTimeoutMs: number): Promise<number> {
   const durations: Record<string, number> = {};
   const failed: string[] = [];
   const expectedCount = files.length;
@@ -1694,7 +1775,7 @@ async function recordFreeTestDurations(files: string[], jobs: number): Promise<n
   // As in full-suite mode, finish parallel work before exclusive host-state fixtures.
   await forEachFileAlone(files.filter(file => !(file in TREE_MUTATING)), files.filter(file => file in TREE_MUTATING), jobs, async (file, index) => {
     const outcome = await runFreeShard([file], index + 1, files.length, {
-      wallTimeoutMs: wallTimeoutForShard(1), quiet: true, homeGuard: sharedFreeHome,
+      wallTimeoutMs, quiet: true, homeGuard: sharedFreeHome,
     });
     durations[normalizeRelativePath(file)] = outcome.elapsedMs;
     if (outcome.status !== 'passed') failed.push(file);
@@ -1851,6 +1932,10 @@ async function main(): Promise<number> {
   }
 
   let files = allFiles;
+  if (options.filesFrom) {
+    files = readFilesFrom(options.filesFrom, allFiles);
+    console.log(`[test:free] files-from ${options.filesFrom}: ${files.length} files, sha256=${filesDigest(files)}`);
+  }
   if (options.quick) {
     const missing = QUICK_CORE.filter(file => !allFiles.includes(file));
     if (missing.length) throw new Error(`Quick core files missing: ${missing.join(', ')}`);
@@ -1879,7 +1964,7 @@ async function main(): Promise<number> {
   }
 
   if (options.recordDurations) {
-    return recordFreeTestDurations(files, fullSuiteJobs());
+    return recordFreeTestDurations(files, fullSuiteJobs(), recordingWallTimeoutMs(options));
   }
   if (options.attributeHome) return attributeFreeHomeWriters(files.filter(file => !(file in TREE_MUTATING)), files.filter(file => file in TREE_MUTATING),
     fullSuiteJobs(), (file, index, homeGuard) => runFreeShard([file], index + 1, files.length, { wallTimeoutMs: wallTimeoutForShard(1), quiet: true, log: () => {}, homeGuard }));
@@ -1979,7 +2064,15 @@ async function main(): Promise<number> {
     outcomes.push(exclusiveOutcome);
   }
 
-  return Math.max(homeChange ? 1 : 0, (await retryFailedFreeFiles(outcomes, totalShards, options)).exitCode);
+  const exitCode = Math.max(homeChange ? 1 : 0, (await retryFailedFreeFiles(outcomes, totalShards, options)).exitCode);
+  if (options.filesFrom) {
+    // The machine-read result for a remote gate: tests from each shard's own summary; failed counts failing files, plus one per failed shard with none attributed.
+    const tests = outcomes.reduce((sum, outcome) => sum + (outcome.summary?.testsRan ?? 0), 0);
+    const failing = outcomes.filter(outcome => outcome.status !== 'passed');
+    const failed = exitCode === 0 ? 0 : Math.max(1, new Set(failing.flatMap(outcome => outcome.failingFiles)).size + failing.filter(outcome => !outcome.failingFiles.length).length);
+    console.log(`[test:free] FILES-FROM RESULT: files=${files.length} tests=${tests} failed=${failed} exit=${exitCode}`);
+  }
+  return exitCode;
 }
 
 /** Dirty generated artifacts (SKILL.md / host outputs) after a failed exclusive shard. */

@@ -38,7 +38,7 @@ echo "Building $APP_NAME v$VERSION..."
 # ─── Step 1: Compile browse binary ─────────────────────────────
 echo "  Compiling browse binary..."
 cd "$ROOT/browse"
-bun build --compile src/cli.ts --outfile "$BUILD_DIR/browse-app" --target=bun 2>/dev/null
+bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/cli.ts --outfile "$BUILD_DIR/browse-app" --target=bun 2>/dev/null
 cd "$ROOT"
 
 # ─── Step 2: Find Playwright's Chromium ─────────────────────────

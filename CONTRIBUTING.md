@@ -165,16 +165,19 @@ never touches a symlinked or non-gstack directory.
 ## Testing & evals
 
 Codex evals and the GPT benchmark adapter default to `gpt-6-astra`:
-explicit model > `GSTACK_CODEX_MODEL` > default. Claude capture and judge
-defaults are `claude-fable-5-1`, resolved through `lib/eval-model.ts`:
+explicit model > `GSTACK_CODEX_MODEL` > default. The Claude model under test
+(capture) defaults to `claude-opus-5-5` and the judge to `claude-fable-5-1`,
+resolved through `lib/eval-model.ts`. The judge stays put when the model under
+test moves, because its calibration fixtures are keyed to it:
 
 - Claude session, PTY, and Agent SDK eval runners and the Claude benchmark adapter: explicit model > `EVALS_MODEL` > `GSTACK_EVAL_MODEL_CAPTURE` > `GSTACK_EVAL_MODEL` > default.
 - Shared judge calls (including benchmark quality scoring): explicit model > `GSTACK_EVAL_MODEL_JUDGE` > `GSTACK_EVAL_MODEL` > default. `EVALS_MODEL` applies to capture runners, not judges.
 
 Warmup stays on `claude-haiku-4-5`; distill stays on
 `claude-haiku-4-5-20251001`. Explicit test and historical benchmark model
-selections still win. Known frontier defaults are maintained in releases;
-there is no automatic model discovery. Paid-run costs shown below are
+selections still win. These eval defaults stay pinned independently from the
+[runtime model tiers](docs/model-policy.md); the tier freshness workflow does
+not discover or change evaluation models automatically. Paid-run costs shown below are
 historical estimates from before this default change, not measurements of
 the new defaults.
 
@@ -182,10 +185,11 @@ the new defaults.
 
 | I want to… | Command | Cost / time | Needs |
 |---|---|---|---|
-| Check an ordinary edit quickly | `bun run test:quick` | Free, about a minute | Bun 1.4.0 |
+| Check an ordinary edit quickly | `bun run test:quick` | Free, about a minute | Bun 1.4.2 |
 | Run one free test file while repairing | `bun test <file>` | Free, seconds | Never bare `bun test` for the suite |
-| Run full free acceptance before publishing | `bun run test` | Free, a few minutes | Bun 1.4.0 |
+| Run full free acceptance before publishing | `bun run test` | Free, a few minutes | Bun 1.4.2 |
 | Run the full free suite from a small machine | `bun run test:ubicloud` | Free suite on a billed 16-vCPU VM, about 5 minutes | `UBICLOUD_API_KEY` |
+| Clear pregate's test tier on a machine under 8 cores ([remote gate](docs/pregate.md#remote-gate)) | `gstack-pregate --stage tests --remote --spend-cap 2 --timeout 2700 --allow-repo-commands` (same command keyed or keyless) | Keyed: one billed 16-vCPU VM, about 7 minutes and $0.06 for the whole free tier, worst case $0.38; keyless: free, local parallel shards, practical for small selections only (98 files took 103 s on 4 cores) | Keyed: `UBICLOUD_API_KEY`; keyless: nothing |
 | Run the curated Windows-safe subset | `bun run test:windows` (CI: six `windows-latest` jobs) | Free | Windows, Git Bash |
 | Refresh the Windows duration seed | `gh workflow run windows-free-tests.yml --ref <branch> -f record_durations=true`, then commit the `free-test-durations-windows` artifact | Free CI runners | Pushed branch, `gh` with workflow rights |
 | Run a native Windows or Dia qualification campaign | `gh workflow run native-qualification.yml --ref <branch> -f mode=<mode>` ([modes](docs/TESTING_INTERNALS.md#windows-free-lane)) | Free CI runners | Pushed branch, `gh` with workflow rights |
@@ -201,13 +205,16 @@ the new defaults.
 | Run the opt-in ML, gitleaks and Swift checks | `gh workflow run platform-qualification.yml --ref <branch>` | Free CI runners | Pushed branch, `gh` with workflow rights |
 | Look at past local eval runs | `bun run eval:list` / `eval:compare` / `eval:summary` | Free | Local eval history |
 | See a case's pass rate across recent weekly runs | `bun run eval:pass-rates --case <case-id>` | Free | `gh` with repo read access |
+| Measure one red case alone against the ship bar (MEETS 9/10) | `bun run scripts/ship-measure.ts measure --case <case-id> --round baseline` ([bar](docs/TESTING_INTERNALS.md#ship-measure)) | API spend for 10 trials (12 for behavior); asks above $2/trial, stops at $25/case | Same as paid coverage |
+| Measure main's flakiest gate cases (the weekly sweep) | `gh workflow run eval-sweep.yml --ref main [-f k=5] [-f cap_usd=150] [-f dry_run=true]`, or locally `bun run scripts/ship-measure.ts sweep --dry-run` ([sweep](docs/TESTING_INTERNALS.md#ship-measure-sweep)) | API spend up to $150 per 7 days (`ship_measure_sweep_budget_usd`); `--dry-run` is free | `gh` with repo read access; CI dispatch needs workflow rights |
+| Replay what the paid gate costs and what each selection or train policy would have cost ([replay](docs/TESTING_INTERNALS.md#replay-gate-cost)) | `bun run scripts/gate-cost-replay.ts --runs <full-gate run ids> --since <date> --until <date>` (screening figures print as screen-provisional, heuristic until T2 lands) | Free; `gh` reads, cached in `.context/gate-cost-cache` | `gh` with repo read access |
 | See the audit success metrics and weekly health | `bun run test:health [--since-days 7] [--json] [--enforce]` | Free; 5–20 minutes of `gh` reads | `gh` with repo read access |
 
 Old command names are listed under [Retired commands](#retired-commands).
 
 ### Setup
 
-Development and tests require Bun 1.4.0 or newer; CI pins and tests 1.4.0.
+Development and tests require Bun 1.4.2 or newer; CI pins and tests 1.4.2.
 Earlier Linux versions can close unrelated live file descriptors during
 subprocess garbage collection, causing intermittent browser and HTTP fixture
 failures ([upstream diagnosis](https://github.com/oven-sh/bun/issues/34785#issuecomment-5020318035)).
@@ -272,7 +279,9 @@ Complete start-to-finish flows belong to the `marathon` tier
 (`describeE2ETier('marathon')`), which runs only in the non-blocking
 `evals-marathon.yml` lane (weekly and on dispatch) and never gates a merge.
 
-Verdicts: paid evals never retry. Each case's kind in `E2E_KINDS`
+Verdicts: paid evals never retry, except the gate's one flaky rerun of a red
+case verdict at the same head ([flaky reruns](docs/TESTING_INTERNALS.md#flaky-reruns)).
+Each case's kind in `E2E_KINDS`
 (`test/helpers/touchfiles-data.ts`) fixes its trials before the run, from the
 constants in `EVAL_POLICY` (`test/helpers/periodic-exclude-data.ts`):
 
@@ -284,9 +293,10 @@ constants in `EVAL_POLICY` (`test/helpers/periodic-exclude-data.ts`):
   PASS at 2 or more with no contract violation (`expectContract()`). Use it only
   when a live model choice decides the verdict and an occasional deviation is
   acceptable product behavior; the one-line reason goes in `BEHAVIOR_WHY`.
-- `judge`: an LLM judge scoring a fixed input; 3 samples of the same prompt,
-  gated on the per-dimension mean (booleans on a majority) against the
-  unchanged threshold. An erroring sample fails the panel and is never resampled.
+- `judge`: an LLM judge scoring a fixed input; exactly 3 samples of the same
+  prompt, each dimension gated on its median, at least 2 of 3 samples, against
+  the unchanged threshold (booleans on a majority; the mean is reported only).
+  An erroring sample fails the panel and is never resampled.
 
 A timed-out, crashed or infrastructure-failed trial counts as a failed trial and
 is reported with its class; a missing trial makes the case INCOMPLETE, which
@@ -295,6 +305,13 @@ cause, never as a clean pass. Case budgets and thresholds never change with
 this policy. Quarantine (`CASE_QUARANTINE`) and history are described in
 `docs/TESTING_INTERNALS.md`; `bun run eval:pass-rates --case <id>` shows a
 case's per-trial pass rate with its Wilson interval.
+
+**A census went red?** Follow [docs/evals/census-red.md](docs/evals/census-red.md):
+read the red line, inspect its evidence with `bun run eval:pass-rates --run <id>`,
+check `--reds` and `--headroom`, repair with a free regression test, and only
+then spend one paid run with the line's `after a repair:` command. A red census
+on `main` is reported on the weekly tracking issue; a census dispatched on a
+branch writes the same report to its run summary and `census-report` artifact.
 
 CI enables verified first-attempt reuse for 16 workflow quality judges for
 24 hours within the same PR. The cookie workflow's custom input and the other 11
@@ -477,6 +494,9 @@ bun run eval:list            # list all eval runs (turns, duration, cost per run
 bun run eval:compare         # compare two runs — shows per-test deltas + Takeaway commentary
 bun run eval:summary         # aggregate stats + per-test efficiency averages across runs
 bun run eval:pass-rates      # per-case trial pass rates + Wilson intervals from recent weekly runs (--case, --runs, --dir, --backfill, --json, --gate)
+bun run eval:pass-rates --reds       # verdict reds per census by failure class and cause, all-green probability
+bun run eval:pass-rates --headroom   # slowest session per case vs its armed budget (alarm above 85% in --gate)
+bun run eval:pass-rates --run <id>   # one census's reds with their values and fetched transcript evidence
 ```
 
 **Detached runs for agents and long suites.** When an agent (or you, for a run
@@ -534,8 +554,8 @@ Override the judge model per run with `GSTACK_EVAL_MODEL_JUDGE`:
 - **Actionability** — Can the agent execute tasks using only the information in the doc?
 
 Each dimension is scored 1-5 by a panel of 3 samples of the same prompt, drawn
-concurrently; each dimension's panel mean must meet that judge's threshold (≥ 4
-for most dimensions; see each case). An erroring sample fails the panel. There's also a regression test that compares generated docs against the hand-maintained baseline from `origin/main` — generated must score equal or higher.
+concurrently; each dimension's panel median (at least 2 of 3 samples) must meet
+that judge's threshold (≥ 4 for most dimensions; see each case). An erroring sample fails the panel. There's also a regression test that compares generated docs against the hand-maintained baseline from `origin/main` — generated must score equal or higher.
 
 Needs `ANTHROPIC_API_KEY` in `.env`. The judge files run in every paid lane
 (`bun run eval:bg:pr` selects the ones your diff touches).
@@ -815,7 +835,7 @@ When Conductor creates a new workspace, `bin/dev-setup` runs automatically. It d
 - **`.claude/skills/` is gitignored.** The symlinks never get committed.
 - **Never write raw `ln -snf` in `setup`.** Every link site in `setup` MUST route through the `_link_or_copy SRC DST` helper near the `IS_WINDOWS` detection. The helper preserves `ln -snf` on Unix and switches to `cp -R` / `cp -f` on Windows without Developer Mode, where plain `ln -snf` produces frozen file copies that don't refresh on `git pull`. `test/setup-windows-fallback.test.ts` enforces this with a static invariant — a single raw `ln` call outside the helper body fails CI.
 - **Synchronous subagent dispatches must state the flag.** Claude Code runs Agent-tool subagents in the background by default (since v2.1.198), so any template step that dispatches a subagent and consumes its output must carry `run_in_background: false`. Use the `{{FOREGROUND_DISPATCH_NOTE}}` placeholder (`scripts/resolvers/constants.ts`) instead of hand-writing the guidance, and add the generated carrier file to `GENERATED_WITH_GUIDANCE` in `test/run-in-background-guidance.test.ts` in the same commit — its structural scanner fails CI on any generated dispatch imperative that lacks the flag.
-- **Never delete or link over a skill entry `setup` cannot prove is gstack's.** Every destructive site in `setup` (the linker, the alias installer, both prefix-flip cleanups) and in `bin/gstack-relink` goes through the ownership helpers (`_claude_entry_is_ours` / `_claude_entry_owned_strongly` in `setup`, `_entry_is_ours` / `_entry_owned_strongly` in relink). The retired-skill prune (`_prune_stale_generated`) applies the same strong/weak split through its own gate: a real host directory is a candidate only when its SKILL.md carries the generated banner (`_owned_for_windows_refresh`), a host symlink is removed only when it resolves into gstack (`_gstack_target_is_ours`), a bannered real directory is cleaned through `_cleanup_weak_dir`, and a symlink inside the render tree is never followed. A symlink into gstack or the `.gstack-owned` marker proves the whole directory; a byte-identical or generated-banner SKILL.md proves only that file, and a differing one is moved to `~/.gstack/backups/skills/<ts>/` first. `test/setup-link-ownership.test.ts`, `test/setup-cleanup-orphans.test.ts`, `test/setup-prune-stale-generated.test.ts`, and `test/relink.test.ts` pin it. The rule is duplicated in the two scripts until the shared helper filed in TODOS.md lands: change both.
+- **Never delete or link over a skill entry `setup` cannot prove is gstack's.** Every destructive site in `setup` (the linker, the alias installer, both prefix-flip cleanups) and in `bin/gstack-relink` goes through the ownership helpers (`_claude_entry_is_ours` / `_claude_entry_owned_strongly` in `setup`, `_entry_is_ours` / `_entry_owned_strongly` in relink). The retired-skill prune (`_prune_stale_generated`) applies the same strong/weak split through its own gate: a real host directory is a candidate only when its SKILL.md carries the generated banner (`_owned_for_windows_refresh`), a host symlink is removed only when it resolves into gstack (`_gstack_target_is_ours`), a bannered real directory is cleaned through `_cleanup_weak_dir`, and a symlink inside the render tree is never followed. A symlink into gstack or the `.gstack-owned` marker proves the whole directory; a byte-identical or generated-banner SKILL.md proves only that file, and a differing one is moved to `~/.gstack/backups/skills/<ts>/` first. `test/setup-link-ownership.test.ts`, `test/setup-cleanup-orphans.test.ts`, `test/setup-prune-stale-generated.test.ts`, and `test/relink.test.ts` pin it. The rule is duplicated in the two scripts until the shared helper filed in TODOS.md lands: change both. The host-render prune (`gstack_prune_host_renders` in `bin/gstack-host-renders.sh`, #1694) applies the same split to the render dirs of hosts a checkout does not serve: a link into the checkout goes, a file proven generated moves to `~/.gstack/backups/host-renders/<ts>-<id>/`, anything else stays, and only emptied directories are removed (`test/host-renders-prune.test.ts`).
 - **`./setup` never fails on Chromium.** The Playwright bootstrap (section `# 2` of `setup`) is best-effort and bounded: every failure becomes a reason code (`skipped`, `chromium-install`, `chromium-install-timeout`, `chromium-install-locked`, `windows-no-node`, `windows-node-modules`, `post-install-launch`) printed in the final summary alongside the browser-dependent skills, and skill registration always runs. `GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT=<seconds>` (default 600) bounds the download; `GSTACK_SKIP_PLAYWRIGHT=1` skips it, the right knob for a no-browser box or a setup-only test loop. `GSTACK_SKIP_ASIDE=1` makes the browser summary (like the skills' probe and the renderer) treat Aside as absent, so the summary never promises a fallback the bootstrap did not deliver (`test/setup-browser-hint.test.ts`). Anything you add after the bootstrap must stay independent of the browser. `test/setup-playwright-best-effort.test.ts` pins the block.
 
 ## Testing your changes in a real project

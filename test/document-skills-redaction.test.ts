@@ -44,7 +44,7 @@ describe("/document-release redaction", () => {
     const section = RELEASE.slice(RELEASE.indexOf('**PR/MR title sync'));
     const script = section.match(/```bash\n([\s\S]*?)\n```/)![1];
     // G1 (#2334): the version comes from the shared classifier, not a root VERSION read.
-    for (const command of ['VB=$(bun run ~/.claude/skills/gstack/bin/gstack-version-bump classify', 'CURRENT_TITLE=$(gh pr view', 'NEW_TITLE=$(', 'gh pr edit --title "$NEW_TITLE"', 'glab mr update -t "$NEW_TITLE"']) {
+    for (const command of ['VB=$(bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-version-bump classify', 'CURRENT_TITLE=$(gh pr view', 'NEW_TITLE=$(', 'gh pr edit --title "$NEW_TITLE"', 'glab mr update -t "$NEW_TITLE"']) {
       expect(script).toContain(command);
     }
     const result = spawnSync('bash', ['-n'], { input: script, encoding: 'utf8', timeout: 5000 });

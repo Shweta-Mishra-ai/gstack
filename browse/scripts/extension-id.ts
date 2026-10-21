@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Derive the Chrome extension ID from the "key" field in
  * extension/manifest.json.

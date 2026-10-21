@@ -5,6 +5,8 @@ import { generateBrainWriteBack } from '../scripts/resolvers/gbrain';
 import { generateAskUserFormat } from '../scripts/resolvers/preamble/generate-ask-user-format';
 import { generateTestCoverageAuditPlan, generateTestCoverageAuditShip } from '../scripts/resolvers/testing';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
+import { generateReviewDashboard, generatePlanFileReviewReport } from '../scripts/resolvers/review-dashboard';
+import { generateExitPlanModeGate } from '../scripts/resolvers/plan-gates';
 import { ENG_REVIEW_EXCERPT } from './helpers/workflow-excerpt';
 import { expectMentions } from './helpers/prompt-structure';
 
@@ -74,8 +76,14 @@ describe('engineering review routing contracts', () => {
   test('high complexity stops before Section 1 and asks cuts and structure separately', () => {
     expectMentions(compact(complexity), [['stop', 'classes/services', 'section']], 'compact(complexity)');
     ordered(compact(complexity), ['1. Explain the complexity', 'Ask each proposed feature cut/deferral separately',
-      '2. Always ask the structure question', '3. Save the actual feature and structure answers']);
+      '2. Always resolve the structure question', '3. Save the actual feature and structure answers']);
     expect(compact(complexity)).toContain('Pending remedies not decided here: <ids>');
+  });
+
+  test('the structure question uses its registered id and honors a stored preference', () => {
+    ordered(compact(complexity), ['2. Always resolve the structure question',
+      'as question_id `plan-eng-review-structure` (no per-plan slug)', '`AUTO_DECIDE` picks the recommendation',
+      'Compare only the file/class arrangement']);
   });
 
   test('no safe smaller arrangement does not authorize scope cuts or bypass the pause', () => {
@@ -125,8 +133,40 @@ describe('engineering review routing contracts', () => {
     const policy = compact(between(section, '## Review record and write policy', '{{LEARNINGS_SEARCH}}'));
     expect(policy).toContain('**Recovery routing → Repairable write/read failure**');
     expect(policy).toMatch(/skip forbidden writes/i);
-    expect(recovery).toContain('`OUTCOME=error`');
-    expect(recovery).not.toContain('`OUTCOME=success`');
+    const blocked = between(recovery, '**Blocked outcome:**', '**Report-back outcome:**');
+    expect(blocked).toContain('`OUTCOME=error`');
+    expect(blocked).not.toContain('`OUTCOME=success`');
+  });
+
+  test('#3106: a caller-forbidden write reports back as DONE with PERSISTED: no and a final PERSIST: line', () => {
+    const back = compact(recovery.slice(recovery.indexOf('**Report-back outcome:**')));
+    ordered(back, ['caller forbids the report file or required Review Log', 'as **not persisted**',
+      'skip navigation, Read-back, the EXIT PLAN MODE GATE and ExitPlanMode', '`OUTCOME=success`', 'Report `DONE` and `PERSISTED: no`',
+      'the last line is `PERSIST: `', 'filled `gstack-review-log` command', 'No saved-review credit until then']);
+    expect(back).not.toContain('BLOCKED');
+    expect(back).not.toMatch(/REPORTED|DONE_WITH/);
+    const blocked = compact(between(recovery, '**Blocked outcome:**', '**Report-back outcome:**'));
+    expect(blocked).toContain('report `BLOCKED`');
+    const routes = compact(between(section, '| Artifact | Destination | If writing is forbidden |', 'QA Test Plan/task JSONL keep'));
+    expect(routes).toContain('use **Read-only review** below, then **Report-back outcome**.');
+    expect(routes).toContain('at Review Log, use **Report-back outcome** instead of publishing a saved review');
+    const finish = compact(between(section, '## Required outputs', '### Output reference'));
+    expect(finish).toContain('Forbidden persistence uses **Report-back outcome**; an unrecovered save requires **Blocked outcome**, not logging.');
+    expect(finish).toContain('If the required log is forbidden, show fields as not persisted and take **Report-back outcome**');
+  });
+
+  test('#3106: an unpersisted review gets no saved credit; /ship names the PERSIST: line or a rerun', () => {
+    const ctx = (skillName: string) => ({ skillName, tmplPath: `${skillName}/SKILL.md.tmpl`, host: 'claude', paths: HOST_PATHS.claude } as TemplateContext);
+    const ship = compact(generateReviewDashboard(ctx('ship')));
+    expect(ship).toContain('With no Eng Review record, say "no saved Eng Review: run the `PERSIST:` line a read-only /plan-eng-review printed, or rerun it"');
+    expect(ship).toContain('docs/troubleshooting.md#plan-eng-review-not-persisted');
+    expect(generateReviewDashboard(ctx('plan-eng-review'))).not.toContain('PERSIST:');
+    const gate = compact(generateExitPlanModeGate(ctx('plan-eng-review')));
+    expect(gate).toContain('Forbidden report/log persistence uses **Report-back outcome**, not this gate; an unrecovered save cannot pass');
+    const writer = compact(generatePlanFileReviewReport(ctx('plan-eng-review')));
+    expect(writer).toContain('Then use **Report-back outcome**.');
+    expect(writer).toMatch(/follow \*\*Blocked outcome\*\* before Review Log or decision logging/);
+    expect(readFileSync('docs/troubleshooting.md', 'utf8')).toContain('<a id="plan-eng-review-not-persisted"></a>');
   });
 
   test('late changes rerun affected approvals and outputs before another navigation answer', () => {

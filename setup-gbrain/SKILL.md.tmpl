@@ -116,7 +116,7 @@ continue immediately with Step 2:
 
 ```bash
 [ -f ~/.claude/skills/gstack/bin/gstack-code-intelligence ] \
-  && bun ~/.claude/skills/gstack/bin/gstack-code-intelligence select gbrain 2>/dev/null \
+  && bun --no-env-file --config=/dev/null ~/.claude/skills/gstack/bin/gstack-code-intelligence select gbrain 2>/dev/null \
   || true
 ```
 
@@ -275,14 +275,38 @@ binary. User scope makes the MCP available in every Claude Code session on
 this machine, not just the current workspace. Absolute path avoids PATH
 resolution issues when Claude Code spawns `gbrain serve` as a subprocess.
 
+On Windows (Git Bash/MSYS) the `gbrain.exe` binstub starts bun in a new
+console, so every Claude Code session would open a visible terminal for the
+MCP. Register `bun.exe` with gbrain's entry instead, which attaches to Claude
+Code's hidden console. Without them, register `gbrain.exe` by its full name,
+because Claude Code does not add `.exe` to a stored path.
+
 ```bash
 GBRAIN_BIN=$(command -v gbrain)
 [ -z "$GBRAIN_BIN" ] && GBRAIN_BIN="$HOME/.bun/bin/gbrain"
 claude mcp remove gbrain -s user 2>/dev/null || true
 claude mcp remove gbrain 2>/dev/null || true
-claude mcp add --scope user gbrain -- "$GBRAIN_BIN" serve
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    BUN_ROOT="${BUN_INSTALL:-$HOME/.bun}"
+    GBRAIN_ENTRY="$BUN_ROOT/install/global/node_modules/gbrain/src/cli.ts"
+    if [ -f "$BUN_ROOT/bin/bun.exe" ] && [ -f "$GBRAIN_ENTRY" ]; then
+      claude mcp add --scope user gbrain -- "$BUN_ROOT/bin/bun.exe" "$GBRAIN_ENTRY" serve
+    else
+      claude mcp add --scope user gbrain -- "$BUN_ROOT/bin/gbrain.exe" serve
+    fi
+    ;;
+  *)
+    claude mcp add --scope user gbrain -- "$GBRAIN_BIN" serve
+    ;;
+esac
 claude mcp list | grep gbrain  # verify: should show "✓ Connected"
 ```
+
+On a local PGLite brain, `claude mcp list` can show `Failed to connect`
+while an open Claude Code session's gbrain holds the database's single-writer
+lock. If `mcp__gbrain__*` tools work in that session, the registration is
+fine.
 
 ### Both paths
 
@@ -459,12 +483,16 @@ Do NOT print the actual token in the curl command — leave the placeholder
 
 ```bash
 SLUG="setup-gbrain-smoke-test-$(date +%s)"
-echo "Set up on $(date). Smoke test for /setup-gbrain." | gbrain put "$SLUG"
-gbrain search "smoke test" | grep -i "$SLUG"
+SMOKE_PAGE=$(mktemp "${TMPDIR:-/tmp}/gstack-gbrain-smoke.XXXXXX")
+echo "Set up on $(date). Smoke test for /setup-gbrain." > "$SMOKE_PAGE"
+gbrain put "$SLUG" < "$SMOKE_PAGE"; PUT_RC=$?
+rm -f "$SMOKE_PAGE"
+[ "$PUT_RC" -eq 0 ] && gbrain search "smoke test" | grep -i "$SLUG"
 ```
 
-Confirms the round trip. On failure, surface `gbrain doctor --json` output
-and STOP with a NEEDS_CONTEXT escalation.
+Confirms the round trip. The page goes in from a temp file, not a pipe: on
+Windows, gbrain failed to read a piped page. On failure, surface
+`gbrain doctor --json` output and STOP with a NEEDS_CONTEXT escalation.
 
 ---
 
@@ -628,12 +656,15 @@ or `headless`, end by naming `/sync-gbrain` as the next step.
 ## `/setup-gbrain --cleanup-orphans`
 
 Re-collect a PAT (show the Path 2a PAT scope disclosure — it lives in the
-brain-init section; read that section if it isn't already loaded), then:
+brain-init section; read that section if it isn't already loaded), then
+collect it with the secret-read helper and list the user's Supabase projects.
+The PAT is read from the user's paste into the environment; never type it into
+a command:
 
 ```bash
-# List user's Supabase projects (user has to pipe this through their own
-# shell to review; we don't rely on a stored PAT).
-export SUPABASE_ACCESS_TOKEN="<collected from read_secret_to_env>"
+# We don't rely on a stored PAT.
+. ~/.claude/skills/gstack/bin/gstack-gbrain-lib.sh
+read_secret_to_env SUPABASE_ACCESS_TOKEN "Paste PAT: " || exit 1
 projects=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   https://api.supabase.com/v1/projects)
 ```

@@ -17,7 +17,7 @@ import { guardScreenshotPath } from './screenshot-size-guard';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SetContentWaitUntil } from './tab-session';
-import { TEMP_DIR, isPathWithin } from './platform';
+import { TEMP_DIR } from './platform';
 import { SAFE_DIRECTORIES } from './path-security';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
 import { withCdpSession } from './cdp-bridge';
@@ -545,18 +545,25 @@ export async function handleWriteCommand(
         } else if (sizeArg === undefined) {
           sizeArg = args[i];
         } else {
-          throw new Error(`Unexpected positional arg: ${args[i]}. Usage: viewport [WxH] [--scale <n>]`);
+          throw new Error(`Unexpected positional arg: ${args[i]}. Usage: viewport [WxH|auto] [--scale <n>]`);
         }
       }
 
       if (sizeArg === undefined && scaleArg === undefined) {
-        throw new Error('Usage: browse viewport [<WxH>] [--scale <n>]  (e.g. 375x812, or --scale 2 to keep current size)');
+        throw new Error('Usage: browse viewport [<WxH>|auto] [--scale <n>]  (e.g. 375x812, auto to unpin, or --scale 2 to keep current size)');
+      }
+
+      if (sizeArg !== undefined && ['auto', 'reset', 'unpin'].includes(sizeArg.toLowerCase())) {
+        if (scaleArg !== undefined) throw new Error('viewport auto cannot be combined with --scale or a size.');
+        return (await bm.resetViewport()) === 'window'
+          ? 'Viewport unpinned: the page follows the browser window again (refs cleared)'
+          : 'Viewport reset to default 1280x720';
       }
 
       // Resolve width/height: either from sizeArg or from current viewport if --scale-only.
       let w: number, h: number;
       if (sizeArg) {
-        if (!sizeArg.includes('x')) throw new Error('Usage: browse viewport [<WxH>] [--scale <n>] (e.g., 375x812)');
+        if (!sizeArg.includes('x')) throw new Error('Usage: browse viewport [<WxH>|auto] [--scale <n>] (e.g., 375x812)');
         const [rawW, rawH] = sizeArg.split('x').map(Number);
         w = Math.min(Math.max(Math.round(rawW) || 1280, 1), 16384);
         h = Math.min(Math.max(Math.round(rawH) || 720, 1), 16384);
@@ -661,18 +668,9 @@ export async function handleWriteCommand(
     case 'cookie-import': {
       const filePath = args[0];
       if (!filePath) throw new Error('Usage: browse cookie-import <json-file>');
-      // Path validation — resolve to absolute and check against safe dirs.
-      // Fixes #707: relative paths previously bypassed the safe directory check.
-      // Mirrors validateOutputPath() — resolves symlinks (e.g., macOS /tmp → /private/tmp).
-      const resolved = path.resolve(filePath);
-      let resolvedReal = resolved;
-      try { resolvedReal = fs.realpathSync(resolved); } catch {
-        // File may not exist yet — resolve parent dir instead
-        try { resolvedReal = path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved)); } catch {}
-      }
-      if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedReal, dir))) {
-        throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-      }
+      // Path validation against safe dirs (#707: relative paths included),
+      // through the same realpath as SAFE_DIRECTORIES (#3104).
+      validateReadPath(filePath);
       if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
       const raw = fs.readFileSync(filePath, 'utf-8');
       let cookies: any[];

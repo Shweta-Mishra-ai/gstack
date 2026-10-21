@@ -237,8 +237,8 @@ test.each(['before','after'])('guard blocks retain command separators around the
 test.each(['assignment-only','set-config','other-config','foreign-reader','or-config','and-cli','inverted-cli','no-exit','return','dynamic-exit','out-of-range-exit','command-substitution','backticks','redirect','diagnostic-command','completed-diagnostic','variable-change','duplicate-config','duplicate-cli','extra-command','conditional-body','inside-harness','inside-body','before-cd','changed-harness','changed-timeout','changed-sandbox','changed-prompt','skipped-validator','suffix'])('availability guards reject changed dispatch or non-stop shell: %s',kind=>{
  const f=fixture();let guards=configStop(f)+'\n'+cliStop;
  if(kind==='assignment-only')guards=configRead(f);
- if(kind==='set-config')guards=guards.replace('get codex_reviews','set codex_reviews enabled');
- if(kind==='other-config')guards=guards.replace('get codex_reviews','get telemetry');
+ if(kind==='set-config')guards=guards.replace('get --stored codex_reviews','set codex_reviews enabled');
+ if(kind==='other-config')guards=guards.replace('get --stored codex_reviews','get --stored telemetry');
  if(kind==='foreign-reader')guards=guards.replace('~/.claude/skills/gstack/bin/gstack-config','/tmp/gstack-config');
  if(kind==='or-config')guards=guards.replace('] && {','] || {');
  if(kind==='and-cli')guards=guards.replace('2>&1 || {','2>&1 && {');
@@ -263,8 +263,8 @@ test.each(['assignment-only','set-config','other-config','foreign-reader','or-co
  if(kind==='inside-body')input.command=input.command.replace(guards+'\n','').replace('_OUTSIDE_EXIT=0','_OUTSIDE_EXIT=0\n'+guards);
  if(kind==='before-cd')input.command=guards+'\ncd '+f.dir+'\n'+f.options.commands.outside.replace("'<prepared-prompt-file>'","'"+f.file+"'");
  if(kind==='changed-harness')input.command=input.command.replace('exit 78','exit 0');
- if(kind==='changed-timeout')input.command=input.command.replace('_gstack_codex_timeout_wrapper 540','_gstack_codex_timeout_wrapper 1');
- if(kind==='changed-sandbox')input.command=input.command.replace('-s "${_GSTACK_CODEX_SANDBOX:?}"','-s danger-full-access');
+ if(kind==='changed-timeout')input.command=input.command.replace('high 540 codex','high 1 codex');
+ if(kind==='changed-sandbox')input.command=input.command.replace('-s "${_CODEX_SANDBOX_MODE:?}"','-s danger-full-access');
  if(kind==='changed-prompt')input.command=input.command.replace('codex exec - ','codex exec "Different plan" ');
  if(kind==='skipped-validator')input.command=input.command.replace(/^bun .*outside-review-result.*\n/m,'');
  if(kind==='suffix')input.command+='\ntrue';

@@ -7,6 +7,6 @@
 set -u
 INSTALL_DIR="${GSTACK_INSTALL_DIR:-$HOME/.claude/skills/gstack}"
 if [ -f "$INSTALL_DIR/bin/gstack-migrate-claude-code" ] && command -v bun >/dev/null 2>&1; then
-  bun "$INSTALL_DIR/bin/gstack-migrate-claude-code" --install-dir "$INSTALL_DIR" || true
+  bun --no-env-file --config=/dev/null "$INSTALL_DIR/bin/gstack-migrate-claude-code" --install-dir "$INSTALL_DIR" || true
 fi
 exit 0

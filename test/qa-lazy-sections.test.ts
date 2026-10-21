@@ -161,8 +161,8 @@ describe('QA-only cross-host lazy rendering', () => {
         expect(fs.readFileSync(path.join(rendered, dir, 'SKILL.md'), 'utf8')).not.toContain(body.split('\n').slice(2).join('\n').trim());
       }
       const outside = generated.artifacts.filter(artifact => artifact.host === host.name && artifact.kind === 'section'
-        && !/^(?:qa|qa-only|ship|plan-ceo-review)\//.test(artifact.relativePath)
-        && !/\/gstack-(?:qa(?:-only)?|ship|plan-ceo-review)\//.test(artifact.relativePath));
+        && !/^(?:qa|qa-only|ship|plan-ceo-review|office-hours)\//.test(artifact.relativePath)
+        && !/\/gstack-(?:qa(?:-only)?|ship|plan-ceo-review|office-hours)\//.test(artifact.relativePath));
       expect(outside.length > 0).toBe(host.name === 'claude');
       // C4: ship is carved on every host; external pointers are relative to the installed skill.
       const ctx = context(host.name, 'ship');
@@ -529,7 +529,7 @@ describe('installed QA pointers', () => {
     '_gstack_generated_header', '_claude_entry_owned_strongly', '_claude_entry_is_ours', '_write_owned_marker',
     '_backup_skill_md', '_cleanup_weak_dir', '_gstack_dir_only_links', '_cleanup_linked_dir',
     '_owned_for_windows_refresh', '_sidecar_root_user_owned', '_prune_stale_generated', '_skill_source_exists',
-    '_link_runtime_dists', '_copy_skill_md', '_skill_copy_hash', '_skill_copy_unmodified', '_preserve_skill_copy_edits', '_record_skill_copies',
+    '_link_runtime_dists', '_copy_runtime_skill_refs', '_copy_skill_md', '_skill_copy_hash', '_skill_copy_unmodified', '_preserve_skill_copy_edits', '_record_skill_copies',
   ].map(setupFunction).join('\n')
     // Install-registry rows (setup's _setup_arm_* / _setup_row) are not under test here.
     + '\n_setup_arm_begin() { :; }\n_setup_arm_publish() { :; }\n_setup_row() { :; }';

@@ -5,12 +5,12 @@
  * federated source, and stay on the machine when the brain is remote.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync } from "child_process";
 import { installFakeBrain } from "./helpers/fake-gbrain-brain";
-import { transcriptSourceId } from "../bin/gstack-memory-ingest";
+import { transcriptCheckoutPath, transcriptSourceId } from "../bin/gstack-memory-ingest";
 
 const SCRIPT = join(import.meta.dir, "..", "bin", "gstack-memory-ingest.ts");
 
@@ -131,5 +131,140 @@ describe("memory ingest: per-repository transcript sources (A4)", () => {
     expect(r.stderr).toMatch(/kept 1 transcript page\(s\) for github\.com\/acme\/alpha on this machine: could not register gbrain source gstack-transcripts-\S+/);
     expect(calls().some((c) => c[0] === "import")).toBe(false);
     expect(sessions()[path]).toBeUndefined();
+  });
+
+  describe("managed gbrain 0.60: each transcript source is bound to its own checkout (#3097)", () => {
+    const managed = (extra: Record<string, string> = {}) => ({ FAKE_MANAGED: "1", ...extra });
+    function runWith(args: string[], extra: Record<string, string>) {
+      const r = spawnSync(process.execPath, [SCRIPT, "--sources", "transcript", ...args], { env: { ...env, ...extra }, cwd: home, encoding: "utf-8", timeout: 60_000 });
+      return { status: r.status, stdout: r.stdout || "", stderr: r.stderr || "" };
+    }
+    const git = (dir: string, ...args: string[]) => spawnSync("git", ["-C", dir, ...args], { env, encoding: "utf-8", timeout: 10_000 });
+    const pageFiles = (dir: string): string[] => readdirSync(dir, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith(".md")).map((e) => e.name).sort();
+    const alpha = transcriptSourceId("github.com/acme/alpha");
+    const checkout = () => transcriptCheckoutPath(alpha, join(gstackHome, "gbrain-transcript-sources"));
+    const seedBrain = (sources: Record<string, unknown>, pages: Record<string, unknown> = {}) =>
+      writeFileSync(brain.brainFile, JSON.stringify({ sources: { default: { federated: true }, ...sources }, pages }));
+
+    it("a fresh source is bound to a checkout under the state root, imports, and keeps one snapshot commit across runs", () => {
+      const first = session("alpha00000000001", repo("alpha"));
+      const r = runWith(["--bulk", "--quiet"], managed());
+      expect(r.status).toBe(0);
+      const add = calls().find((c) => c[0] === "sources" && c[1] === "add" && c[2] === alpha)!;
+      expect(add).toEqual(expect.arrayContaining(["--path", checkout(), "--no-federated"]));
+      expect(fakeBrain().sources[alpha].binding).toMatchObject({ owner_host_id: "host-local", local_path: checkout(), state: "active" });
+      expect(sessions()[first]).toMatchObject({ status: "ingested", source_id: alpha });
+      expect(pageFiles(checkout())).toHaveLength(1);
+      expect(git(checkout(), "rev-list", "--count", "HEAD").stdout.trim()).toBe("1");
+      expect(git(checkout(), "status", "--porcelain").stdout.trim()).toBe("");
+
+      // Second run: a new session lands, the source is not added again, and
+      // the checkout still holds exactly one commit with both pages.
+      session("alpha00000000002", join(home, "repos", "alpha"));
+      rmSync(brain.callLog);
+      expect(runWith(["--incremental", "--quiet"], managed()).status).toBe(0);
+      expect(calls().some((c) => c[0] === "sources" && c[1] === "add")).toBe(false);
+      expect(pageFiles(checkout())).toHaveLength(2);
+      expect(git(checkout(), "rev-list", "--count", "HEAD").stdout.trim()).toBe("1");
+      expect(git(checkout(), "ls-files").stdout.trim().split("\n").filter((f) => f.endsWith(".md"))).toHaveLength(2);
+      expect(git(checkout(), "reflog").stdout.trim()).toBe("");
+    });
+
+    it("an existing path-less source registered by an earlier run is migrated on the next run and its imports land", () => {
+      const path = session("alpha00000000001", repo("alpha"));
+      seedBrain({ [alpha]: { federated: false } });
+      writeFileSync(join(gstackHome, ".transcript-ingest-state.json"), JSON.stringify({
+        schema_version: 2, last_writer: "gstack-memory-ingest", sessions: {},
+        sources: { [alpha]: { repo: "github.com/acme/alpha", registered_at: "2026-10-01T00:00:00Z" } },
+      }));
+      const r = runWith(["--bulk", "--quiet"], managed());
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`bound gbrain source ${alpha} to ${checkout()}: it had no checkout`);
+      expect(fakeBrain().sources[alpha]).toMatchObject({ local_path: checkout(), binding: { owner_host_id: "host-local" } });
+      expect(sessions()[path]).toMatchObject({ status: "ingested", source_id: alpha });
+      expect(git(checkout(), "rev-list", "--count", "HEAD").stdout.trim()).toBe("1");
+    });
+
+    it("a migrated source whose pages predate the binding stays uncommitted until they re-import, then snapshots", () => {
+      const path = session("alpha00000000001", repo("alpha"));
+      // Imported before managed persistence: the page is in the brain, with no file.
+      expect(runWith(["--bulk", "--quiet"], {}).status).toBe(0);
+      expect(sessions()[path]).toMatchObject({ status: "ingested", source_id: alpha });
+      session("alpha00000000002", join(home, "repos", "alpha"));
+      const r = runWith(["--incremental", "--quiet"], managed());
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain("1 page(s) imported before the binding are re-imported on the next run");
+      expect(r.stderr).toContain(`left the checkout of ${alpha} uncommitted: gbrain holds 2 page(s) for it and 1 have a file`);
+      expect(git(checkout(), "rev-parse", "--verify", "-q", "HEAD").status).not.toBe(0);
+      expect(sessions()[path].status).toBe("refused");
+      expect(runWith(["--incremental", "--quiet"], managed()).status).toBe(0);
+      expect(sessions()[path]).toMatchObject({ status: "ingested", source_id: alpha });
+      expect(pageFiles(checkout())).toHaveLength(2);
+      expect(git(checkout(), "rev-list", "--count", "HEAD").stdout.trim()).toBe("1");
+    });
+
+    it("a resumed timeout checkpoint staged before the upgrade is admitted and migrated before it imports", () => {
+      const path = session("alpha00000000001", repo("alpha"));
+      const stage = join(gstackHome, `.staging-ingest-1-2-src-${alpha}`);
+      // Before the upgrade: a path-less source, and a stage left behind by an import that never landed.
+      runWith(["--bulk", "--quiet"], { FAKE_FAIL: "transcripts", FAKE_COPY_STAGE: stage });
+      expect(fakeBrain().sources[alpha].local_path).toBeUndefined();
+      expect(sessions()[path]).toBeUndefined();
+      expect(existsSync(stage)).toBe(true);
+      rmSync(brain.callLog);
+      const r = runWith(["--bulk", "--quiet"], managed({ GSTACK_INGEST_RESUME_DIR: stage }));
+      expect(r.status).toBe(0);
+      const log = calls();
+      const add = log.findIndex((c) => c[0] === "sources" && c[1] === "add" && c.includes("--path"));
+      const imp = log.findIndex((c) => c[0] === "import" && c[1] === stage);
+      expect(add).toBeGreaterThan(-1);
+      expect(imp).toBeGreaterThan(add);
+      expect(sessions()[path]).toMatchObject({ status: "ingested", source_id: alpha });
+      expect(existsSync(stage)).toBe(false);
+    });
+
+    it("a source held by another owner is left alone, with a message naming the owner and the commands", () => {
+      const path = session("alpha00000000001", repo("alpha"));
+      seedBrain({ [alpha]: { federated: false, binding: { owner_host_id: "host-other", local_path: "/srv/other/alpha", state: "active" } } });
+      const r = runWith(["--bulk", "--quiet"], managed());
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`gbrain source ${alpha} is held by another owner (host host-other, checkout (none on this host))`);
+      expect(r.stderr).toContain(`gbrain sources writer status --source ${alpha} --json`);
+      expect(r.stderr).toContain(`gbrain sources set-path ${alpha} ${checkout()}`);
+      expect(r.stderr).toContain("docs/troubleshooting.md#memory-ingest-transcript-checkout");
+      expect(calls().some((c) => c[0] === "sources" && c[1] === "add")).toBe(false);
+      expect(calls().some((c) => c[0] === "import")).toBe(false);
+      expect(fakeBrain().sources[alpha].binding.owner_host_id).toBe("host-other");
+      expect(sessions()[path]).toBeUndefined();
+      expect(existsSync(checkout())).toBe(false);
+    });
+
+    it("a source this host bound to a different directory is not taken over either", () => {
+      session("alpha00000000001", repo("alpha"));
+      const elsewhere = join(home, "elsewhere");
+      mkdirSync(elsewhere);
+      seedBrain({ [alpha]: { federated: false, local_path: elsewhere, binding: { owner_host_id: "host-local", local_path: elsewhere, state: "active" } } });
+      const r = runWith(["--bulk", "--quiet"], managed());
+      expect(r.stderr).toContain(`is held by another owner (this host, checkout ${elsewhere})`);
+      expect(calls().some((c) => c[0] === "import")).toBe(false);
+      expect(fakeBrain().sources[alpha].binding.local_path).toBe(elsewhere);
+    });
+
+    it("binding is refused under an ephemeral state root; an already-bound source still imports there", () => {
+      const path = session("alpha00000000001", repo("alpha"));
+      const r = runWith(["--bulk", "--quiet"], managed({ GSTACK_EPHEMERAL: "1" }));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain("this state root");
+      expect(r.stderr).toContain("is ephemeral (GSTACK_EPHEMERAL=1), so gstack does not bind one");
+      expect(r.stderr).toContain("GSTACK_STATE_ROOT=<durable directory> gstack-memory-ingest --bulk");
+      expect(calls().some((c) => c[0] === "sources" && c[1] === "add")).toBe(false);
+      expect(sessions()[path]).toBeUndefined();
+      // Bound on a durable run, then ingesting again on an ephemeral one.
+      expect(runWith(["--bulk", "--quiet"], managed()).status).toBe(0);
+      session("alpha00000000002", join(home, "repos", "alpha"));
+      expect(runWith(["--incremental", "--quiet"], managed({ GSTACK_EPHEMERAL: "1" })).status).toBe(0);
+      expect(pageFiles(checkout())).toHaveLength(2);
+    });
   });
 });

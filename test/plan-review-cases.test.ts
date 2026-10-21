@@ -138,8 +138,7 @@ describe('CI workflow clarity regressions', () => {
   test('CEO fallback names the current host mode and needs completed findings before the later report exists', () => {
     for (const host of ALL_HOST_CONFIGS) {
       const source = generateCodexPlanReview({ skillName: 'plan-ceo-review', host: host.name, paths: HOST_PATHS[host.name] } as TemplateContext);
-      const mode = host.name === 'codex' ? 'under_current_harness' : 'under_codex';
-      expect([...new Set(source.match(/under_codex|under_current_harness/g))]).toEqual([mode]);
+      expect([...new Set(source.match(/under_codex|under_current_harness/g))]).toEqual(['under_current_harness']);
       expect(source).toMatch(/SOURCE=in-host, OUTSIDE_STATUS=unavailable, and STATUS=clean or issues_found/);
       expect(source).not.toContain('Sections 1-10/11 and current report');
     }
@@ -196,7 +195,7 @@ describe('plan report persistence precedes completion logging', () => {
       expect(template.match(/\{\{PLAN_FILE_REVIEW_REPORT\}\}/g)).toHaveLength(1);
       const logPolicy = compactProse(template.slice(log, dashboard));
       if (skill === 'plan-eng-review') {
-        expectAll(compactProse(template), [/at Review Log, use \*\*Blocked outcome\*\* instead of publishing a saved review/i,
+        expectAll(compactProse(template), [/at Review Log, use \*\*Report-back outcome\*\* instead of publishing a saved review/i,
           /only a successful required log permits publication as a saved review/i]);
       } else if (skill === 'plan-ceo-review') {
         expectAll(logPolicy, [/successful write and Read-back/i, /failed plan\/report save or verification stops before this block/i,
@@ -320,7 +319,7 @@ test('Eng loads its one remedy procedure before Scope Challenge findings and ret
     const scope = compactProse(sections.slice(sections.indexOf('## Scope Challenge'), sections.indexOf('## Review Sections')));
     expectAll(scope, [/decision-brief format for this complexity gate/i,
       /ask each proposed feature cut\/deferral separately; wait before changing scope/i,
-      /unapproved fixes stay pending/i, /always ask the structure question when this gate trips/i,
+      /unapproved fixes stay pending/i, /always resolve the structure question when this gate trips/i,
       /offer confirmation of the original arrangement or a pause to investigate a smaller one\. wait for the answer/i,
       /apply only accepted scope changes/i, /"No issues found" for an empty list/i, /findings and scope answers approve no remedies/i]);
     const complexityRule = at(scope, /initial scope selectors need no grid or \*\*pre-answer\*\* ledger write/i);
@@ -562,14 +561,14 @@ describe('Eng approved-work decision gate', () => {
     const routes = Object.fromEntries(policy.split('\n').filter(line => line.startsWith('| '))
       .map(line => line.split('|').slice(1, -1).map(cell => cell.trim())).map(cells => [cells[0], cells[2]]));
     expect(routes["Working plan, ledger and complete review report"]).toContain('wait without completion telemetry');
-    expect(routes["Working plan, ledger and complete review report"]).toContain('then use **Blocked outcome**');
+    expect(routes["Working plan, ledger and complete review report"]).toContain('then **Report-back outcome**');
     for (const auxiliary of ['QA Test Plan and task JSONL', 'TODOS.md']) {
       expect(routes[auxiliary]).toContain('**not persisted**');
       expect(routes[auxiliary]).toContain('continue');
     }
     expect(routes['Required Review Log']).toContain('The final gate cannot pass without this log');
     expect(routes['Required Review Log']).toContain('Present its fields as **not persisted**');
-    expect(routes['Required Review Log']).toContain('at Review Log, use **Blocked outcome** instead of publishing a saved review');
+    expect(routes['Required Review Log']).toContain('at Review Log, use **Report-back outcome** instead of publishing a saved review');
     const log = template.split('## Review Log')[1]!.split('{{REVIEW_DASHBOARD}}')[0]!;
     expect(log).toMatch(/finish step 3, after successful Read-back/i);
     expect(log).not.toContain('PLAN MODE EXCEPTION — ALWAYS RUN');
@@ -583,10 +582,11 @@ describe('Eng approved-work decision gate', () => {
     expectAll(compactProse(closing), [/display the Review Readiness Dashboard, then present the saved Completion summary/i,
       /read-only EXIT PLAN MODE GATE in every host mode/i, /ExitPlanMode only in host plan mode/i,
       /\*\*Recovery routing → Late change or missing work\*\* before navigation resumes/i,
-      /only after both pass, run success telemetry/i, /requires \*\*Blocked outcome\*\*, not logging/i]);
+      /only after both pass, run success telemetry/i, /an unrecovered save requires \*\*Blocked outcome\*\*, not logging/i,
+      /forbidden persistence uses \*\*Report-back outcome\*\*/i]);
     const publication = compactProse(closing.slice(closing.indexOf('3. **Log the saved review.**'), closing.indexOf('5. **Choose navigation.**')));
-    expectAll(publication, [/if the required log is forbidden, show fields as not persisted and take \*\*Blocked outcome\*\*/i,
-      /neither supplies completion or saved-dashboard credit/i]);
+    expectAll(publication, [/if the required log is forbidden, show fields as not persisted and take \*\*Report-back outcome\*\*/i,
+      /failures use the write policy's recovery/i]);
     ordered(template, ['### TODOS.md updates', '{{PLAN_REVIEW_APPROVAL_CHECK}}', '## Required outputs',
       '{{PLAN_FILE_REVIEW_REPORT}}', '## Review Log', '{{REVIEW_DASHBOARD}}', '## Next Steps — Review Chaining',
       '## Learning hooks', '{{BRAIN_WRITE_BACK}}']);
@@ -646,7 +646,7 @@ describe('outside-voice commitment queue', () => {
     for (const host of ALL_HOST_CONFIGS) {
       const eng = generateCodexPlanReview({ host: host.name, paths: HOST_PATHS[host.name]!, skillName: 'plan-eng-review' } as TemplateContext);
       const provider = host.name === 'codex' ? 'Claude Code' : 'Codex';
-      const mismatch = host.name === 'codex' ? 'under_current_harness' : 'under_codex';
+      const mismatch = 'under_current_harness';
       // B1: the heading also admits `unverified`.
       expect(eng).toContain('**If `CODEX_MODE: ready`');
       expect(eng).toContain(`— run ${provider}:**`);
@@ -665,7 +665,7 @@ describe('outside-voice commitment queue', () => {
         expect(eng).not.toContain('codex exec');
       } else {
         expect(eng).toContain('codex exec');
-        expect(eng).toMatch(/then follow \*\*Native fallback\*\*/i);
+        expect(eng).toContain('_CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?');
       }
     }
   });

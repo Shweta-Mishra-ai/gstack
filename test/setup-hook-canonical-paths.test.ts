@@ -23,17 +23,100 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { spawnSync } from 'child_process';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const setupSrc = fs.readFileSync(path.join(ROOT, 'setup'), 'utf-8');
+const ROOT_HELPER = path.join(ROOT, 'bin', 'gstack-claude-root.sh');
+const rootHelperSrc = fs.readFileSync(ROOT_HELPER, 'utf-8');
+const memorableSrc = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-memorable'), 'utf-8');
 const hookBinSrc = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-settings-hook'), 'utf-8');
 const uninstallSrc = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-uninstall'), 'utf-8');
 
 describe('setup: canonical-only hook paths', () => {
   test('CANONICAL_GSTACK_ROOT honors CLAUDE_CONFIG_DIR with ~/.claude fallback', () => {
-    expect(setupSrc).toContain(
-      'CANONICAL_GSTACK_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gstack"',
-    );
+    expect(rootHelperSrc).toContain('"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gstack"');
+  });
+
+  test('setup and gstack-memorable take the root from the one sourced helper', () => {
+    for (const [src, sourceLine] of [
+      [setupSrc, '. "$SOURCE_GSTACK_DIR/bin/gstack-claude-root.sh" ||'],
+      [memorableSrc, '. "$(dirname "$0")/gstack-claude-root.sh" ||'],
+    ]) {
+      expect(src).toContain(sourceLine);
+      expect(src).toContain('CANONICAL_GSTACK_ROOT="$(gstack_canonical_claude_root)"');
+      expect(src).not.toContain('CANONICAL_GSTACK_ROOT="${CLAUDE_CONFIG_DIR');
+    }
+  });
+
+  describe('gstack_canonical_claude_root', () => {
+    function installAt(root: string) {
+      const bin = path.join(root, 'bin');
+      fs.mkdirSync(bin, { recursive: true });
+      fs.writeFileSync(path.join(bin, 'gstack-session-update'), '#!/bin/sh\n', { mode: 0o755 });
+    }
+
+    function resolve(home: string, configDir?: string): string {
+      const env: Record<string, string> = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home };
+      if (configDir !== undefined) env.CLAUDE_CONFIG_DIR = configDir;
+      const r = spawnSync('bash', ['-c', 'set -u; . "$1" && gstack_canonical_claude_root', '_', ROOT_HELPER.replace(/\\/g, '/')],
+        { env, encoding: 'utf-8', timeout: 10_000 });
+      expect(r.status).toBe(0);
+      return r.stdout.replace(/\n$/, '');
+    }
+
+    function withHome(fn: (home: string) => void) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-canon-'));
+      try {
+        installAt(path.join(home, '.claude', 'skills', 'gstack'));
+        fn(home);
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    }
+
+    test('no CLAUDE_CONFIG_DIR resolves to the $HOME install', () => {
+      withHome((home) => {
+        expect(resolve(home)).toBe(path.join(home, '.claude', 'skills', 'gstack'));
+      });
+    });
+
+    test('a per-session config dir linking back to the $HOME install resolves to the $HOME spelling', () => {
+      withHome((home) => {
+        const session = path.join(home, 'session-1234');
+        fs.mkdirSync(session);
+        fs.symlinkSync(path.join(home, '.claude', 'skills'), path.join(session, 'skills'));
+        expect(resolve(home, session)).toBe(path.join(home, '.claude', 'skills', 'gstack'));
+      });
+    });
+
+    test('a config dir with its own install keeps that install', () => {
+      withHome((home) => {
+        const other = path.join(home, 'other-config');
+        installAt(path.join(other, 'skills', 'gstack'));
+        expect(resolve(home, other)).toBe(path.join(other, 'skills', 'gstack'));
+      });
+    });
+
+    test('a config dir with no install falls back to the $HOME install', () => {
+      withHome((home) => {
+        const empty = path.join(home, 'empty-config');
+        fs.mkdirSync(empty);
+        expect(resolve(home, empty)).toBe(path.join(home, '.claude', 'skills', 'gstack'));
+      });
+    });
+
+    test('with no $HOME install the config-dir spelling stands, even when it is empty', () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-canon-'));
+      try {
+        const empty = path.join(home, 'empty-config');
+        fs.mkdirSync(empty);
+        expect(resolve(home, empty)).toBe(path.join(empty, 'skills', 'gstack'));
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
   });
 
   test('_hook_command_path body never references the running tree', () => {
@@ -127,8 +210,8 @@ describe('setup: heal-first ordering + visibility', () => {
 describe('gstack-settings-hook: shared prelude (dedupe key == prune predicate)', () => {
   test('every bun script call site uses the shared JS prelude concatenation', () => {
     const codeLines = hookBinSrc.split('\n').filter((l) => !l.trim().startsWith('#'));
-    const bunCalls = codeLines.filter((l) => l.includes('bun -e '));
-    const preludeCalls = codeLines.filter((l) => l.includes(`bun -e "$_HOOK_JS_PRELUDE"'`));
+    const bunCalls = codeLines.filter((l) => l.includes('bun --no-env-file --config=/dev/null -e '));
+    const preludeCalls = codeLines.filter((l) => l.includes(`bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'`));
     expect(bunCalls.length).toBeGreaterThanOrEqual(6);
     expect(preludeCalls.length).toBe(bunCalls.length);
   });

@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateReviewArmy } from '../scripts/resolvers/review-army';
 import { generateCrossReviewDedup, generateSharedCodeReuse, generateScopeDrift } from '../scripts/resolvers/review-scope';
@@ -7,7 +9,7 @@ import { generatePlanCompletionAuditReview, generatePlanCompletionAuditShip, gen
 import { generateQAReview } from '../scripts/resolvers/qa';
 import { generateConfidenceCalibration } from '../scripts/resolvers/confidence';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
-import { expectMentions } from './helpers/prompt-structure';
+import { between, compact, expectAbsent, expectMentions, expectOrdered, expectTokens } from './helpers/prompt-structure';
 
 const root = join(import.meta.dir, '..');
 const skill = readFileSync(join(root, 'review/SKILL.md.tmpl'), 'utf8');
@@ -148,7 +150,7 @@ test('caller QA runs charter and setup after resource loading and has a severity
 
 test('review prepares context and deduplicates before classifying findings', () => {
   const positions = [
-    '## Step 3.5: Slop scan', '## Step 3.6: Gather review context',
+    '## Step 3.5: Diff scans', '## Step 3.6: Gather review context',
     '{{LEARNINGS_SEARCH}}', '{{ASIDE_RESEARCH}}', '## Step 4: Critical pass',
     '## Step 5: Fix-First Review', '{{CROSS_REVIEW_DEDUP}}',
     '**Keep decisions through fix cycles:**', '### Step 5a: Classify each finding',
@@ -298,6 +300,9 @@ test('review finalization ownership: the plan audit retains its high-impact gate
   const flatAudit = audit.replace(/\s+/g, ' ');
   expectMentions(flatAudit, [['before', 'implementation', 'invocation']], 'flatAudit');
   expect(flatAudit).toMatch(/not this read-only audit/i);
+  // C2: a spawned or non-interactive review cannot answer the question; its default writes and drops nothing.
+  expect(flatAudit).toContain('Spawned or non-interactive: report REQUIREMENTS MISSING, continue; record nothing.');
+  expect(flatAudit.indexOf('Spawned or non-interactive: report')).toBeLessThan(flatAudit.indexOf('When continuing after the audit'));
 });
 
 test('review scope notes remain provisional until the plan section emits the only final scope check', () => {
@@ -356,6 +361,70 @@ for (const skillName of ['review', 'ship']) {
     host: 'claude', paths: HOST_PATHS.claude };
   const army = generateReviewArmy(ctx);
   const flat = army.replace(/\s+/g, ' ');
+
+  // PR gate run 38981523623 (ship-exploratory-plan-checks): the block sourced the scope signals
+  // without printing them, so the agent appended its own echo to see SCOPE_FRONTEND.
+  test(`${skillName} clarity: the scope block prints every signal specialist selection reads`, () => {
+    const block = between(army, '### Detect stack and scope', '### Read specialist hit rates');
+    expect(block).toContain("/gstack-diff-scope <base> 2>/dev/null) || true\nset | grep '^SCOPE_'\n");
+    const selection = between(army, '### Select specialists', '### Adaptive gating');
+    const used = [...new Set(selection.match(/SCOPE_[A-Z_]+/g))];
+    expect(used.length).toBeGreaterThan(0);
+    const flags = between(readFileSync(join(root, 'bin/gstack-diff-scope'), 'utf8'), '_print_flags() {', '}');
+    for (const signal of used) {
+      if (flags.includes(`echo "${signal}=`)) continue;
+      // PR gate run 39002269281: a signal gstack-diff-scope does not print comes from a detect helper the scope
+      // block itself runs, never from a command named only in selection prose.
+      const helper = /bin\/(gstack-[a-z-]+) detect\b/.exec(block.split('\n').find(line => line.includes(signal))!)?.[1];
+      expect(helper, signal).toBeDefined();
+      expect(readFileSync(join(root, 'bin', helper!), 'utf8'), signal).toContain(`${signal}=\${`);
+      expect(selection, signal).not.toMatch(/\bdetect\b/);
+    }
+  });
+
+  test(`${skillName} clarity: the state-machine signal checks the detector's exit status and fails toward dispatch`, () => {
+    const block = between(army, '### Detect stack and scope', '### Read specialist hit rates');
+    expect(block).toContain(`_SM=$(${HOST_PATHS.claude.binDir}/gstack-state-matrix detect --base <base>) || _SM=SCOPE_STATE_MACHINE=unknown; source <(echo "$_SM")\n`);
+    expect(block.indexOf('SCOPE_STATE_MACHINE=unknown')).toBeLessThan(block.indexOf("set | grep '^SCOPE_'"));
+    const selection = between(army, '### Select specialists', '### Adaptive gating').replace(/\s+/g, ' ');
+    expect(selection).toContain('9. **State Machines** — if SCOPE_STATE_MACHINE is true or unknown: read');
+    // /review delta on 51f1e02: a fixed .gstack/tmp/state-machines.md let a second review check the previous run's
+    // output (Write refuses an unread existing file) and commit it; each run now checks the new file outfile prints.
+    expect(selection).toContain('/gstack-state-matrix outfile`, Read the file it prints, write the full output there, then run `');
+    expect(selection).toContain('/gstack-state-matrix check <file>` on it.');
+    expect(selection).not.toContain('.gstack/tmp/state-machines.md');
+    expect(selection).not.toContain('<<');
+    expect(selection).not.toContain('pipe output');
+  });
+
+  test(`${skillName} clarity: the scope block run against a failing detector prints unknown and keeps its stderr`, () => {
+    const stubs = mkdtempSync(join(realpathSync(tmpdir()), 'scope-block-'));
+    try {
+      const block = /\`\`\`bash\n([\s\S]*?)\n\`\`\`/.exec(between(generateReviewArmy({ ...ctx, paths: { ...ctx.paths, binDir: stubs } }),
+        '### Detect stack and scope', '### Read specialist hit rates'))![1].replaceAll('<base>', 'main');
+      writeFileSync(join(stubs, 'gstack-diff-scope'), '#!/bin/sh\necho SCOPE_FRONTEND=false\n', { mode: 0o755 });
+      const run = (detector: string) => {
+        writeFileSync(join(stubs, 'gstack-state-matrix'), `#!/bin/sh\n${detector}\n`, { mode: 0o755 });
+        return spawnSync('bash', ['-c', block], { cwd: stubs, encoding: 'utf8', timeout: 10_000 });
+      };
+      const failed = run("echo SCOPE_STATE_MACHINE=false; echo '# no merge base with origin/main; run: git fetch origin main'; echo 'detector crashed' >&2; exit 2");
+      expect(failed.stdout).toMatch(/^SCOPE_STATE_MACHINE=unknown$/m);
+      expect(failed.stdout).not.toMatch(/^SCOPE_STATE_MACHINE=false$/m);
+      expect(failed.stderr).toContain('detector crashed');
+      expect(run('exit 127').stdout).toMatch(/^SCOPE_STATE_MACHINE=unknown$/m);
+      const silent = run("echo 'detector found no git' >&2; exit 3");
+      expect(silent.stdout).toMatch(/^SCOPE_STATE_MACHINE=unknown$/m);
+      expect(silent.stderr).toContain('detector found no git');
+      const lateFail = run("echo SCOPE_STATE_MACHINE=true; echo SCOPE_LEAK=1; exit 1");
+      expect(lateFail.stdout).toMatch(/^SCOPE_STATE_MACHINE=unknown$/m);
+      expect(lateFail.stdout).not.toContain('SCOPE_LEAK');
+      const detected = run("echo SCOPE_STATE_MACHINE=true; echo '# state-machine: src/takes.ts:4 proposal,accept'");
+      expect(detected.stdout).toMatch(/^SCOPE_STATE_MACHINE=true$/m);
+      expect(detected.stdout).toMatch(/^SCOPE_FRONTEND=false$/m);
+      expect(run('echo SCOPE_STATE_MACHINE=false').stdout).toMatch(/^SCOPE_STATE_MACHINE=false$/m);
+      expect(block).toContain("DIFF_LINES=$(git diff \"$DIFF_BASE\" --numstat | awk '{n+=$1+$2} END {print n+0}')");
+    } finally { rmSync(stubs, { recursive: true, force: true }); }
+  });
 
   test(`${skillName} clarity: terminal failure permits independent work but never certifies coverage`, () => {
     expectMentions(flat, [['confirm', 'finished', 'stopped']], 'flat');
@@ -462,4 +531,94 @@ test('ship and review count unverified or unavailable outside reviews as missing
   for (const rel of ['ship/SKILL.md', 'ship/sections/pr-body.md', 'review/SKILL.md']) {
     expect(read(rel)).toMatch(/`unverified` or `unavailable` is (listed as )?missing coverage[^.]*never (as )?(a )?pass/i);
   }
+});
+
+test('testing specialist treats negative assertions as decisions and catches ones a rename emptied', () => {
+  const specialist = between(readFileSync(join(root, 'review/specialists/testing.md'), 'utf8'), '### Negative Assertions', '\n### ');
+  expectTokens(specialist, ['not.toContain', 'assertNotIn'], 'testing specialist');
+  expectMentions(compact(specialist), [
+    ['new', 'absent', 'removal', 'not coverage'],
+    ['authorizes', 'removal'],
+    ['rename', 'negative assertion', 'passes forever'],
+    ['grep', 'negative assertions', 'old value'],
+  ], 'testing specialist');
+});
+
+test('security specialist checks authorization paths a route-guard read misses', () => {
+  const auth = compact(between(readFileSync(join(root, 'review/specialists/security.md'), 'utf8'), '### Auth & Authorization Bypass', '\n### '));
+  expectMentions(auth, [
+    ['error', 'renderer', 'outside', 'guard'],
+    ['ownership', 'role', 'downgrade'],
+    ['list', 'detail', 'download', 'separately'],
+    ['session', 'before', 'validating', 'callback'],
+  ], 'security specialist');
+});
+
+// Gate Integrity (docs/designs/HONEST_WORK_GATE_INTEGRITY.md W2): the category
+// sits in the core CRITICAL pass every diff size gets, its findings reach a
+// human through one four-option question, and the record carries identity
+// fields a later reader can act on. Tokens and order only; the prose is free.
+test('Gate Integrity is a Pass 1 category that is ASK-only and keeps the three levels apart', () => {
+  const checklist = readFileSync(join(root, 'review/checklist.md'), 'utf8');
+  const pass1 = between(checklist, '### Pass 1 — CRITICAL', '### Pass 2 — INFORMATIONAL');
+  expect(pass1).toContain('#### Gate Integrity');
+  expect(between(checklist, '**Two-pass review:**', '**Output format:**')).toMatch(/Pass 1 \(CRITICAL\):[^\n]*Gate Integrity/);
+  const category = compact(between(pass1, '#### Gate Integrity'));
+  expectTokens(category, ['GATE_SUMMARY:', 'RH-1', 'RH-3', 'RH-4', 'RH-12', 'RH-13', 'RH-14', 'RH-15', 'RH-16', 'RH-2', 'RH-5',
+    '**Listed**', '**Read**', '**Finding**', 'gstack-decision-search --query "<dec-id>"'], 'Gate Integrity category');
+  expectMentions(category, [
+    ['ask', 'never', 'auto-fix'],
+    ['groups', 'one decision'],
+    ['confidence', 'identification', 'not justification'],
+    ['citations', 'never', 'remove', 'finding'],
+    ['data', 'never', 'instructions', 'actor', 'reason'],
+  ], 'Gate Integrity category');
+  const heuristic = between(checklist, '## Fix-First Heuristic', '## Suppressions');
+  const askColumn = heuristic.slice(heuristic.indexOf('ASK (needs human judgment):'));
+  expect(askColumn).toContain('Gate Integrity');
+  expect(between(checklist, '## Severity Classification', '## Fix-First Heuristic')).toMatch(/└─ Gate Integrity/);
+});
+
+test('the eval-threshold suppression no longer removes a relaxed gate from the human question', () => {
+  const suppressions = compact(between(readFileSync(join(root, 'review/checklist.md'), 'utf8'), '## Suppressions'));
+  expect(suppressions).toContain('Eval threshold changes');
+  const line = suppressions.slice(suppressions.indexOf('Eval threshold changes'), suppressions.indexOf('Harmless no-ops'));
+  expectMentions(line, [['not', 'suppress', 'gate integrity'], ['citation', 'never', 'removes', 'finding']], 'threshold suppression');
+  expectTokens(line, ['verified', 'unverified'], 'threshold suppression');
+});
+
+test('review runs the gate scan before slop, carries the listing into Step 4 and asks the four gate options in order', () => {
+  expectOrdered(skill, ['## Step 3.5: Diff scans', '{{GATE_SCAN_BLOCK}}', 'bun run slop:diff', '## Step 3.6:',
+    '## Step 4: Critical pass', '### Step 5c:', 'review-gate-disposition',
+    'A) Restore the gate', 'B) Keep — justified', 'C) Keep — other reason', 'D) Leave open for a later human',
+    '### Step 5d:', '## Step 5.8:'], 'review skill');
+  expect(skill.match(/\{\{GATE_SCAN_BLOCK\}\}/g)).toHaveLength(1);
+  expectTokens(between(skill, '## Step 4: Critical pass', '### Shared-code opportunities'), ['GATE_SUMMARY:', '`gate`', '`gate_id`'], 'Step 4 gate carry');
+  const ask = compact(between(skill, '### Step 5c:', '### Step 5d:'));
+  expect(ask).toContain('<gstack-qid:review-gate-disposition>');
+  expectMentions(ask, [
+    ['spawned', 'headless', 'd', 'recommended'],
+    ['auto-chosen', 'never', 'disposition'],
+  ], 'Step 5c gate question');
+  for (const action of ['`restored`', '`kept`', '`open`']) expect(ask).toContain(action);
+});
+
+test('review persists gate identity fields, counts open findings and reports one Gate edits line', () => {
+  const record = compact(between(skill, '### 2. Fill the record', '### Report the final review'));
+  expectTokens(record, ['`gate`', '`gate_id`', '`reason`', '`kept`', '`restored`', '`open`', '`actor`', 'gstack-session-kind'], 'review record');
+  expectMentions(record, [
+    ['never', 'hunk text'],
+    ['`open`', 'count', '`issues_found`'],
+    ['logger', 'stamps', '`actor`'],
+  ], 'review record');
+  const report = compact(between(skill, '### Report the final review', '{{LEARNINGS_LOG}}'));
+  expectOrdered(report, ['`Gate edits: none detected (', '`Gate edits: N listed, M read, K findings —', '`Gate edits: partial (', '`Gate edits: UNAVAILABLE —'], 'final report');
+  expectMentions(report, [['unavailable', 'never', 'none detected']], 'final report');
+});
+
+test('review suppressions allow a clean result and skip common false positives but never suppress missing validation or a missing await', () => {
+  const suppressions = between(readFileSync(join(root, 'review/checklist.md'), 'utf8'), '## Suppressions');
+  expectMentions(compact(suppressions), [['zero findings', 'valid']], 'suppressions');
+  expectTokens(suppressions, ['"Function too long"', '"Possible null dereference"', '"N+1 query"', '"Hardcoded value"', '`Math.random()`'], 'suppressions');
+  expectAbsent(suppressions, [/missing input validation/i, /missing await/i], 'suppressions');
 });

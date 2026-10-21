@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Generate agents-digest/gstack-AGENTS.md — the instruction-only tier.
  *

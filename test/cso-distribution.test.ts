@@ -388,7 +388,7 @@ describe('CSO runtime staging gates', () => {
     expect(gate['continue-on-error']).not.toBe(true);
     const required = workflow.jobs['free-tests'];
     expect(required.if).toBe('always()');
-    expect(required.needs).toEqual(['free-suite', 'typecheck', 'cso-macos-launcher', 'macos-named-regressions', 'cso-windows-launcher', 'cso-docker-integration']);
+    expect(required.needs).toEqual(['free-suite', 'typecheck', 'quick-bun-default', 'cso-macos-launcher', 'macos-named-regressions', 'cso-windows-launcher', 'cso-docker-integration']);
     expect(required.steps[0].run).toContain('test "$CSO_DOCKER_RESULT" = success');
     for (const current of Object.values(workflow.jobs) as any[]) for (const step of current.steps) {
       if (step.uses?.startsWith('oven-sh/setup-bun')) expect(step.uses).toBe('oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6');

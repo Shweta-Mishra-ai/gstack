@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * PreToolUse hook for AskUserQuestion (Claude Code, plan-tune cathedral T6).
  *

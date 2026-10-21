@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import committedCatalog from '../lib/cso/runtime-catalog.json';
 import buildInputs from '../lib/cso/images/build-inputs.json';
 import { isEvaluationRuntimeCatalog, validateRuntimeCatalog } from '../lib/cso/runtime-catalog';
@@ -168,6 +172,22 @@ describe('CSO evaluation-only runtime catalogs', () => {
     expect(JSON.stringify(candidate)).not.toMatch(/Passed/);
     expect(validateEvaluationCandidate(candidate, buildInputs)).toBe(candidate);
     expect(() => validateEvaluationCandidate(committedCatalog, buildInputs)).toThrow('NOT_AN_EVALUATION_CATALOG');
+  });
+  test('evaluation-candidate --created-at writes identical catalog bytes on every platform build', () => {
+    const staged = mkdtempSync(join(tmpdir(), 'cso-staged-'));
+    try {
+      stagedRecords().forEach((record, index) => { mkdirSync(join(staged, `row-${index}`)); writeFileSync(join(staged, `row-${index}`, 'staged-image.json'), JSON.stringify(record)); });
+      const build = (name: string, ...extra: string[]) => {
+        const output = join(staged, name);
+        const result = spawnSync('bun', ['scripts/cso-runtime-promotion.ts', 'evaluation-candidate', '--staged-root', staged, '--output', output, ...extra], { cwd: join(import.meta.dir, '..'), encoding: 'utf8', timeout: 30_000 });
+        expect(result.status).toBe(0);
+        return readFileSync(output, 'utf8');
+      };
+      const [amd64, arm64] = ['amd64.json', 'arm64.json'].map(name => build(name, '--created-at', '2026-10-11T07:05:00.000Z'));
+      expect(arm64).toBe(amd64);
+      expect(JSON.parse(amd64).runtimes.every((runtime: { qualifiedAt: string }) => runtime.qualifiedAt === '2026-10-11T07:05:00.000Z')).toBe(true);
+      expect(JSON.parse(build('now.json')).runtimes[0].qualifiedAt).not.toBe('2026-10-11T07:05:00.000Z');
+    } finally { rmSync(staged, { recursive: true, force: true }); }
   });
   test('staging records must come from one run and match the reviewed build rows', () => {
     const split = stagedRecords(); split[1].workflow = 'https://github.com/garrytan/gstack/actions/runs/999';

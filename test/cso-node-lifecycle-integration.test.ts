@@ -191,11 +191,12 @@ suite('CSO Node producer-visible repair lifecycle fixture', () => {
       const submittedFinding = submitted.findings[0];
       expect(submittedFinding).toMatchObject({ reproduction: 'not_attempted', repair: 'not_attempted', closure: 'open' });
       const plan = await cli.command<any>(['runtime-plan', original.runId, 'node', '--port', '34569']);
+      expect(plan.runtimeProfile).toBe(cli.runtime.id);
       const vulnerable = fs.readFileSync(path.join(originalRunDirectory, 'snapshot', 'policy.js'), 'utf8');
       const repaired = "module.exports={status:403,body:'DENIED'};\n";
       const request: VerificationRequest = {
         findingId: submittedFinding.id,
-        runtimeProfile: cli.runtime.id,
+        runtimeProfile: plan.runtimeProfile,
         port: 34569,
         start: plan.start.command,
         legitimate: [{ name: 'legitimate control', path: '/control', method: 'GET', expected: { status: 200, includes: 'CONTROL_OK' } }],

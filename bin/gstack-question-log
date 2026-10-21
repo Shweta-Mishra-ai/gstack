@@ -46,7 +46,7 @@ INPUT="$1"
 TMPERR=$(mktemp "${TMPDIR:-/tmp}/gstack-question-log.XXXXXX") || { echo "gstack-question-log: could not create a temp file in ${TMPDIR:-/tmp}, so the question was not logged. Fix: point TMPDIR at a writable directory." >&2; exit 1; }
 trap 'rm -f "$TMPERR"' EXIT
 set +e
-VALIDATED=$(printf '%s' "$INPUT" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun -e "
+VALIDATED=$(printf '%s' "$INPUT" | GSTACK_LIB_DIR="$SCRIPT_DIR/../lib" bun --no-env-file --config=/dev/null -e "
 const { hasInjection } = await import(process.env.GSTACK_LIB_DIR + '/jsonl-store.ts');
 const path = require('path');
 const raw = await Bun.stdin.text();
@@ -218,7 +218,7 @@ LOG_FILE="$GSTACK_HOME/projects/$SLUG/question-log.jsonl"
 # Lookup is bounded so the bin stays cheap on hot paths.
 DEDUP_SKIP=""
 if [ -f "$LOG_FILE" ]; then
-  DEDUP_SKIP=$(VALIDATED_JSON="$VALIDATED" LOG_FILE_PATH="$LOG_FILE" bun -e '
+  DEDUP_SKIP=$(VALIDATED_JSON="$VALIDATED" LOG_FILE_PATH="$LOG_FILE" bun --no-env-file --config=/dev/null -e '
     const fs = require("fs");
     const j = JSON.parse(process.env.VALIDATED_JSON);
     if (!j.tool_use_id) { console.log(""); process.exit(0); }
@@ -238,7 +238,7 @@ if [ -f "$LOG_FILE" ]; then
 fi
 
 if [ "$DEDUP_SKIP" = "dup" ]; then
-  echo "DEDUP: skipped (source=$(echo "$VALIDATED" | bun -e 'const j=JSON.parse(await Bun.stdin.text()); console.log(j.source);'), tool_use_id duplicate)"
+  echo "DEDUP: skipped (source=$(echo "$VALIDATED" | bun --no-env-file --config=/dev/null -e 'const j=JSON.parse(await Bun.stdin.text()); console.log(j.source);'), tool_use_id duplicate)"
   exit 0
 fi
 

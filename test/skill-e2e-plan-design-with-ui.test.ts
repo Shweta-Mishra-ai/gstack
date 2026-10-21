@@ -24,16 +24,29 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const FIXTURE = path.join(ROOT, 'test', 'fixtures', 'plans', 'ui-heavy-feature.md');
 
 const designFocusBoundary = (fp: AskUserQuestionFingerprint): boolean =>
-  fp.nativeCall?.answered === true && !fp.nativeCall.failed && fp.nativeCall.questions.some(({ question }) => {
+  fp.nativeCall?.answered === true && !fp.nativeCall.failed && fp.nativeCall.questions.some(({ question, options }) => {
     const text = question.trim().replace(/^D\d+(?:\.\d+)?\s*[—–:-]\s*/i, '');
     // A target menu can mention a design system without reviewing this plan.
     // The source Step 0D question, or a native title (first line) that offers all
     // seven design dimensions/passes versus a focus, in any order or wording. The
-    // count may be a numeral or a word; the title must name design.
+    // count may be a numeral or a word; the title must name design, unless the
+    // body carries the step's own design-completeness rating (run 39199692993).
     const title = text.split(/\r?\n/, 1)[0]!;
-    return /^I(?:['’]ve| have) rated this plan (?:10(?:\.0+)?|[0-9](?:\.\d+)?)\/10 on design completeness\.[\s\S]*\bWant me to focus on specific areas instead of all (?:7|seven)\?/i.test(text)
+    // Step 0A's rating is a sentence that scores design completeness out of 10,
+    // however it is worded ("rated this plan 4/10 for design completeness", run
+    // 39363705692; "This plan is a 3/10 on design completeness", the 0A example).
+    const rated = (body: string) => body.split(/(?<=[.!?])\s+|\r?\n/).some(sentence =>
+      /\bdesign completeness\b/i.test(sentence) && /(?<![\d./])(?:10(?:\.0+)?|[0-9](?:\.\d+)?)\/10(?!\d|\.\d)/.test(sentence));
+    // Runs 39298269902 a1/a2: a title that only names the focus ("Review focus.",
+    // on one line before Project/branch/task:), with the step's own rating in the
+    // body and an option that offers all seven dimensions against a narrower one.
+    // The option leads with all seven, whatever it calls them ("All 7 areas", run 39363705692).
+    const lead = text.split(/\r?\n|\s+(?=Project\/branch\/task:)/, 1)[0]!;
+    return /^I(?:['’]ve| have) rated this plan (?:10(?:\.0+)?|[0-9](?:\.\d+)?)\/10 on design completeness\.[\s\S]*\bWant me to focus on specific areas instead(?: of all (?:7|seven))?\?/i.test(text)
       || (/\ball (?:7|seven) (?:design )?(?:dimensions|passes)\b/i.test(title) && /\bfocus\b/i.test(title)
-        && /\bdesign\b/i.test(title) && /\?\s*$/.test(title));
+        && (/\bdesign\b/i.test(title) || rated(text.slice(title.length))) && /\?\s*$/.test(title))
+      || (/\bfocus\b/i.test(lead) && rated(text) && options.length >= 2
+        && options.some(({ label }) => /^\s*all (?:7|seven)\s+[a-z]/i.test(label)));
   });
 
 // Require a choice about the supplied UI, not a workflow offer after focus.
@@ -47,7 +60,7 @@ const issueLabeled = (options: Array<{ label: string }>): boolean => {
     && new Set(labels.map(match => match![1])).size === 1
     && new Set(labels.map(match => match![2])).size === labels.length;
 };
-const uiChoice = /\b(?:layout|compos(?:e|ed|ition)|anchor|regions?|panels?|notifications?|activity|quick actions?|loading|skeletons?|empty|errors?|success|modals?|toasts?|buttons?|links?|copy|typography|fonts?|spacing|contrast|colors?|breakpoints?|responsive|keyboard|focus (?:order|trap|management)|aria|a11y|accessibility)\b/i;
+const uiChoice = /\b(?:hierarch(?:y|ies)|see first|layout|compos(?:e|ed|ition)|anchor|regions?|panels?|notifications?|activity|quick actions?|loading|skeletons?|empty|errors?|success|modals?|toasts?|buttons?|links?|copy|typography|fonts?|spacing|contrast|colors?|breakpoints?|responsive|keyboard|focus (?:order|trap|management)|aria|a11y|accessibility)\b/i;
 const designReviewFinding = (fp: AskUserQuestionFingerprint): boolean =>
   fp.nativeCall?.answered === true && !fp.nativeCall.failed && !designFocusBoundary(fp) && fp.nativeCall.questions.some(({ question, options }) => {
     const title = question.split(/\r?\n/, 1)[0]!.trim().replace(/^D\d+(?:\.\d+)?\s*[—–:-]\s*/i, '');

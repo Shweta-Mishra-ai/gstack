@@ -53,6 +53,10 @@ DX TREND (prior reviews):
   ...
 ```
 
+Error Messages, API/CLI/SDK and Overall DX are scored under the `dx_rubric` the row records.
+When a prior row's `dx_rubric` is absent or differs from `agent-ready-v1`, print
+"rubric changed, not comparable" for those three dimensions instead of a score or trend.
+
 ### Pass 1: Getting Started Experience (Zero Friction)
 
 Rate 0-10: Can a developer go from zero to hello world in under 5 minutes?
@@ -101,33 +105,44 @@ Evaluate:
 - **Reliability/trust**: Latency, retries, rate limits, idempotency, offline behavior?
 - **Progressive disclosure**: Simple case is production-ready, complexity revealed gradually?
 - **Persona fit**: Does the interface match how [persona] thinks about the problem?
+- **Agent ergonomics** (observational, recorded with evidence, not separately scored): non-interactive by default, structured output, layered `--help`.
 
 Good API design test: Can a [persona] use this API correctly after seeing one example?
 
 **STOP.** Run the Decision gate; ask only for a new or justified reopened decision. Recommend + WHY.
 
-### Pass 3: Error Messages & Debugging (Fight Uncertainty)
+### Pass 3: Error Messages & Debugging (agent-ready)
 
-Rate 0-10: When something goes wrong, does the developer know what happened, why,
-and how to fix it?
+Rate 0-10: When something goes wrong, can the reader, often an AI agent running unattended,
+tell what happened, recover safely, and debug it without reading the source?
 
 **Evidence recall:** Reference any error-related friction points from 0F and confusion
-points from 0G.
+points from 0G. Pass 3 always evaluates the agent reader as a second lens beside the
+persona from 0A.
 
-Load reference: Read the "## Pass 3" section from `~/.claude/skills/gstack/plan-devex-review/dx-hall-of-fame.md`.
+Load reference: Read the "## Pass 3" section from `~/.claude/skills/gstack/plan-devex-review/dx-hall-of-fame.md`
+before scoring: the full contract, calibration examples and the standards mapping.
 
-**Trace 3 specific error paths** from the plan or codebase. For each, evaluate against
-the three-tier system from the Hall of Fame:
-- **Tier 1 (Elm):** Conversational, first person, exact location, suggested fix
-- **Tier 2 (Rust):** Error code links to tutorial, primary + secondary labels, help section
-- **Tier 3 (Stripe API):** Structured JSON with type, code, message, param, doc_url
+{{DX_ERROR_COMPACT}}
 
-For each error path, show what the developer currently sees vs. what they should see.
+The "## Pass 3" Hall of Fame section loaded above holds the full contract: the item table,
+the per-surface channel rules and the evidence states.
 
-Also evaluate:
-- **Permission/sandbox/safety model**: What can go wrong? How clear is the blast radius?
-- **Debug mode**: Verbose output available?
-- **Stack traces**: Useful or internal framework noise?
+**Trace 3 specific error paths plus one unexpected-failure path** (crash, dependency failure)
+from the plan or codebase. When the plan names no unexpected-failure handling, record that
+absence as the trace gap. Output one matrix, prose only for failures:
+
+```
+ERROR PATH MATRIX (agent-ready-v1)
+Path                  | Class      | what | fix | recovery | code | context | trace | redaction | channel | Cap
+[path]                | usage      | pass | fail| N/A      | pass | N/A     | N/A   | pass      | pass    | CAP6:fix
+```
+
+For each capped path, show what an agent sees today and the corrected error line. Also note
+the permission and safety model (what can go wrong, how clear the blast radius is) and whether
+a verbose or debug mode exists.
+
+**DX TRIAGE:** report the cap-triggering gaps only, and always every CAP4 finding.
 
 **STOP.** Run the Decision gate; ask only for a new or justified reopened decision. Recommend + WHY.
 
@@ -312,6 +327,11 @@ Options: **A)** Add to TODOS.md **B)** Skip **C)** Build it now
 
 ### DX Scorecard
 
+In the plan file, write it as its own `## DX Review Scorecard` section
+(the scorecard, its verdict lines and the Unresolved Decisions below) above the terminal
+`## GSTACK REVIEW REPORT`, replacing this review's earlier one. Never write it inside
+the report: the next plan review deletes and regenerates everything under that heading.
+
 ```
 +====================================================================+
 |              DX PLAN REVIEW — SCORECARD                             |
@@ -341,6 +361,7 @@ Options: **A)** Add to TODOS.md **B)** Skip **C)** Build it now
 | Opinionated + Escape Hatches | [covered/gap]                       |
 | Code in Context    | [covered/gap]                                  |
 | Magical Moments    | [covered/gap]                                  |
+| Agents Are Users   | [covered/gap]                                  |
 +====================================================================+
 ```
 
@@ -357,7 +378,7 @@ DX IMPLEMENTATION CHECKLIST
 [ ] Installation is one command
 [ ] First run produces meaningful output
 [ ] Magical moment delivered via [vehicle from 0D]
-[ ] Every error message has: problem + cause + fix + docs link
+[ ] Every error message meets the agent-ready error contract (Pass 3)
 [ ] API/CLI naming is guessable without docs
 [ ] Every parameter has a sensible default
 [ ] Docs have copy-paste examples that actually work
@@ -387,7 +408,7 @@ above. On failure, report the error and stop; do not log completion or an accept
 metadata to `~/.gstack/`; the following dashboard reads the saved result.
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-devex-review","timestamp":"TIMESTAMP","status":"STATUS","initial_score":N,"overall_score":N,"product_type":"PRODUCT_TYPE","tthw_current":"TTHW_CURRENT","tthw_target":"TTHW_TARGET","mode":"MODE","persona":"PERSONA","competitive_tier":"COMPETITIVE_TIER","unresolved":N,"commit":"COMMIT"}'
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-devex-review","timestamp":"TIMESTAMP","status":"STATUS","initial_score":N,"overall_score":N,"product_type":"PRODUCT_TYPE","tthw_current":"TTHW_CURRENT","tthw_target":"TTHW_TARGET","mode":"MODE","persona":"PERSONA","competitive_tier":"COMPETITIVE_TIER","unresolved":N,"dx_rubric":"agent-ready-v1","dimension_scores":{"getting_started":N,"api_cli_sdk":N,"error_messages":N,"documentation":N,"upgrade_path":N,"dev_environment":N,"community":N,"dx_measurement":N},"commit":"COMMIT"}'
 ```
 
 TIMESTAMP = current ISO 8601 datetime; STATUS = "clean" if score 8+ AND 0 unresolved, else "issues_open"; other fields from the DX Scorecard + Step 0; COMMIT = `git rev-parse --short HEAD`.

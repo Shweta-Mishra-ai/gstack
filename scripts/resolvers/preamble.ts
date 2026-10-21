@@ -82,7 +82,7 @@ export function generatePreamble(ctx: TemplateContext): string {
     // _BRANCH / _TEL env vars are live) and before all onboarding gates so
     // models read the authoritative "AskUserQuestion satisfies plan mode's
     // end-of-turn" rule before any other instruction. Renders for all skills
-    // (not interactive-gated); the text applies universally.
+    // (not interactive-gated) on hosts whose capabilities declare planMode.
     generatePlanModeInfo(ctx),
     generateUpgradeCheck(ctx),
     // Phase 2: the 8 one-time onboarding generators (lake-intro, telemetry-

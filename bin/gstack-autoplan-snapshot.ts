@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Autoplan's blind reviewer inputs contain only the current implementation plan. */
 import { createHash } from 'node:crypto';
 import { linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -20,17 +20,20 @@ function dxTermsFor(content: string) {
   return { threshold: 2, matches, matchCount, dxRequiredByTerms: matchCount >= 2 };
 }
 
-/** Byte-bound scope evidence; semantic product/user triggers can only enable DX. */
+/** Byte-bound scope evidence; semantic product/user triggers can only enable DX. UI evidence (lib/autoplan-scope.ts) loads only here, so every other command still runs from a lone copy of this file. */
 export function detectDxScope(activePlan: string, developerTool = false, agentPrimary = false) {
   const source = realpathSync(activePlan);
   const content = extractImplementationPlan(readFileSync(source, 'utf8'));
   const terms = dxTermsFor(content);
   return { activePlan: source, sha256: sha256(content), ...terms, developerTool, agentPrimary,
-    dxRequired: terms.dxRequiredByTerms || developerTool || agentPrimary };
+    dxRequired: terms.dxRequiredByTerms || developerTool || agentPrimary, ...(require('../lib/autoplan-scope') as typeof import('../lib/autoplan-scope')).detectUiScope(content) };
 }
 
 // The native dispatch payload is assembled from the same immutable bytes as
 // the outside reviewer input. Keep full role criteria here, not a hand summary.
+// dx criterion 3 is DX_ERROR_COMPACT from lib/dx-error-contract.ts, copied as a
+// literal because this file runs alone in installed copies;
+// test/dx-error-contract.test.ts keeps them identical.
 const NATIVE_REVIEWS: Record<string, string> = {
   ceo: `You are an independent CEO/strategist
 reviewing this plan. You have NOT seen any prior review. Evaluate:
@@ -52,7 +55,7 @@ For each finding: what's wrong, severity (critical/high/medium), and the fix.`,
 reviewing this plan. You have NOT seen any prior review. Evaluate:
 1. Getting started: how many steps from zero to hello world? What's the TTHW?
 2. API/CLI ergonomics: naming consistency, sensible defaults, progressive disclosure?
-3. Error handling: does every error path specify problem + cause + fix + docs link?
+3. Error handling: Score every error path against the agent-ready error contract (https://github.com/garrytan/gstack/blob/main/docs/agent-ready-errors.md): what (operation and actual values), fix (a safe, authorized command or edit on the first or last line, or the precise thing a human must provide), recovery (retry, fix and retry, do X first, or ask a human; side effects none/partial/complete/unknown, reconcile before retrying an unknown outcome, a retry bound), code (stable, with a doc anchor), context (versions, config, env var names, the underlying cause; caller-safe only for remote services), trace (unexpected failures only: a compact trace or its file path locally, a correlation id remotely), redaction (no secret values anywhere), channel (the surface's native failure signal: non-zero exit and stderr for a CLI, status plus RFC 9457 body for an API, a typed error for an SDK, isError for an MCP tool). Usage and validation errors rejected before any work need only what, fix, code, redaction and channel; items apply per surface, N/A needs a reason, an item the plan never specifies for a path it introduces is a gap, and unknown is reserved for existing behavior you could not inspect. Report a leaked secret, a failure signalled as success, an unsafe fix, or a block on a terminal (a hang, or a no-terminal failure that names no non-interactive alternative such as --yes) as a Critical finding titled "CAP4:<path>:<item>" (caps the Error Messages score at 4/10); report a missing applicable fix, recovery, context or trace as a High finding titled "CAP6:<path>:<item>" (caps it at 6/10).
 4. Documentation: copy-paste examples? Information architecture? Interactive elements?
 5. Escape hatches: can developers override every opinionated default?
 For each finding: what's wrong, severity (critical/high/medium), and the fix.`,
@@ -66,7 +69,8 @@ reviewing this plan. You have NOT seen any prior review. Evaluate:
 For each finding: what's wrong, severity, and the fix.`
 };
 
-function implementationBounds(plan: string) {
+/** The section headings outside code fences, in order (the runner's PLAN_SECTIONS_INVALID diagnosis reads these). */
+export function sectionHeadings(plan: string) {
   const boundaries: Array<{ name: string; start: number; end: number }> = [];
   let offset = 0;
   let fence: { char: string; length: number } | null = null;
@@ -86,6 +90,11 @@ function implementationBounds(plan: string) {
     }
     offset += raw.length;
   }
+  return boundaries;
+}
+
+function implementationBounds(plan: string) {
+  const boundaries = sectionHeadings(plan);
   if (boundaries.length !== 2 || boundaries[0]!.name !== 'Implementation plan' || boundaries[1]!.name !== 'Review record') {
     throw new Error('Expected one Implementation plan section followed by one Review record section outside Markdown code/quotes');
   }
@@ -149,7 +158,7 @@ export function acceptedBlocks(text: string): Map<string, AcceptedBlock> {
 
 // Marker lines belong to the author's retention record, not blind review data.
 // Keep every requirement-body byte, including line endings and literal examples.
-function implementationForReview(source: string): string {
+export function implementationForReview(source: string): string {
   let result = ''; let offset = 0;
   for (const block of acceptedBlocks(source).values()) {
     if (block.none) throw new Error('No-change record does not belong in Implementation plan');
@@ -367,17 +376,28 @@ export function amendImplementation(phase: string, activePlan: string, snapshotP
   return checkPhaseImplementation(phase, source, snapshotPath, extractImplementationPlan(next) === prior ? 'unchanged' : 'changed');
 }
 
+/**
+ * The canonical spelling of an init destination: the deepest existing ancestor is
+ * realpathed (so /tmp -> /private/tmp on macOS) and any missing segments plus the
+ * basename are re-joined. Pure path computation; the regular-file check stays in
+ * initializePlan. Init reports this spelling, so callers comparing against the
+ * argv they passed must canonicalize the argv the same way.
+ */
+export function canonicalDestination(file: string): string {
+  let parent = dirname(file);
+  const missing: string[] = [];
+  while (!lstatSync(parent, { throwIfNoEntry: false })) {
+    missing.unshift(basename(parent)); parent = dirname(parent);
+  }
+  return join(realpathSync(parent), ...missing, basename(file));
+}
+
 /** Initialize the existing strict section contract before any scope or review call. */
 export function initializePlan(sourcePlan: string, activePlan: string, restorePath: string) {
   if (![sourcePlan, activePlan, restorePath].every(isAbsolute)) throw new Error('Initialization requires three absolute paths');
   const source = realpathSync(sourcePlan);
   const destination = (file: string) => {
-    let parent = dirname(file);
-    const missing: string[] = [];
-    while (!lstatSync(parent, { throwIfNoEntry: false })) {
-      missing.unshift(basename(parent)); parent = dirname(parent);
-    }
-    const canonical = join(realpathSync(parent), ...missing, basename(file));
+    const canonical = canonicalDestination(file);
     const state = lstatSync(canonical, { throwIfNoEntry: false, bigint: true });
     if (state && !state.isFile()) throw new Error('Initialization destinations must be regular files, not links or directories');
     return { file: canonical, state, bytes: state ? readFileSync(canonical) : undefined };
@@ -400,7 +420,9 @@ export function initializePlan(sourcePlan: string, activePlan: string, restorePa
     if (!text.trim() || !Buffer.from(text).equals(original)) throw new Error('Initialization source must be nonempty UTF-8 text');
     let plan = text;
     try { extractImplementationPlan(plan); }
-    catch {
+    catch (error) {
+      // Only a plan with no section headings is wrapped; a present-but-wrong or empty section reports its own error.
+      if (sectionHeadings(text).length) throw error;
       plan = `## Implementation plan\n${text}${text.endsWith('\n') ? '' : '\n'}## Review record\n`;
       // Partial/duplicate boundaries and unclosed fences remain errors, not raw-plan fallbacks.
       extractImplementationPlan(plan);

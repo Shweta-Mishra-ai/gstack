@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-render — render a local HTML file through a browser: Aside when it
  * is running, otherwise gstack's own headless browser (the browse daemon).

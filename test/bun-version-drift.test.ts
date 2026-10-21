@@ -10,9 +10,16 @@
  * parsing — a lane on a different Bun is testing a different product.
  *
  * Bumping Bun: change every surface in one commit; this test names each one.
+ *
+ * E1: bin/gstack-bun-version.sh is the one source setup and the auto-updater
+ * read. Its tested version is the CI pin, engines.bun's lower bound, setup's
+ * install hint and README's requirement; its floor (1.3.3) is the security
+ * boundary below which the no-autoload compile flags are silently ignored.
  */
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 const ROOT = path.resolve(__dirname, '..');
@@ -21,7 +28,12 @@ const WORKFLOWS_DIR = path.join(ROOT, '.github', 'workflows');
 interface Pin {
   surface: string;
   version: string;
+  /** The workflow job the pin sits in (empty outside a workflow). */
+  job?: string;
 }
+
+/** The one job that runs on GSTACK_BUN_DEFAULT instead of the minimum (plan A-g). */
+const DEFAULT_BUN_JOB = 'quick-bun-default';
 
 function collectPins(): Pin[] {
   const pins: Pin[] = [];
@@ -30,7 +42,9 @@ function collectPins(): Pin[] {
     if (!/\.ya?ml$/.test(name)) continue;
     const source = fs.readFileSync(path.join(WORKFLOWS_DIR, name), 'utf-8');
     const lines = source.split('\n');
+    let job = '';
     for (let i = 0; i < lines.length; i++) {
+      job = lines[i].match(/^ {2}([A-Za-z0-9_-]+):\s*$/)?.[1] ?? job;
       if (!/uses:\s*oven-sh\/setup-bun@/.test(lines[i])) continue;
       // A pinned stanza is `with:` + `bun-version: <v>` within the next few
       // lines; an unpinned setup-bun is itself drift (installs latest).
@@ -39,6 +53,7 @@ function collectPins(): Pin[] {
       pins.push({
         surface: `${name}:${i + 1}`,
         version: m ? m[1] : '<unpinned setup-bun — installs latest>',
+        job,
       });
     }
   }
@@ -62,8 +77,8 @@ function collectPins(): Pin[] {
 }
 
 describe('bun version pins', () => {
-  test('every CI surface pins the same bun version', () => {
-    const pins = collectPins();
+  test('every CI surface pins the same bun version (the install-default job aside)', () => {
+    const pins = collectPins().filter(p => p.job !== DEFAULT_BUN_JOB);
     // Sanity: the scan found the known surfaces (a regex rot that finds
     // nothing must fail loudly, not vacuously pass).
     expect(pins.length).toBeGreaterThanOrEqual(6);
@@ -87,4 +102,118 @@ describe('bun version pins', () => {
       ).toBe(true);
     }
   });
+});
+
+function bunVersionsFile(): { floor: string; tested: string; installDefault: string; verified: string[] } {
+  const src = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-bun-version.sh'), 'utf-8');
+  return {
+    floor: src.match(/^GSTACK_BUN_FLOOR="([^"]+)"$/m)?.[1] ?? '<no GSTACK_BUN_FLOOR>',
+    tested: src.match(/^GSTACK_BUN_TESTED="([^"]+)"$/m)?.[1] ?? '<no GSTACK_BUN_TESTED>',
+    installDefault: src.match(/^GSTACK_BUN_DEFAULT="([^"]+)"$/m)?.[1] ?? '<no GSTACK_BUN_DEFAULT>',
+    verified: (src.match(/^GSTACK_BUN_VERIFIED="([^"]+)"$/m)?.[1] ?? '').split(/\s+/).filter(Boolean),
+  };
+}
+
+// Plan A2/A-g: the Capy install default is separate from the floor. It must be
+// a verified archive at or above the minimum, and exactly one CI job (the
+// quick free tier) runs on it so the default Bun is never untested.
+describe('install default Bun (A2, A-g)', () => {
+  const { tested, installDefault, verified } = bunVersionsFile();
+  test('GSTACK_BUN_DEFAULT is a verified archive and not below the supported minimum', () => {
+    expect(verified).toContain(installDefault);
+    expect(verified).toContain(tested);
+    expect(Bun.semver.order(installDefault, tested)).toBeGreaterThanOrEqual(0);
+  });
+  test('one CI job runs the quick free tier on GSTACK_BUN_DEFAULT, and the free-tests aggregate requires it', () => {
+    const onDefault = collectPins().filter(p => p.job === DEFAULT_BUN_JOB);
+    expect(onDefault.map(p => p.version)).toEqual([installDefault]);
+    const workflow = Bun.YAML.parse(fs.readFileSync(path.join(WORKFLOWS_DIR, 'free-tests.yml'), 'utf-8')) as { jobs: Record<string, { needs?: string[]; steps: { run?: string }[] }> };
+    expect(workflow.jobs[DEFAULT_BUN_JOB].steps.some(step => step.run?.includes('bun run test:quick'))).toBe(true);
+    expect(workflow.jobs['free-tests'].needs).toContain(DEFAULT_BUN_JOB);
+  });
+});
+
+describe('Bun requirement surfaces agree (E1)', () => {
+  const { floor, tested } = bunVersionsFile();
+
+  test('tested version == every CI pin (the install-default job aside) == engines.bun lower bound; floor sits below it', () => {
+    const ciVersions = [...new Set(collectPins().filter((p) => p.job !== DEFAULT_BUN_JOB).map((p) => p.version))];
+    expect(ciVersions).toEqual([tested]);
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf-8'));
+    expect(pkg.engines?.bun).toBe(`>=${tested}`);
+    expect(floor).toBe('1.3.3');
+    expect(Bun.semver.order(floor, tested)).toBe(-1);
+  });
+
+  test('README states the tested version and the floor', () => {
+    const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf-8');
+    expect(readme).toContain(`[Bun](https://bun.sh/) v${tested}+`);
+    expect(readme).toContain(`refuses Bun older than ${floor}`);
+  });
+
+  test.skipIf(process.platform === 'win32')('setup install hint pins the tested version', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-hint-'));
+    try {
+      const nobun = path.join(base, 'bin');
+      fs.mkdirSync(nobun);
+      for (const tool of ['dirname', 'cat', 'uname', 'mkdir']) {
+        const found = spawnSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf-8', timeout: 10_000 }).stdout.trim();
+        if (found) fs.symlinkSync(found, path.join(nobun, tool));
+      }
+      const r = spawnSync('/bin/bash', [path.join(ROOT, 'setup')], {
+        encoding: 'utf-8', env: { PATH: nobun, HOME: base }, timeout: 30_000,
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('bun is required but not installed');
+      expect(r.stderr).toContain(`BUN_VERSION="${tested}"`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test('the Capy installer\'s linux-x64 archive checksum is the one Dockerfile.ci verifies', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-bun-version.sh'), 'utf-8');
+    const dockerfile = fs.readFileSync(path.join(ROOT, '.github', 'docker', 'Dockerfile.ci'), 'utf-8');
+    const shSha = src.match(/^\s*linux-x64\) echo ([0-9a-f]{64}) ;;$/m)?.[1];
+    const dockerSha = dockerfile.match(/bun_target=linux-x64; bun_sha256=([0-9a-f]{64})/)?.[1];
+    expect(shSha, 'gstack_bun_archive_sha256 linux-x64').toBeDefined();
+    expect(shSha).toBe(dockerSha);
+    const r = spawnSync('bash', ['-c', `. "${path.join(ROOT, 'bin', 'gstack-bun-version.sh')}" && gstack_bun_archive_sha256 linux-x64 && gstack_bun_archive_sha256 linux-x64-baseline && gstack_bun_archive_sha256 linux-aarch64 && ! gstack_bun_archive_sha256 darwin-arm64`], { encoding: 'utf-8', timeout: 10_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout.trim().split('\n')).toHaveLength(3);
+  });
+
+  test('BROWSE SETUP install hint pins the tested version', () => {
+    const resolver = fs.readFileSync(path.join(ROOT, 'scripts', 'resolvers', 'browse.ts'), 'utf-8');
+    expect([...resolver.matchAll(/BUN_VERSION="([0-9][^"]*)"/g)].map((m) => m[1])).toEqual([tested]);
+  });
+
+  // Compiled probe of the security floor: a binary built with the four
+  // no-autoload flags must not read a .env beside it. Run by hand against
+  // released binaries on 2026-10-04: Bun 1.3.2 accepted the flags and still
+  // loaded .env; 1.3.3 and 1.4.0 did not. This keeps the probe honest on the
+  // Bun under test (the CI pin); the control build proves the probe can see a leak.
+  test.skipIf(process.platform === 'win32')('compiled probe: the no-autoload flags hold on the Bun under test', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-probe-'));
+    try {
+      fs.writeFileSync(path.join(base, 'probe.ts'), 'console.log(process.env.GSTACK_BUN_PROBE ?? "absent");\n');
+      const run = path.join(base, 'run');
+      fs.mkdirSync(run);
+      fs.writeFileSync(path.join(run, '.env'), 'GSTACK_BUN_PROBE=leaked\n');
+      const build = (out: string, flags: string[]) => {
+        const r = spawnSync(process.execPath, ['build', '--compile', ...flags, 'probe.ts', '--outfile', out], {
+          cwd: base, encoding: 'utf-8', timeout: 120_000,
+        });
+        expect(r.status, r.stderr).toBe(0);
+        return spawnSync(path.join(base, out), [], { cwd: run, encoding: 'utf-8', timeout: 30_000 }).stdout.trim();
+      };
+      expect(build('control', [])).toBe('leaked');
+      expect(build('guarded', [
+        '--no-compile-autoload-dotenv', '--no-compile-autoload-bunfig',
+        '--no-compile-autoload-tsconfig', '--no-compile-autoload-package-json',
+      ])).toBe('absent');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 240_000);
 });

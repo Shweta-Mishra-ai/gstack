@@ -29,9 +29,10 @@ const DISCOVERY: Record<string, string> = {
   opencode: '.config/opencode/skills',
   cursor: '.cursor/skills',
   copilot: '.copilot/skills',
+  agy: '.gemini/antigravity-cli/skills',
 };
-/** Every directory any host (or a shared agents layout) reads. */
-const ALL_DISCOVERY_DIRS = [...Object.values(DISCOVERY), '.agents/skills', '.copilot/skills', '.hermes/skills'];
+/** Every directory any host (or a shared agents layout) reads; .gemini/skills is Gemini CLI's. */
+const ALL_DISCOVERY_DIRS = [...Object.values(DISCOVERY), '.agents/skills', '.copilot/skills', '.hermes/skills', '.gemini/skills'];
 
 const installable = ALL_HOST_CONFIGS.filter(c => c.tier !== 'instruction-only').map(c => c.name);
 const instructionOnly = ALL_HOST_CONFIGS.filter(c => c.tier === 'instruction-only').map(c => c.name);
@@ -128,6 +129,7 @@ describe.skipIf(process.platform === 'win32')('host conformance kit', () => {
       const rows = registryRows(f);
       expect(rows.map(row => [row[0], row[1], row[3], row[5], row[6]])).toEqual([[host, 'global', dest, realpathSync(src), readFileSync(join(src, 'VERSION'), 'utf8').trim()]]);
       expect(r.stdout + r.stderr).toMatch(new RegExp(`Install summary:[\\s\\S]*\\b${host}\\s+\\S+\\s+global\\s+installed`));
+      expect(r.stdout.trim().split('\n').at(-1)).toBe(`gstack ready (${host})`);
 
       const status = runSetup(f, join(src, 'setup'), ['--status']);
       expect(status.status).toBe(0);
@@ -203,7 +205,9 @@ describe.skipIf(process.platform === 'win32')('host conformance kit', () => {
     const qa = join(src, '.agents/skills/gstack-qa/sections');
     rmSync(join(qa, readdirSync(qa).find(n => n.endsWith('.md'))!));
     const status = runSetup(f, join(src, 'setup'), ['--status']);
-    expect(status.status).toBe(0);
+    // A1: broken section links make --status exit 1 instead of always 0.
+    expect(status.status).toBe(1);
+    expect(status.stderr).toContain('broken section links');
     expect(status.stdout).toMatch(/codex global: router is a symlink, which Codex skips\. Fix: cd \S+ && \.\/setup --host codex; section links: [1-9]\d* of \d+ broken \(first: [^)]*\)\. Fix: cd /);
   }, 60_000);
 
@@ -228,6 +232,7 @@ describe.skipIf(process.platform === 'win32')('host conformance kit', () => {
     expect(upgrade.status, upgrade.stdout + upgrade.stderr).toBe(0);
     expect(upgrade.stdout).toContain(`Refreshing registered gstack installs from source: ${realpathSync(src)}`);
     expect(upgrade.stdout).toMatch(/Upgrade summary:\n[\s\S]*claude\s+full\s+global\s+unchanged\s+1\.91\.14\.0[\s\S]*codex\s+experimental\s+global\s+installed\s+1\.91\.14\.0/);
+    expect(upgrade.stdout.trim().split('\n').at(-1)).toBe('gstack ready (claude, codex)');
     expect(registryRows(f).map(r => [r[0], r[6]]).sort()).toEqual([['claude', '1.91.14.0'], ['codex', '1.91.14.0']]);
     // The refreshed Codex install runs the new checkout's render.
     expect(realpathSync(join(f.home, '.codex/skills/gstack-review/SKILL.md'))).toBe(join(realpathSync(src), '.agents/skills/gstack-review/SKILL.md'));

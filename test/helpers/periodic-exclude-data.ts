@@ -42,7 +42,8 @@ export const CASE_CI_EXCLUDE: Record<string, { reason: string; tracking: string 
 
 /**
  * Paid-eval verdict policy, pre-registered (v1 approved 2026-09-29; v2
- * approved 2026-10-04, D1 of docs/test-audit-2026-10.md). Frozen before the
+ * approved 2026-10-04, D1 of docs/test-audit-2026-10.md; v3 approved
+ * 2026-10-06, the judge median gate). Frozen before the
  * census: any change after seeing census results needs Garry's re-approval
  * and a fresh census, and bumps `version` (every trial record carries it as
  * policy_version; readers score only their own version, so pass-rate history
@@ -51,7 +52,11 @@ export const CASE_CI_EXCLUDE: Record<string, { reason: string; tracking: string 
  *                 fixtures, its skills' prompt files) + HARNESS_VERSION
  *                 (scripts/harness-version.json), keyed with model and CLI
  *                 version; weekly history = scheduled main runs plus main
- *                 dispatches; only v2 trials count toward quarantine entry.
+ *                 dispatches; only current-version trials count toward
+ *                 quarantine entry.
+ *   v3          - the judge gate changes from the panel mean to the
+ *                 per-dimension median of 3 samples; v2's identity and
+ *                 history rules are unchanged, and v2 trials stop scoring.
  *   panel       - behavior cases and quarantined cases run n independent
  *                 trials; a behavior panel PASSES at >= k passing trials with
  *                 no contract violation. Rule and judge cases run one trial.
@@ -59,18 +64,27 @@ export const CASE_CI_EXCLUDE: Record<string, { reason: string; tracking: string 
  *                 new-policy trials; exit at >= `exit.rate` over >=
  *                 `exit.minTrials`; at most `capFraction` of each tier's
  *                 blocking cases; an entry expires after `expiryWeeklyRuns`.
- *   judge       - a judge case draws `samples` independent samples of one
- *                 prompt concurrently; numeric dimensions gate on the panel
- *                 mean against the unchanged threshold, booleans on a strict
- *                 majority; an erroring sample fails the panel, never resampled.
+ *   judge       - a judge case draws exactly `samples` (3) independent samples
+ *                 of one prompt concurrently; a numeric dimension passes when
+ *                 its median (at least 2 of 3 samples) meets the unchanged
+ *                 threshold, and the mean is reported only; booleans gate on a
+ *                 strict majority; any other sample count or an erroring sample
+ *                 fails the panel, never resampled.
  *   drift       - one-sided Fisher exact alarm between input-identity series
  *                 (Holm-controlled across the cases tested in one report).
  *   infraRedispatch - a census whose every red verdict is machine-classified
  *                 INFRA or INCOMPLETE may be re-dispatched this many times as
  *                 a new run; both runs are reported.
+ *   flaky rerun - (CREW rule 16, Garry 2026-10-19: "you can just run the
+ *                 failed test again and note that it is flaky") the gate reruns
+ *                 a red case verdict once at the same head with the same trials
+ *                 and threshold; a pass is a flaky-annotated PASS, a second
+ *                 failure is red. Trial records and this version are unchanged;
+ *                 a rerun's trials stay in its own artifacts and flake record
+ *                 (scripts/lib/paid-rerun.ts, docs/TESTING_INTERNALS.md#flaky-reruns).
  */
 export const EVAL_POLICY = {
-  version: 2,
+  version: 3,
   panel: { n: 3, k: 2 },
   quarantine: {
     entry: { rate: 0.95, minTrials: 10 },

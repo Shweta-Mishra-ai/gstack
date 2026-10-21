@@ -150,11 +150,19 @@ already isolated to this fixture. Do not change them.`;
     }
     if (tool === 'AskUserQuestion') {
       const owner = read(boundary).match(/gstack-freeze-v1:([a-f0-9]{32})/)?.[1];
-      const questions = input.questions as Array<{ question: string; options: Array<{ label: string }> }>;
+      const questions = input.questions as Array<{ question: string; options: Array<{ label: string; description?: string }> }>;
       const question = questions?.[0];
+      const options = Array.isArray(question?.options) ? question.options : [];
+      // The declared question is identified by its two options' meanings, not its wording.
+      const proceed = options.filter(option => /\b(continue|proceed)\b/i.test(option.label));
+      const stop = options.filter(option => /\b(abort|stop|cancel)\b/i.test(option.label));
+      const means = (option: { description?: string } | undefined, contrary: RegExp) =>
+        Boolean(option) && (typeof option!.description !== 'string' || !contrary.test(option!.description));
+      const declared = options.length === 2 && proceed.length === 1 && stop.length === 1 && proceed[0] !== stop[0]
+        && means(proceed[0], /\b(abort|stop|cancel|no edits?|without edit\w*)\b/i) && means(stop[0], /\b(continue|proceed)\b/i);
       const abort = id === 'investigate-owned-abort';
-      const choice = question?.options?.find(option => (abort ? /\b(abort|stop|cancel)\b/i : /\b(continue|proceed)\b/i).test(option.label));
-      if (!owner || questions?.length !== 1 || !choice || !/continue|proceed|abort/i.test(question.question)) {
+      const choice = abort ? stop[0] : proceed[0];
+      if (!owner || questions?.length !== 1 || !declared || !choice) {
         interactions.push({ tool, disposition: 'unsupported-question', input, owner });
         return { behavior: 'deny', message: 'Ask only whether to continue or abort, after scope acquisition.' };
       }
@@ -167,6 +175,10 @@ already isolated to this fixture. Do not change them.`;
     changedProtectedFiles: [...protectedFiles].filter(([file, bytes]) => read(file) !== bytes).map(([file]) => path.relative(root, file)) });
   return { id, root, repo, env, prompt, source, receipts, boundary, installed, physicalSource, canUseTool, preToolUse, snapshot };
 }
+
+/** One sentence naming the verifier and its failure ("the verifier couldn't run", "is unavailable", "isn't verified"). */
+export const acknowledgesEndingError = (finalText: string): boolean => finalText.split(/(?<=[.!?])\s+|\n/).some(sentence =>
+  /\bverif\w*/i.test(sentence) && /\b(?:error\w*|unavailable|cannot|can['’]t|could(?: not|n['’]t)|unable|wasn['’]t able|not (?:be )?verified|isn['’]t verified|failed)\b/i.test(sentence));
 
 export function boundaryFailures(fixture: ReturnType<typeof createBoundaryFixture>, result: Pick<AgentSdkResult, 'exitReason' | 'events' | 'assistantTurns'>) {
   const evidence = fixture.snapshot();
@@ -206,7 +218,7 @@ export function boundaryFailures(fixture: ReturnType<typeof createBoundaryFixtur
     if (fixture.id === 'investigate-owned-ending-error') {
       // The fixture's ending error says to stop without retrying the verifier.
       check(statuses.length === 1 && statuses[0] === '69', 'ending verifier error was not delivered once without retry');
-      check(/error|unavailable|cannot|could not|unable/i.test(finalText), 'ending error not acknowledged');
+      check(acknowledgesEndingError(finalText), 'ending error not acknowledged');
     } else check(statuses.at(-1) === '0', 'final verification did not succeed');
   }
   return failures;

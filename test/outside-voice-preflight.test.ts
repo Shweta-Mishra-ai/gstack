@@ -29,6 +29,12 @@ test('adversarial outside failures retain the required native pass without dupli
       expect(output).not.toContain("Use the caller's fallback");
       expectMentions(output, [['only', 'non-blocking', 'adversarial']], 'output');
       expect(output).toContain('GATE: MISSING COVERAGE');
+      // C2: the gate names what missing coverage does instead of an unnamed "existing user decision flow".
+      if (output.includes('Only a completed response with severity tags')) {
+        expect(output).toContain('→ GATE: MISSING COVERAGE; no fix question.');
+        expect(outsideVoiceInvocation(ctx)).toContain('missing coverage is never clean/PASS');
+        expect(output).not.toContain('preserve the existing user decision flow');
+      }
       expect(outsideVoiceInvocation(ctx)).toContain("Use the caller's fallback; missing coverage is never clean/PASS.");
       const disabled = outsideVoicePreflight(ctx, { disabledBehavior: 'skip-all' });
       expect(disabled).toMatch(/(?:do NOT fall back|Disabled ends this entire extra review step)/);
@@ -36,17 +42,17 @@ test('adversarial outside failures retain the required native pass without dupli
   }
 });
 
-test('ship design availability is an existing automatic choice, not a new opt-in', () => {
+test('ship design-lite honors codex_reviews like every other opt-in caller (#3102)', () => {
   for (const host of ALL_HOST_CONFIGS) {
     const ctx: TemplateContext = { host: host.name, skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', paths: HOST_PATHS[host.name] };
     const output = outsideVoicePreflight(ctx, { disabledBehavior: 'opt-in' });
-    expect(output).toContain('No additional opt-in is needed');
-    expect(output).toContain('`CODEX_MODE` reports provider availability, not user consent');
+    expect(output).not.toContain('No additional opt-in is needed');
+    expect(output).not.toContain('_OUTSIDE_CFG=enabled');
+    expect(output).toContain('get --stored codex_reviews');
+    expect(output).toContain("`CODEX_MODE: disabled` or a send's `consent_missing` line: `codex_reviews` is off or unreadable; do not ask; record `outside_status: disabled`.");
     const other = outsideVoicePreflight({ ...ctx, skillName: 'review' }, { disabledBehavior: 'opt-in' });
-    expect(other).not.toContain('No additional opt-in is needed');
-    expect(other).toContain('_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.');
-    expect(output.match(/```bash\n([\s\S]*?)\n```/)![1]).toBe(other.match(/```bash\n([\s\S]*?)\n```/)![1].replace(
-      '_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.', '_OUTSIDE_CFG=enabled'));
+    expect(other).not.toContain('_OUTSIDE_CFG=enabled');
+    expect(output.match(/```bash\n([\s\S]*?)\n```/)![1]).toBe(other.match(/```bash\n([\s\S]*?)\n```/)![1]);
   }
 });
 
@@ -108,7 +114,7 @@ describe('own-harness review fallback instructions', () => {
       test(`${host.name}: ${name} fallback names only the mode its preflight emits`, () => {
         const ctx: TemplateContext = { host: host.name, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl', paths: HOST_PATHS[host.name] };
         const text = render(ctx);
-        const mode = host.name === 'codex' ? 'under_current_harness' : 'under_codex';
+        const mode = name === 'plan' || host.name === 'codex' ? 'under_current_harness' : 'under_codex';
         const preflight = text.match(/```bash\n([\s\S]*?)\n```/)![1];
         expect(preflight).toContain(mode);
         expect([...new Set(text.match(/under_codex|under_current_harness/g))]).toEqual([mode]);
@@ -139,7 +145,7 @@ function fixture() {
   if (git.status !== 0) throw new Error(git.stderr);
   const capture = path.join(dir, 'capture.json');
   const fake = path.join(dir, 'fake-claude.ts');
-  fs.writeFileSync(fake, `const prompt=await Bun.stdin.text(); await Bun.write(process.env.FIXTURE_CAPTURE!,JSON.stringify({prompt,args:process.argv.slice(2)})); console.log(JSON.stringify({result:'Recommendation: ship because the isolated fixture completed its review.'}));`);
+  fs.writeFileSync(fake, `const prompt=await Bun.stdin.text(); await Bun.write(process.env.FIXTURE_CAPTURE!,JSON.stringify({prompt,args:process.argv.slice(2)})); console.log(JSON.stringify({result:'No issues found.\\nRecommendation: ship because the isolated fixture completed its review.'}));`);
   const env = { ...process.env, HOME: home, CODEX_HOME: '', GSTACK_HOME: path.join(home, '.gstack'),
     GSTACK_ROOT: '', GSTACK_BIN: '', GSTACK_ACTIVE_HOST: 'codex', CODEX_THREAD_ID: 'fixture', CODEX_SANDBOX: '', CLAUDECODE: '',
     GSTACK_CLAUDE_BIN: process.execPath, GSTACK_CLAUDE_BIN_ARGS: JSON.stringify([fake]), FIXTURE_CAPTURE: capture };
@@ -233,4 +239,32 @@ describe('outside reviewer runtime discovery in fresh shells', () => {
     expect(JSON.parse(fs.readFileSync(f.capture, 'utf8')).prompt).toBe(fs.readFileSync(prompt, 'utf8'));
     expect(fs.existsSync(path.join(f.repo, 'NEVER'))).toBe(false);
   });
+});
+
+// Value: protects=the adversarial DIFF_SIZE sums insertions+deletions across files and ignores binary rows;
+//   fails_when=the numstat/awk sum reads the wrong field or a binary "-" row breaks it; why_new=no test ran the
+//   size block; seam=none; no_claim=the size thresholds that consume DIFF_SIZE
+test('adversarial DIFF_SIZE counts changed lines from numstat', () => {
+  const ctx: TemplateContext = { host: 'claude', skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', paths: HOST_PATHS.claude };
+  const fence = generateAdversarialStep(ctx).match(/```bash\n(DIFF_BASE=[\s\S]*?)\n```/);
+  expect(fence).not.toBeNull();
+  const repo = fs.mkdtempSync(path.join(TEMP, 'diff-size-'));
+  const git = (...args: string[]) => {
+    const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: repo, encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(0);
+  };
+  git('init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'one\ntwo\n');
+  git('add', '-A');
+  git('commit', '-qm', 'base');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  git('checkout', '-q', '-b', 'feature');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'one\nTWO\n');            // 1 insertion + 1 deletion
+  fs.writeFileSync(path.join(repo, 'b.txt'), 'x\ny\nz\n');              // 3 insertions
+  fs.writeFileSync(path.join(repo, 'c.bin'), Buffer.from([0, 1, 2, 0])); // binary: "-\t-" in numstat
+  git('add', '-A');
+  git('commit', '-qm', 'change');
+  const r = spawnSync('bash', ['-c', fence![1].replaceAll('<base>', 'main')], { cwd: repo, encoding: 'utf8', timeout: 30_000 });
+  expect(r.stderr).toBe('');
+  expect(r.stdout.trim()).toBe('DIFF_SIZE: 5');
 });

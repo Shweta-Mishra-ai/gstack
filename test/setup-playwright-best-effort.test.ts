@@ -106,13 +106,15 @@ describe('setup: Chromium bootstrap static invariants', () => {
 
 /**
  * Integration harness: the real block + the real deadline helpers, with the
- * probe and installer stubbed. `bunx` is a shell function, so the block's
- * subshell inherits the stub. Emits REASON=... and REACHED_END=1 so the test
- * can prove setup continued past the block.
+ * probe and installer stubbed. The installer runs through setup's `bun_cmd`,
+ * a shell function, so the block's subshell inherits the stub. Emits
+ * REASON=... and REACHED_END=1 so the test can prove setup continued past
+ * the block.
  */
 function runBlock(opts: {
   probe: 'ok' | 'fail' | 'fail-then-ok';  // fail-then-ok = fresh install: probe fails, install runs, probe passes
-  bunx: string;             // body of the bunx stub
+  bunx?: string;            // body of the bun_cmd stub (the installer); omitted = setup's real bun_cmd runs $BUN_CMD
+  bunCmd?: string;          // BUN_CMD for the real bun_cmd (default: bun)
   env?: Record<string, string>;
   preLockPid?: string;      // pre-create the install lock held by this pid
   preLockNoPidAgeMin?: number; // pre-create a lock dir with NO pid file, this many minutes old
@@ -160,7 +162,10 @@ function runBlock(opts: {
     '_clear_playwright_quarantine() { :; }',
     probeFn,
     opts.prelude ?? '',
-    `bunx() { echo "bunx-called override=${'$'}{PLAYWRIGHT_HOST_PLATFORM_OVERRIDE:-unset}" >> "$MARK"; ${opts.bunx}; }`,
+    `BUN_CMD='${opts.bunCmd ?? 'bun'}'`,
+    opts.bunx === undefined
+      ? extractFn('bun_cmd')
+      : `bun_cmd() { echo "bun-x-called args=$* override=${'$'}{PLAYWRIGHT_HOST_PLATFORM_OVERRIDE:-unset}" >> "$MARK"; ${opts.bunx}; }`,
     killTree,
     extractFn('_wait_with_deadline'),
     // The block opens with the /etc/os-release probe that RESETS the override
@@ -287,14 +292,14 @@ describe('setup: Chromium bootstrap block executes best-effort', () => {
     const r = runBlock({ probe: 'fail', bunx: 'exit 0', preLockPid: '4194305' /* above Linux's largest pid_max: never a live pid */ });
     expect(r.status).toBe(0);
     expect(r.stderr).toContain('reclaiming stale Chromium-install lock');
-    expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bunx-called');
+    expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bun-x-called');
   });
 
   test('a lock whose pid file is garbage (-1, abc, 0) is stale, not "locked": kill -0 -1 would signal everything and "succeed"', () => {
     for (const pid of ['-1', 'abc', '0']) {
       const r = runBlock({ probe: 'fail', bunx: 'exit 0', preLockPid: pid });
       expect(r.status).toBe(0);
-      expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bunx-called');
+      expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bun-x-called');
       expect(r.stdout).not.toContain('chromium-install-locked');
     }
   }, 15_000);
@@ -302,7 +307,7 @@ describe('setup: Chromium bootstrap block executes best-effort', () => {
   test('a lock held by a LIVE pid but older than the install bound is reclaimed (holder past its deadline, or a recycled pid)', () => {
     const r = runBlock({ probe: 'fail', bunx: 'exit 0', preLockPid: String(process.pid), preLockAgeMin: 30, env: { GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT: '60' } });
     expect(r.status).toBe(0);
-    expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bunx-called');
+    expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bun-x-called');
     expect(r.stdout).not.toContain('chromium-install-locked');
     expect(r.stderr).toContain('past the install bound');
   }, 15_000);
@@ -310,7 +315,7 @@ describe('setup: Chromium bootstrap block executes best-effort', () => {
   test('a lock dir with NO pid file is reclaimed once older than the install bound, and honored while fresh', () => {
     const old = runBlock({ probe: 'fail', bunx: 'exit 0', preLockNoPidAgeMin: 30, env: { GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT: '60' } });
     expect(old.status).toBe(0);
-    expect(fs.readFileSync(path.join(old.tmp, 'mark'), 'utf-8')).toContain('bunx-called');
+    expect(fs.readFileSync(path.join(old.tmp, 'mark'), 'utf-8')).toContain('bun-x-called');
     expect(old.stdout).not.toContain('chromium-install-locked');
     const fresh = runBlock({ probe: 'fail', bunx: 'exit 0', preLockNoPidAgeMin: 0, env: { GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT: '600' } });
     expect(fresh.status).toBe(0);
@@ -363,6 +368,46 @@ function pathWithoutNode(): { bin: string; cleanup: () => void } {
 }
 
 describe('setup: Chromium bootstrap block — fresh install, lock hygiene, override, Windows arms', () => {
+  /** A winget-shaped Bun (#3131): `bun` on PATH, no `bunx` anywhere on it. */
+  function wingetBun(body: string): { dir: string; env: Record<string, string>; cleanup: () => void } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-winget-bun-'));
+    fs.writeFileSync(path.join(dir, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${dir}/calls"\n${body}\n`, { mode: 0o755 });
+    const rest = (process.env.PATH ?? '').split(path.delimiter)
+      .filter((d) => d && !fs.existsSync(path.join(d, 'bunx')) && !fs.existsSync(path.join(d, 'bunx.exe')));
+    return { dir, env: { PATH: [dir, ...rest].join(path.delimiter) }, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  test('winget-shaped Bun with no bunx: the install runs as `bun x` through setup\'s resolver and succeeds', () => {
+    const bun = wingetBun('exit 0');
+    try {
+      const r = runBlock({ probe: 'fail-then-ok', env: bun.env });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('REASON=\n');
+      expect(r.stdout).toContain('REACHED_END=1');
+      expect(fs.readFileSync(path.join(bun.dir, 'calls'), 'utf-8')).toBe('x playwright install chromium\n');
+    } finally {
+      bun.cleanup();
+    }
+  });
+
+  test('exit 127 from the installer names the resolved bun and both skip commands, not the network', () => {
+    const bun = wingetBun('exit 127');
+    try {
+      const r = runBlock({ probe: 'fail', env: bun.env });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('REASON=chromium-install\n');
+      expect(r.stderr).toContain(`${path.join(bun.dir, 'bun')} x playwright install chromium exited 127 (command not found); install Bun from bun.sh (winget Bun ships no bunx), or skip with ./setup --no-browser (Git Bash) or .\\setup.ps1 --no-browser (PowerShell)`);
+      expect(r.stderr).not.toContain('offline, proxy');
+    } finally {
+      bun.cleanup();
+    }
+  });
+
+  test('the installer stub sees `x playwright install chromium`', () => {
+    const r = runBlock({ probe: 'fail-then-ok', bunx: 'exit 0' });
+    expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bun-x-called args=x playwright install chromium override=unset');
+  });
+
   test('fresh install happy path: probe fails, install succeeds, re-probe passes → no reason, lock released, EXIT trap restored', () => {
     const r = runBlock({ probe: 'fail-then-ok', bunx: 'exit 0' });
     expect(r.status).toBe(0);
@@ -370,7 +415,7 @@ describe('setup: Chromium bootstrap block — fresh install, lock hygiene, overr
     expect(r.stdout).toContain('REACHED_END=1');
     // Installer ran exactly once (no override on a non-26.04 path).
     const mark = fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8');
-    expect(mark.split('\n').filter((l) => l.startsWith('bunx-called')).length).toBe(1);
+    expect(mark.split('\n').filter((l) => l.startsWith('bun-x-called')).length).toBe(1);
     expect(mark).toContain('override=unset');
     // The mkdir-mutex is released for the next setup...
     expect(fs.existsSync(path.join(r.tmp, 'gstack-playwright-install.lock'))).toBe(false);
@@ -402,7 +447,7 @@ describe('setup: Chromium bootstrap block — fresh install, lock hygiene, overr
       expect(r.stdout).toContain('REACHED_END=1');
       expect(r.stderr).toContain('nodejs.org');
       // The install itself ran; only the Node verification failed.
-      expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bunx-called');
+      expect(fs.readFileSync(path.join(r.tmp, 'mark'), 'utf-8')).toContain('bun-x-called');
     } finally {
       cleanup();
     }
@@ -486,6 +531,7 @@ function runSummary(reason: string, telemetry: 'ok' | 'fail' | 'missing', prelud
       'log() { [ "$QUIET" -eq 0 ] && echo "$@" || true; }',
       `SOURCE_GSTACK_DIR="${tmp}"`,
       `_PW_FAIL_REASON="${reason}"`,
+      extractFn('_setup_ready_line'),
       ...prelude,
       tail,
       'echo "REACHED_END=1"',

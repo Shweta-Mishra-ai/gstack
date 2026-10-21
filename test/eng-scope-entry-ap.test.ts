@@ -128,7 +128,7 @@ test('the full evaluated bundle routes startup into ordered preparation before s
   expect(policy).toContain('| QA Test Plan and task JSONL | Discovery paths below | Present each completely as **not persisted** and continue. |');
   expect(policy).toContain('| Best-effort metadata/learning logs | Helper-defined locations | Skip forbidden writes; otherwise keep their best-effort behavior. |');
   const finish = section.slice(section.indexOf('## Required outputs'), section.indexOf('### Output reference'));
-  expect(finish.replace(/\s+/g, ' ')).toMatch(/required log is forbidden, show fields as not persisted and take \*\*Blocked outcome\*\*/i);
+  expect(finish.replace(/\s+/g, ' ')).toMatch(/required log is forbidden, show fields as not persisted and take \*\*Report-back outcome\*\*/i);
   const log = section.slice(section.indexOf('## Review Log'), section.indexOf('## Next Steps'));
   expect(log).toContain("' || exit $?");
   expect(log).toContain("' 2>/dev/null || true");

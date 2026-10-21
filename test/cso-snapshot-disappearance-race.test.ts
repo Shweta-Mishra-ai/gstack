@@ -14,7 +14,7 @@ function trustedGit():string{
   return executable;
 }
 function gitEnvironment(home:string):NodeJS.ProcessEnv{
-  return{...process.env,HOME:home,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:process.platform==='win32'?'NUL':'/dev/null',GIT_TERMINAL_PROMPT:'0'};
+  return{...process.env,HOME:home,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0'};
 }
 type FileIdentity={path:string;dev:bigint;ino:bigint};
 function canonicalFile(file:string):string{

@@ -199,6 +199,7 @@ Persona examples by product type (pick the 3 most relevant):
 - **OSS contributor from GitHub** -- git clone && make test, CONTRIBUTING.md, issue templates
 - **Student learning to code** -- needs hand-holding, clear error messages, lots of examples
 - **DevOps engineer setting up infra** -- Terraform/Docker, non-interactive mode, env vars
+- **AI coding agent** -- reads errors literally, cannot ask, retries blindly, pays per token (any type except Documentation; picking it makes the agent the primary persona for every pass)
 
 After reply, keep this in working notes; write it above the plan's decision ledger
 only after 0C's target is answered:
@@ -448,7 +449,7 @@ For each DX section:
   for the persona. Each expansion requires its own opt-in AskUserQuestion.
 - **DX POLISH:** Examine every touchpoint within the accepted scope and contracts.
   Trace each issue to evidence. Do not redesign established APIs to improve a score.
-- **DX TRIAGE:** Flag adoption blockers (below 5); skip nice-to-haves (5-7).
+- **DX TRIAGE:** Flag adoption blockers (below 5) and every CAP4 error-contract finding; skip nice-to-haves (5-7).
 
 {{SECTION:review-sections}}
 

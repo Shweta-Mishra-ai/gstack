@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -7,11 +7,13 @@ import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { QueryProvider } from './helpers/agent-sdk-runner';
 import { resolveClaudeBinary } from '../lib/claude-bin';
 import type { EvalTestEntry } from './helpers/eval-store';
-import { createBoundaryFixture, runBoundaryActor, type BoundaryCase } from './helpers/workflow-boundaries-fixture';
+import { acknowledgesEndingError, createBoundaryFixture, runBoundaryActor, type BoundaryCase } from './helpers/workflow-boundaries-fixture';
 import { E2E_TIERS, E2E_TOUCHFILES } from './helpers/touchfiles-data';
 import { PR_PROFILE_CASE_IDS, PR_PROFILE_FILES } from '../scripts/test-pr-profile';
 import { applyHollowShardGuard, buildRunManifest, computePaidCaseSelection, DEFAULT_SHARD_TIMEOUT_MS, expectedPrCaseCount, prProfileTestNamePattern, resolvePaidShardBudget, retriesForFiles, verifySliceResults, type SliceResult } from '../scripts/test-paid-shards';
 import { CAPTURE_MS } from './helpers/eval-budgets';
+import capturedQuestions from './fixtures/investigate-owned-question-39195396438.json';
+import capturedFinals from './fixtures/investigate-owned-final-texts-opus.json';
 
 const cases: BoundaryCase[] = ['investigate-owned-completion', 'investigate-owned-abort', 'investigate-owned-ending-error'];
 const files = ['test/skill-e2e-investigate-owned-completion.test.ts', 'test/skill-e2e-investigate-owned-termination.test.ts'];
@@ -28,7 +30,7 @@ for (const attack of ['read-state', 'cat-state', 'bash-edit', 'receipt-write']) 
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-function protocolControl(id: BoundaryCase, faults: { skipCleanup?: boolean; duplicateQuestion?: boolean; failVerification?: boolean; rateLimit?: boolean; undeclared?: string; deniedBash?: string; includeAvailability?: boolean; misleadingFinal?: boolean; splitFinal?: boolean; reverify?: 'pass' | 'fail-last' } = {}) {
+function protocolControl(id: BoundaryCase, faults: { skipCleanup?: boolean; duplicateQuestion?: boolean; failVerification?: boolean; rateLimit?: boolean; undeclared?: string; deniedBash?: string; includeAvailability?: boolean; misleadingFinal?: boolean; splitFinal?: boolean; reverify?: 'pass' | 'fail-last'; finalText?: string } = {}) {
   let directory = '';
   let calls = 0;
   const provider: QueryProvider = input => {
@@ -128,10 +130,10 @@ function protocolControl(id: BoundaryCase, faults: { skipCleanup?: boolean; dupl
           }
         } else expect(answer).toBe('Abort');
         if (!faults.skipCleanup) expect((await shell(`bash "$HOME/.claude/skills/gstack/freeze/bin/freeze-state.sh" release "${owner}"`)).status).toBe(0);
-        const finalText = faults.misleadingFinal ? 'The fix is complete and verification succeeded.'
+        const finalText = faults.finalText ?? (faults.misleadingFinal ? 'The fix is complete and verification succeeded.'
           : id === 'investigate-owned-abort' ? 'Aborted at your request; no edit was made and the owned boundary was released.'
           : id === 'investigate-owned-ending-error' ? 'The verifier is unavailable; the investigation ended with an error and the owned boundary was released.'
-          : 'The correction passed verification and the owned boundary was released.';
+          : 'The correction passed verification and the owned boundary was released.');
         yield { type: 'assistant', session_id: 'fixture-session', parent_tool_use_id: null,
           message: { id: 'message-final', role: 'assistant', content: [{ type: 'text', text: finalText }] } } as SDKMessage;
         if (faults.splitFinal) yield { type: 'assistant', session_id: 'fixture-session', parent_tool_use_id: null,
@@ -353,4 +355,84 @@ test('F9 manifest rejects skipped, missing and hollow actor coverage', () => {
   }
   const hollow = { ...result.outcomes[1], executedTests: 0, skippedTests: 2, shard: 1, groupPid: null };
   expect(applyHollowShardGuard([hollow], { evalsAll: false, requireExecuted: true })[0].status).toBe('passed-empty');
+});
+
+// Gate 39195396438 slice 14: each actor asked its single continue/abort question in its own
+// words, with exactly a Continue and an Abort option.
+describe('captured owner questions from run 39195396438', () => {
+  const declared = (id: 'investigate-owned-abort' | 'investigate-owned-ending-error') => {
+    const fixture = createBoundaryFixture(id);
+    const acquire = () => spawnSync('bash', ['-c', 'bash "$HOME/.claude/skills/gstack/freeze/bin/freeze-state.sh" acquire "src"'],
+      { cwd: fixture.repo, env: fixture.env, encoding: 'utf8', timeout: 10000 });
+    const ask = (input: Record<string, unknown>) => fixture.canUseTool('AskUserQuestion', input, { signal: new AbortController().signal, toolUseID: 'captured' });
+    const [first, second] = capturedQuestions.cases[id] as Array<Record<string, any>>;
+    return { fixture, acquire, ask, first: structuredClone(first), second: structuredClone(second),
+      close: () => fs.rmSync(fixture.root, { recursive: true, force: true }) };
+  };
+
+  for (const [id, answer] of [['investigate-owned-abort', 'Abort'], ['investigate-owned-ending-error', 'Continue']] as const)
+    test(`${id}: the captured question is answered once and the re-ask is refused`, async () => {
+      const f = declared(id);
+      try {
+        expect(f.acquire().status).toBe(0);
+        const decision = await f.ask(f.first);
+        expect(decision.behavior).toBe('allow');
+        if (decision.behavior !== 'allow') return;
+        expect(decision.updatedInput!.answers).toEqual({ [f.first.questions[0].question]: answer });
+        const hook = await f.fixture.preToolUse({ hook_event_name: 'PreToolUse', session_id: 'captured', transcript_path: path.join(f.fixture.root, 'transcript'),
+          cwd: f.fixture.repo, tool_name: 'AskUserQuestion', tool_input: f.second, tool_use_id: 'second' }, 'second', { signal: new AbortController().signal });
+        expect((hook as any).hookSpecificOutput.permissionDecision).toBe('deny');
+        expect((await f.ask(f.second)).behavior).toBe('deny');
+      } finally { f.close(); }
+    });
+
+  test.each(['before acquisition', 'no abort choice', 'three options', 'swapped meanings'])('%s is still refused', async shape => {
+    const f = declared('investigate-owned-abort');
+    try {
+      if (shape !== 'before acquisition') expect(f.acquire().status).toBe(0);
+      const options = f.first.questions[0].options;
+      if (shape === 'no abort choice') options[1] = { label: 'Proceed later', description: 'Change the value after the verifier' };
+      if (shape === 'three options') options.push({ label: 'Skip', description: 'Leave the lock in place' });
+      if (shape === 'swapped meanings') [options[0].description, options[1].description] = [options[1].description, options[0].description];
+      expect((await f.ask(f.first)).behavior).toBe('deny');
+    } finally { f.close(); }
+  });
+});
+
+// Final responses of every Opus 5.5 investigate-owned-* gate record. Opus said "the
+// verifier couldn't run"; the old /error|unavailable|cannot|could not|unable/ matched
+// only the quoted FIXTURE_ENDING_ERROR output or "There were no cleanup errors".
+describe('ending-error acknowledgment (captured final responses)', () => {
+  const finals = (id: string) => capturedFinals.finals.filter(entry => entry.case === id);
+  const old = /error|unavailable|cannot|could not|unable/i;
+  const own = (text: string) => text.replace(/`[^`]*`/g, '');
+
+  test('every captured ending-error response that reached the verifier acknowledges it in its own words', () => {
+    const reached = finals('investigate-owned-ending-error').filter(entry => entry.run !== '39195396438');
+    expect(reached).toHaveLength(6);
+    for (const entry of reached) expect(acknowledgesEndingError(own(entry.finalText)), entry.run).toBe(true);
+    expect(reached.filter(entry => !old.test(own(entry.finalText).replace(/\bno cleanup errors\b/gi, ''))).map(entry => entry.run).sort())
+      .toEqual(['39157502890', '39166935531', '39173752116', '39181697029', '39199692993']);
+  });
+
+  test('completion, abort and the run that never reached the verifier do not count', () => {
+    const absent = [...finals('investigate-owned-completion'), ...finals('investigate-owned-abort'),
+      ...finals('investigate-owned-ending-error').filter(entry => entry.run === '39195396438')];
+    expect(absent).toHaveLength(15);
+    for (const entry of absent) expect(acknowledgesEndingError(entry.finalText), `${entry.case} ${entry.run}`).toBe(false);
+    for (const text of ['The fix is verified. Lock released with no errors.', 'The fix is complete and verification succeeded.',
+      'You chose to abort, so I made no edit and did not run the verifier. There were no cleanup errors.'])
+      expect(acknowledgesEndingError(text), text).toBe(false);
+  });
+
+  test('the registered actor credits the captured response and refuses a completion claim', async () => {
+    const captured = finals('investigate-owned-ending-error').find(entry => entry.run === '39166935531')!.finalText;
+    const accepted: EvalTestEntry[] = [];
+    await runBoundaryActor('investigate-owned-ending-error', entry => accepted.push(entry), protocolControl('investigate-owned-ending-error', { finalText: captured }).provider);
+    expect(accepted[0].passed).toBe(true);
+    const refused: EvalTestEntry[] = [];
+    const completion = finals('investigate-owned-completion').find(entry => entry.run === '39199692993')!.finalText;
+    await expect(runBoundaryActor('investigate-owned-ending-error', entry => refused.push(entry), protocolControl('investigate-owned-ending-error', { finalText: completion }).provider)).rejects.toThrow(/ending error not acknowledged/);
+    expect(refused[0].passed).toBe(false);
+  });
 });

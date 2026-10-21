@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
-import { qaFunctionalPrompt, QA_FUNCTIONAL_CASES } from './helpers/qa-functional-eval';
+import { qaFunctionalPrompt, qaFunctionalRequiredProbes, QA_FUNCTIONAL_CASES, QA_WEBHOOK_FIX_CAPTURE_LIMIT, QA_WEBHOOK_POST_REPAIR_SCENARIOS } from './helpers/qa-functional-eval';
 import { qaCommandAllowed } from './helpers/qa-functional-observer';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseNDJSON } from './helpers/session-runner';
-import { qaFunctionalVerdict, qaNativeProbes } from './helpers/qa-functional-evidence';
+import { QA_WEBHOOK_REQUIRED_SCENARIOS, qaFunctionalVerdict, qaNativeProbes } from './helpers/qa-functional-evidence';
 import { createQAFunctionalFixture, ownedPath } from './helpers/qa-functional-fixture';
 import { validateQACheckpoints } from './helpers/qa-checkpoint-evidence';
 import { computePaidCaseSelection } from '../scripts/test-paid-shards';
@@ -135,7 +135,12 @@ test('CI native exploration Read does not stand in for completed method Reads', 
   try {
     for (const variant of ['omitted methods', 'pending methods', 'completed methods']) {
       const events = structuredClone(captured.omittedReadEvents);
-      if (variant !== 'omitted methods') events.push(...captured.completedMethodEvents.filter(event => variant === 'completed methods' || event.type === 'assistant'));
+      if (variant !== 'omitted methods') events.push(...structuredClone(captured.completedMethodEvents.filter(event => variant === 'completed methods' || event.type === 'assistant')));
+      for (const part of events.flatMap((event: any) => Array.isArray(event.message?.content) ? event.message.content : [])) {
+        if (part.type === 'tool_result' && typeof part.content === 'string' && part.content.includes('AUTO-GENERATED from system-functional.md.tmpl')) {
+          part.content = readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8').split('\n').map((line, i) => `${i + 1}\t${line}`).join('\n');
+        }
+      }
       const parsed = parseNDJSON(events.map(event => JSON.stringify(event)));
       expect(parsed.toolCalls.some(call => call.tool === 'Read' && call.input.file_path.endsWith('/qa-only/sections/exploratory.md') && call.output.includes('# Shared exploratory QA'))).toBe(true);
       const errors = qaFunctionalVerdict(fixture, 'qa-only', {
@@ -242,12 +247,76 @@ test('webhook fix stage asks for the fix-loop probes; the R29 scenario omissions
   for (const probe of ['original failing probe', 'happy-path probe', 'cancellation', 'unavailable-dependency probe']) expect(verification).toContain(probe);
   expect(verification).not.toContain('All eight scenarios');
   expect(fix).toMatch(/completion reserve does not end required coverage/i);
-  expect(verification).toBe(((prompt: string) => prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence')))(qaFunctionalPrompt({ family: 'cli', mode: 'qa' })));
+  // Paid run 38986120559: a status-only repair fixed both concurrency orders but not partial, which stage 2 never asked for
+  // while verifyQANativeRegression reruns all eight. The webhook stage now names the repaired invariant's scenarios; the CLI
+  // stage keeps its four probes.
+  const cli = ((prompt: string) => prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence')))(qaFunctionalPrompt({ family: 'cli', mode: 'qa' }));
+  expect(cli).toContain('2. On the repaired source, run the original failing probe, an adjacent happy-path probe, cancellation and the unavailable-dependency probe.');
+  expect(verification).toContain('2. On the repaired source, run the original failing probe and every other scenario of the repaired invariant (duplicate, partial, concurrent-ab, concurrent-ba), then the adjacent happy-path probe, cancellation and the unavailable-dependency probe.');
+  expect(verification.slice(verification.indexOf('dependency probe. '))).toBe(cli.slice(cli.indexOf('dependency probe. ')));
   const report = qaFunctionalPrompt({ family: 'webhook', mode: 'qa-only' });
   expect(report).toMatch(/all eight scenarios are required coverage/i);
   for (const scenario of required) expect(report).toContain(scenario);
 });
 
+
+test('webhook fix budget names the post-repair scenarios up front, and they feed only the capture nudge', () => {
+  const fix = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
+  const budget = fix.slice(fix.indexOf('Capture budget:'), fix.indexOf('Complete these stages in order'));
+  expect(budget).toBe('Capture budget: 12 captures in total. Reserve the post-repair reruns first: the 7 scenarios of stage 2 plus each distinct pre-repair command your verdict relies on that they do not repeat (for example a reject probe); pre-repair exploration gets only what remains. If those reruns cannot all fit, report the rest as open. If the remaining pre-repair captures cannot establish and replay the defect, report incomplete. ');
+  expect(fix.indexOf('Capture budget:')).toBeLessThan(fix.indexOf('1. Prove the regression red'));
+  for (const entry of QA_FUNCTIONAL_CASES.filter(entry => entry.id !== 'qa-functional-webhook-fix')) expect(qaFunctionalPrompt(entry)).not.toContain('Capture budget:');
+  expect([...QA_WEBHOOK_POST_REPAIR_SCENARIOS]).toEqual(['duplicate', 'partial', 'concurrent-ab', 'concurrent-ba', 'happy', 'cancel', 'dependency']);
+  expect(qaFunctionalRequiredProbes({ family: 'webhook', mode: 'qa' })).toEqual(QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(scenario => `bun run probe -- ${scenario}`));
+  expect(qaFunctionalRequiredProbes({ family: 'webhook', mode: 'qa-only' })).toEqual(QA_WEBHOOK_REQUIRED_SCENARIOS['qa-only'].map(scenario => `bun run probe -- ${scenario}`));
+  expect(qaFunctionalRequiredProbes({ family: 'cli', mode: 'qa' })).toBeUndefined();
+  expect(QA_WEBHOOK_REQUIRED_SCENARIOS.qa).toEqual(['happy', 'cancel', 'dependency']);
+  const source = readFileSync(join(import.meta.dir, 'helpers/qa-functional-eval.ts'), 'utf8');
+  expect(source).toContain('GSTACK_QA_REQUIRED_PROBES: JSON.stringify(qaFunctionalRequiredProbes(entry))');
+});
+
+test('webhook fix budget fits a pre-repair reject plus the reproduced defect inside the unchanged 12-capture ceiling', () => {
+  expect(QA_WEBHOOK_FIX_CAPTURE_LIMIT).toBe(12);
+  const probe = (scenario: string) => `bun run probe -- ${scenario}`;
+  const preRepair = ['reject', 'duplicate', 'duplicate'].map(probe);
+  const reliedOn = [...new Set(preRepair)];
+  const postRepair = [...new Set([...QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(probe), ...reliedOn])];
+  expect(postRepair).toEqual([...QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(probe), probe('reject')]);
+  expect(preRepair.length + postRepair.length).toBe(11);
+  expect(preRepair.length + postRepair.length).toBeLessThanOrEqual(QA_WEBHOOK_FIX_CAPTURE_LIMIT);
+  expect(QA_WEBHOOK_FIX_CAPTURE_LIMIT - postRepair.length).toBeGreaterThanOrEqual(preRepair.length);
+  const fix = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
+  const budget = fix.slice(fix.indexOf('Capture budget:'), fix.indexOf('Complete these stages in order'));
+  expect(budget.indexOf('Reserve the post-repair reruns first')).toBeLessThan(budget.indexOf('pre-repair exploration gets only what remains'));
+  expect(budget).toContain('report the rest as open');
+});
+
+test('fix runs rerun every pre-repair capture their verdict relies on; superseded rows stay open until rerun', () => {
+  // Paid run 39053431488 (#3252): capture 003 (duplicate) was labelled superseded and never rerun after the repair.
+  const rule = 'After your final repair, rerun every pre-repair capture your verdict relies on; a superseded row stays open until its command reran on the repaired source.';
+  for (const entry of QA_FUNCTIONAL_CASES) {
+    const prompt = qaFunctionalPrompt(entry);
+    if (entry.mode === 'qa') expect(prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence'))).toContain(rule);
+    else expect(prompt).not.toContain(rule);
+  }
+});
+
+test('exploratory sections state one stop rule tied to per-rule input probes, and fix runs close superseded captures', () => {
+  // PR gates 38983306684, 39001107574 and 39073934326 (#3260 at 93449bc): cli-report counted `-5` as its sign probe and never
+  // probed the amount's digits-only rule with an otherwise valid value, so it missed the seeded non-digit defect. A worked
+  // example naming the signed amount (0fe616e) was misread as 'a signed amount breaks only the digits-only rule' (local
+  // run fw3b-cli1), so the rule states the principle instead: break one rule, satisfy every other.
+  const stop = "Stop when scoped contracts are tested or blocked: each field's documented input rule needs a probe that breaks only it and satisfies every other rule; rules uncovered at a probe/time cap go in limits.";
+  const fix = 'After a fix, every earlier capture is superseded, even from a client that prints no snapshot: rerun each one your verdict relies on, or report it as an open remainder.';
+  for (const rel of ['qa/sections/exploratory.md', 'qa-only/sections/exploratory.md']) {
+    const section = readFileSync(join(import.meta.dir, '..', rel), 'utf8');
+    expect(section.split(stop)).toHaveLength(2);
+    expect(section.match(/^Stop when\b.*$/gm)).toEqual([stop]);
+    expect(section.match(/input rule/g)).toHaveLength(1);
+    expect(section.includes(fix)).toBe(rel.startsWith('qa/'));
+  }
+  expect(readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8')).toContain('One probe per documented input rule of each field (allowed characters, format, sign, range, arity) breaking only it:');
+});
 
 test('fix-stage checkpoint provenance survives intervening native regression tests', () => {
   const prompt = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });

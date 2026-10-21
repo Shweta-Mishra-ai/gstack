@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-gbrain-sync — V1 unified sync verb.
  *
@@ -30,7 +30,7 @@
  */
 
 import { existsSync, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, renameSync, realpathSync, readdirSync, appendFileSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, basename, isAbsolute } from "path";
 import { execSync, spawnSync } from "child_process";
 import { homedir, hostname } from "os";
 import { createHash } from "crypto";
@@ -51,6 +51,7 @@ import {
 } from "../lib/gbrain-sources";
 import { detectAutopilot, decideSourceRemove, decideCodeSync } from "../lib/gbrain-guards";
 import { writeReceipt } from "../lib/egress-receipt";
+import { bunIsolationArgs } from "../lib/bun-isolation";
 import { dbUnreachableReason, localEngineStatus, localEngineStatusDetail, type LocalEngineStatus } from "../lib/gbrain-local-status";
 import { buildGbrainEnv, spawnGbrain, spawnGbrainAsync, execGbrainJson, NEEDS_SHELL_ON_WINDOWS, bashScriptInvocation } from "../lib/gbrain-exec";
 import { repoPolicyTier as sharedRepoPolicyTier } from "../lib/gbrain-repo-policy-client";
@@ -1474,13 +1475,32 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
 }
 
 /**
- * Ensure `.gbrain-source` is listed in the consumer repo's `.gitignore`.
+ * Ensure `.gbrain-source` is ignored in the consumer repo.
  *
- * Idempotent: only appends when the entry is not already present (matched on
- * trimmed lines so a leading/trailing whitespace difference doesn't add a
- * second copy). Wraps writes in try/catch so a read-only checkout or weird
+ * Idempotent. A trimmed `.gbrain-source` line is enough, and so is a
+ * pattern in a tracked `.gitignore` that already ignores the pin (an
+ * ignore-everything `*` covers it); appending a second line would dirty that
+ * tracked file. Global excludes and `.git/info/exclude` do not count: they
+ * are invisible to teammates' clones, which would then commit the pin
+ * (#1384). Wraps writes in try/catch so a read-only checkout or weird
  * perms logs a warning and lets the rest of the sync continue.
  */
+function trackedGitignoreIgnoresGbrainSource(root: string): boolean {
+  const check = spawnSync("git", ["-C", root, "-c", "core.excludesFile=", "check-ignore", "-v", "-z", "--stdin"], {
+    input: ".gbrain-source\0",
+    encoding: "utf-8",
+    timeout: 5_000,
+  });
+  if (check.status !== 0) return false;
+  const [source = "", , pattern = ""] = check.stdout.split("\0");
+  if (pattern.startsWith("!") || basename(source) !== ".gitignore" || isAbsolute(source)) return false;
+  const tracked = spawnSync("git", ["-C", root, "ls-files", "--error-unmatch", "--", `:(top,literal)${source}`], {
+    stdio: "ignore",
+    timeout: 5_000,
+  });
+  return tracked.status === 0;
+}
+
 export function ensureGbrainSourceGitignored(root: string): void {
   const gitignorePath = join(root, ".gitignore");
   try {
@@ -1493,7 +1513,7 @@ export function ensureGbrainSourceGitignored(root: string): void {
     const alreadyIgnored = existing
       .split("\n")
       .some((line) => line.trim() === ".gbrain-source");
-    if (alreadyIgnored) {
+    if (alreadyIgnored || trackedGitignoreIgnoresGbrainSource(root)) {
       return;
     }
     const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
@@ -1592,7 +1612,7 @@ function runMemoryIngest(args: CliArgs, previous: SyncState, consent: Transcript
   }
 
   const ingestPath = join(import.meta.dir, "gstack-memory-ingest.ts");
-  const ingestArgs = ["run", ingestPath];
+  const ingestArgs = [...bunIsolationArgs(), "run", ingestPath];
   if (args.mode === "full") ingestArgs.push("--bulk");
   else ingestArgs.push("--incremental");
   if (args.mode === "full" && consent.affirmative && consent.window !== "recent") ingestArgs.push("--all-history");
@@ -1608,7 +1628,7 @@ function runMemoryIngest(args: CliArgs, previous: SyncState, consent: Transcript
     process.env.GSTACK_SYNC_MEMORY_TIMEOUT_MS,
     "GSTACK_SYNC_MEMORY_TIMEOUT_MS",
   );
-  const result = spawnSync("bun", ingestArgs, {
+  const result = spawnSync(process.execPath, ingestArgs, {
     encoding: "utf-8",
     timeout: memoryTimeoutMs,
     env: childEnv,
@@ -1643,6 +1663,9 @@ function runMemoryIngest(args: CliArgs, previous: SyncState, consent: Transcript
   };
 }
 
+export const NO_BASH_SUMMARY =
+  "skipped (no bash found; set GSTACK_GIT_BASH (old name: GSTACK_BASH) to your Git bash.exe. PowerShell: [Environment]::SetEnvironmentVariable('GSTACK_GIT_BASH', 'C:\\Program Files\\Git\\bin\\bash.exe', 'User'), then restart Claude Code; or add it to the \"env\" block of ~/.claude/settings.json)";
+
 function runBrainSyncPush(args: CliArgs): StageResult {
   const t0 = Date.now();
 
@@ -1670,7 +1693,7 @@ function runBrainSyncPush(args: CliArgs): StageResult {
       ran: false,
       ok: true,
       duration_ms: Date.now() - t0,
-      summary: "skipped (no bash found; set GSTACK_BASH to your Git bash.exe)",
+      summary: NO_BASH_SUMMARY,
     };
   }
 

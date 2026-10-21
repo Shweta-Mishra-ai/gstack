@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -9,13 +9,21 @@ import { childEnvironment, executable, git as readGitMetadata, runProcess } from
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))fs.rmSync(root,{recursive:true,force:true});});
 
-function fixture(){
-  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-'))),repo=path.join(root,'repo'),runDir=path.join(root,'state','run');
-  roots.push(root);fs.mkdirSync(repo);fs.mkdirSync(runDir,{recursive:true,mode:0o700});
-  const git=(...args:string[])=>{const result=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{HOME:root,PATH:'/usr/bin:/bin'},timeout:30_000});if(result.status)throw new Error(result.stderr);return result.stdout;};
+const fixtureGit=(repo:string,home:string)=>(...args:string[])=>{const result=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{HOME:home,PATH:'/usr/bin:/bin'},timeout:30_000});if(result.status)throw new Error(result.stderr);return result.stdout;};
+let template='';
+// The first /usr/bin/git spawns on a cold macOS runner can eat a test's whole 5 s budget before the code under test runs; pay them once here.
+beforeAll(()=>{
+  template=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-template-')));
+  const repo=path.join(template,'repo'),git=fixtureGit(repo,template);fs.mkdirSync(repo);
   git('init','-q');git('config','user.email','fixture@example.test');git('config','user.name','Fixture');
   fs.writeFileSync(path.join(repo,'tracked.ts'),'export const tracked = true\n');git('add','tracked.ts');git('commit','-qm','base');
-  return{root,repo,runDir,git};
+},{timeout:30_000});
+afterAll(()=>fs.rmSync(template,{recursive:true,force:true}));
+
+function fixture(){
+  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-'))),repo=path.join(root,'repo'),runDir=path.join(root,'state','run');
+  roots.push(root);fs.cpSync(path.join(template,'repo'),repo,{recursive:true});fs.mkdirSync(runDir,{recursive:true,mode:0o700});
+  return{root,repo,runDir,git:fixtureGit(repo,root)};
 }
 
 function replaceWithSymlinkAfterLstat(target:string,replacement:string,occurrence=1){
@@ -82,6 +90,20 @@ describe('CSO Git metadata hardening',()=>{
     expect(manifest.deletedPaths).toEqual([{path:'tracked.ts',pathId:expect.stringMatching(/^[a-f0-9]{32}$/)}]);
     expect(history).toContain('Subject: base');
     expect(history).not.toContain('replacement-history');
+  });
+
+  test.skipIf(process.platform==='win32')('retained history withholds diffs of credential files the snapshot excludes',async()=>{
+    const {repo,runDir,git}=fixture();
+    fs.writeFileSync(path.join(repo,'.env'),'UPSTREAM_TOKEN=planted-history-value\n');fs.writeFileSync(path.join(repo,'tracked.ts'),'export const tracked = false\n');
+    git('add','.env','tracked.ts');git('commit','-qm','configure upstream');
+
+    await capture(repo,runDir);
+    const history=fs.readFileSync(path.join(runDir,'history.txt'),'utf8');
+
+    expect(history).not.toContain('planted-history-value');
+    expect(history).toContain('diff withheld: .env (credential or execution configuration)');
+    expect(history).toContain('+export const tracked = false');
+    expect(history).toContain('Subject: configure upstream');
   });
 
   test.skipIf(process.platform==='win32')('rejects repository config includes before Git can consume them',async()=>{

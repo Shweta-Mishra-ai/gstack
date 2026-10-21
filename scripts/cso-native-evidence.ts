@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Derive native runtime gate evidence from the named Docker tests that actually executed and passed. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';

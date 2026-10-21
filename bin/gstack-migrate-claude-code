@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 // Repair existing installs only; never install a new host or invoke an AI CLI.
 import * as path from 'node:path';
 import { migrateClaudeCodeSkills } from '../lib/claude-code-migration';

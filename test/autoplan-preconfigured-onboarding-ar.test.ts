@@ -20,7 +20,7 @@ function fixture(plan = original) {
   // This free test controls unrelated startup side effects, not the seeded repo.
   writeFileSync(join(state, 'config.yaml'), 'update_check: false\nartifacts_sync: off\ntelemetry: off\n');
   writeFileSync(join(state, '.proactive-prompted'), '');
-  const env = { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: state, GSTACK_STATE_ROOT: state };
+  const env = { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: state, GSTACK_STATE_ROOT: state, GSTACK_LEASE_DIR: join(state, 'gstack-leases') };
   const start = () => execFileSync(join(root, 'bin/gstack-skill-start'), ['--skill', 'autoplan'],
     { cwd, env, encoding: 'utf8', timeout: 30_000 });
   const discover = () => execFileSync('bash', ['-c', DESIGN_DOC_DISCOVERY_BLOCK.replaceAll('~/.claude/skills/gstack/bin/', `${root}/bin/`)],

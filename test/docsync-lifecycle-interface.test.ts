@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fixtureDocs } from './helpers/docsync-fixture';
 import { docsCommandAllowed, docsNativeInterface, docsPreambleCommands, docsToolFailures } from './helpers/docsync-observer';
-import type { SkillTestResult } from './helpers/session-runner';
+import { parseNDJSON, type SkillTestResult } from './helpers/session-runner';
 
 let fixture: ReturnType<typeof fixtureDocs>;
 beforeAll(() => { fixture = fixtureDocs('updated'); });
@@ -34,6 +34,15 @@ test.each(['success', 'error', 'abort', 'unknown'])('same-session literal end ac
   expect(docsCommandAllowed(end, fixture)).toBe(true);
   const result = { toolCalls: [{ tool: 'Bash', input: { command: end }, output: '' }] } as SkillTestResult;
   expect(docsToolFailures(result, fixture)).toEqual([]);
+});
+
+test('start --help is a read with or without the spawned prefix; anything else after the prefix still names document-release', () => {
+  const start = `${fixture.skills.split(path.sep).join('/')}/bin/gstack-skill-start`;
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --help`, fixture)).toBe(true);
+  expect(docsCommandAllowed(`${start} --help`, fixture)).toBe(true);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --help --skill qa`, fixture)).toBe(false);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --skill qa --model claude`, fixture)).toBe(false);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned /tmp/gstack-skill-start --help`, fixture)).toBe(false);
 });
 
 test('historical misplaced spawned prefix remains rejected while corrected preamble stays supported', () => {
@@ -112,9 +121,13 @@ test('Git guidance uses the existing working directory; --git-dir and --work-tre
 
 describe('stored docsync observer commands', () => {
   const stored = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-observer-commands.json'), 'utf8')) as
-    { known_good: string[]; known_bad: string[] };
-  const fill = (command: string) => command.replaceAll('{repo}', fixture.repo).replaceAll('{other}', path.dirname(fixture.repo));
+    { known_good: string[]; known_good_posix: string[]; known_bad: string[] };
+  const fill = (command: string) => command.replaceAll('{repo}', fixture.repo).replaceAll('{other}', path.dirname(fixture.repo))
+    .replaceAll('{home}', fixture.home);
   test.each(stored.known_good)('harmless read form is accepted: %s', command => {
+    expect(docsCommandAllowed(fill(command), fixture)).toBe(true);
+  });
+  test.skipIf(process.platform === 'win32').each(stored.known_good_posix)('shared read-only grammar form is accepted: %s', command => {
     expect(docsCommandAllowed(fill(command), fixture)).toBe(true);
   });
   test.each(stored.known_bad)('known-bad form stays rejected: %s', command => {
@@ -125,5 +138,88 @@ describe('stored docsync observer commands', () => {
       for (const suffix of [' 2>/dev/null', ' || true']) expect(docsCommandAllowed(command + suffix, fixture)).toBe(false);
       expect(docsCommandAllowed(`cd ${fixture.repo} && ${command}`, fixture)).toBe(false);
     }
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('candidate call at a missing binary path (exit 127)', () => {
+  const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-candidate-not-found-public.json'), 'utf8')) as
+    { calls: SkillTestResult['toolCalls'] };
+  let current: ReturnType<typeof fixtureDocs>;
+  let publish: string;
+  let missing: string;
+  beforeAll(() => {
+    current = fixtureDocs('current');
+    publish = path.join(current.home, 'fixture-publish.ts');
+    missing = path.join(current.home, 'missing-shard');
+  });
+  afterAll(() => current?.clean());
+  const fill = (text: string) => text.replaceAll('{shard}', missing).replaceAll('{home}', current.home);
+  const replay = (calls = captured.calls) => ({ toolCalls: calls.map(call => ({ tool: call.tool, output: fill(call.output),
+    input: Object.fromEntries(Object.entries(call.input).map(([key, value]) => [key, typeof value === 'string' ? fill(value) : value])) })) }) as SkillTestResult;
+  const wrong = () => captured.calls.findIndex(call => call.output.startsWith('Exit code 127'));
+  const retry = () => wrong() + 1;
+  const failures = (result: SkillTestResult) => docsToolFailures(result, current, [publish], true);
+  const pair = (wrongOutput: string, retryOutput = '{}', wrongCommand = captured.calls[wrong()].input.command) => replay([
+    { tool: 'Bash', input: { command: wrongCommand }, output: wrongOutput },
+    { tool: 'Bash', input: { command: captured.calls[retry()].input.command }, output: retryOutput },
+  ]);
+  const notFound = (binary: string) => `Exit code 127\n(eval):1: no such file or directory: ${binary}`;
+  const wrongBinary = () => fill(captured.calls[wrong()].input.command.split(' ')[0]);
+
+  test('captured run 39223031058 ship-docsync-current passes; its wrong-path call alone is outside the interface', () => {
+    const result = replay();
+    expect(result.toolCalls[retry()].input.command).toBe(result.toolCalls[wrong()].input.command.replace(wrongBinary(),
+      `${current.skills}/bin/gstack-docs-candidate`));
+    expect(docsCommandAllowed(result.toolCalls[wrong()].input.command, current, [publish])).toBe(false);
+    expect(failures(result)).toEqual([]);
+  });
+
+  test('the native exit-127 tool result reaches the observer as the recorded output', () => {
+    const command = fill(captured.calls[wrong()].input.command);
+    const parsed = parseNDJSON([
+      { type: 'assistant', parent_tool_use_id: 'child', message: { content: [{ type: 'tool_use', id: 'wrong', name: 'Bash', input: { command } }] } },
+      { type: 'user', parent_tool_use_id: 'child', message: { content: [{ type: 'tool_result', tool_use_id: 'wrong', content: notFound(wrongBinary()), is_error: true }] },
+        tool_use_result: `Error: ${notFound(wrongBinary())}` },
+    ].map(event => JSON.stringify(event)));
+    expect(parsed.toolCalls[0].output).toBe(notFound(wrongBinary()));
+  });
+
+  test('a 127 with no later run of the same command at the declared path still fails', () => {
+    const calls = captured.calls.filter((_, index) => index !== retry());
+    expect(failures(replay(calls))).toContain('command outside declared docs observation interface');
+    const before = [captured.calls[retry()], ...calls];
+    expect(failures(replay(before))).toContain('command outside declared docs observation interface');
+    expect(failures(pair(notFound(wrongBinary()), 'Exit code 1\nboom'))).toContain('command outside declared docs observation interface');
+    const otherArgs = captured.calls[wrong()].input.command.replace('ship2-docs-a1.json', 'other.json');
+    expect(failures(pair(notFound(wrongBinary()), '{}', otherArgs))).toContain('command outside declared docs observation interface');
+  });
+
+  test('any other exit or shell message outside the declared path still fails', () => {
+    expect(failures(pair(notFound(wrongBinary())))).toEqual([]);
+    for (const output of [`Exit code 126\n(eval):1: permission denied: ${wrongBinary()}`, 'Exit code 1\nerror', '',
+      `Exit code 127\n(eval):1: command not found: ${wrongBinary()}`, notFound(wrongBinary()) + '\nextra',
+      notFound(path.join(missing, 'other/gstack-docs-candidate'))]) {
+      expect(failures(pair(output)), output).toContain('command outside declared docs observation interface');
+    }
+  });
+
+  test('a wrong-path binary that exists still fails, whether it ran or claims 127', () => {
+    fs.mkdirSync(path.dirname(wrongBinary()), { recursive: true });
+    fs.writeFileSync(wrongBinary(), 'candidate stand-in\n');
+    try {
+      for (const output of ['{}', notFound(wrongBinary())]) {
+        expect(failures(pair(output)), output).toContain('command outside declared docs observation interface');
+      }
+    } finally { fs.rmSync(missing, { recursive: true, force: true }); }
+  });
+
+  test('only a candidate binary at an absolute literal path qualifies', () => {
+    const declared = current.skills.split(path.sep).join('/');
+    const skillEnd = `${missing}/.claude/skills/gstack/bin/gstack-skill-start --help`;
+    expect(failures(replay([{ tool: 'Bash', input: { command: skillEnd }, output: notFound(skillEnd.split(' ')[0]) },
+      { tool: 'Bash', input: { command: `${declared}/bin/gstack-skill-start --help` }, output: 'usage' }]))).toContain('command outside declared docs observation interface');
+    const relative = 'missing/gstack-docs-candidate --help';
+    expect(failures(replay([{ tool: 'Bash', input: { command: relative }, output: notFound('missing/gstack-docs-candidate') },
+      { tool: 'Bash', input: { command: `${declared}/bin/gstack-docs-candidate --help` }, output: 'usage' }]))).toContain('command outside declared docs observation interface');
   });
 });

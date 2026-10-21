@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-model-benchmark — run the same prompt across multiple providers
  * and compare latency, tokens, cost, quality, and tool-call count.

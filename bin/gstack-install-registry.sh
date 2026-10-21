@@ -25,6 +25,28 @@
 # Callers must set GSTACK_STATE_ROOT first (bin/gstack-state-root.sh). Bash 3.2
 # clean; no flock (macOS lacks it), so the lock is an atomic mkdir.
 
+# Same-path and containment checks (bin/gstack-path-spelling.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/gstack-path-spelling.sh" 2>/dev/null || true
+
+# gstack_install_move_hint SRC HOST — when HOST's runtime root ROOT is SRC (the
+# checkout) or contains it, `./setup --host HOST` would replace the checkout
+# (#3084): print the commands that move it out first and return 0. A symlinked
+# ~/.claude/skills/gstack that points at SRC becomes the checkout itself.
+# Kiro writes its runtime files into ROOT in place, which would link the
+# checkout into itself, so it counts too. Claude installs in place from the
+# checkout, and a ROOT that is a symlink is replaced as a link: those return 1.
+gstack_install_move_hint() {
+  local src="$1" host="$2" root="$3" claude_link="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gstack"
+  [ "$host" = claude ] && return 1
+  [ -L "$root" ] && return 1
+  command -v gstack_path_within >/dev/null 2>&1 && gstack_path_within "$src" "$root" || return 1
+  if [ -L "$claude_link" ] && gstack_path_same "$claude_link" "$src"; then
+    printf 'rm %s && mv %s %s && cd %s && ./setup --host claude && ./setup --host %s\n' "$claude_link" "$src" "$claude_link" "$claude_link" "$host"
+  else
+    printf 'mv %s ~/gstack && cd ~/gstack && ./setup --host %s\n' "$src" "$host"
+  fi
+}
+
 gstack_install_registry_file() {
   printf '%s/installs.tsv\n' "${GSTACK_STATE_ROOT:?gstack-install-registry: GSTACK_STATE_ROOT is not set}"
 }
@@ -160,7 +182,7 @@ gstack_install_render_for() {
 gstack_host_tier() {
   case "$1" in
     claude) echo full ;;
-    codex|kiro|factory|opencode|cursor|copilot) echo experimental ;;
+    codex|kiro|factory|opencode|cursor|copilot|agy) echo experimental ;;
     slate|openclaw|hermes|gbrain) echo instruction-only ;;
     *) echo unknown ;;
   esac
@@ -231,6 +253,7 @@ gstack_install_known_roots() {
   printf 'opencode\tglobal\t%s\t%s\n' "$HOME/.config/opencode/skills" "$HOME/.config/opencode/skills/gstack"
   printf 'cursor\tglobal\t%s\t%s\n' "$HOME/.cursor/skills" "$HOME/.cursor/skills/gstack"
   printf 'copilot\tglobal\t%s\t%s\n' "$HOME/.copilot/skills" "$HOME/.copilot/skills/gstack"
+  printf 'agy\tglobal\t%s\t%s\n' "$HOME/.gemini/antigravity-cli/skills" "$HOME/.gemini/antigravity-cli/skills/gstack"
   proj="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$proj" ] && [ "$proj" != "$HOME" ]; then
     printf 'claude\tproject\t%s\t%s\n' "$proj/.claude/skills" "$proj/.claude/skills/gstack"
@@ -241,7 +264,7 @@ gstack_install_known_roots() {
 # _gstack_status_rows — summary rows (see gstack_install_registry_render) for
 # every registered install, then every unregistered install found on disk.
 _gstack_status_rows() {
-  local host scope project dest root src ver prefix render ts cur result note seen="|"
+  local host scope project dest root src ver prefix render ts cur result note move seen="|"
   while IFS='	' read -r host scope project dest root src ver prefix render ts; do
     [ -n "$host" ] || continue
     seen="$seen$root|"
@@ -255,6 +278,9 @@ _gstack_status_rows() {
       result=current
     else
       result=stale; note="refresh: cd $src && ./setup --host $host"
+    fi
+    if [ "$result" != missing ] && move="$(gstack_install_move_hint "$src" "$host" "$root")"; then
+      note="the gstack checkout lives in this host's runtime root ($root), so ./setup --host $host would replace it; move it first: $move (docs/troubleshooting.md#setup-runtime-root-contains-checkout)"
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$scope" "$src" "$dest" "$ver" "$cur" "$result" "$note"
   done <<ROWS
@@ -271,6 +297,9 @@ ROWS
     note="installed before the registry; register it: cd $src && ./setup --host $host"
     if [ "$scope" = global ] && [ "$host" != claude ] && _gstack_vendored_source "$src"; then
       note="captured by the project-vendored copy at $src (#2879); choose: keep it (cd $src && ./setup --host $host --global) or repoint it at your global checkout (cd <global checkout> && ./setup --host $host)"
+    fi
+    if move="$(gstack_install_move_hint "$src" "$host" "$root")"; then
+      note="installed before the registry, and the gstack checkout lives in this host's runtime root ($root), so ./setup --host $host would replace it; move it first: $move (docs/troubleshooting.md#setup-runtime-root-contains-checkout)"
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$scope" "$src" "$dest" "-" "$cur" unregistered "$note"
   done <<ROOTS

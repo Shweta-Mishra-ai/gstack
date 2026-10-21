@@ -162,6 +162,7 @@ describe('one-way door safety', () => {
       'ship-test-failure-triage',         // shipping broken tests
       'review-sql-safety',                 // SQL injection path
       'review-llm-trust-boundary',         // LLM trust boundary
+      'review-gate-disposition',           // gate edit disposition: never-ask/AUTO_DECIDE must not waive it
       'cso-global-scan-approval',          // scans outside branch
       'cso-finding-fix',                   // security finding
       'land-and-deploy-merge-confirm',     // actual merge
@@ -677,7 +678,7 @@ function findAllTemplates(): string[] {
 // dimension at its 0.5 seed. Calibration now needs at least one signal event.
 describe('B10: no CALIBRATED with zero signals', () => {
   const tmpl = fs.readFileSync(path.join(ROOT, 'plan-tune', 'SKILL.md.tmpl'), 'utf-8');
-  const start = tmpl.indexOf('gstack-developer-profile --profile | bun -e "') + 'gstack-developer-profile --profile | bun -e "'.length;
+  const start = tmpl.indexOf('gstack-developer-profile --profile | bun --no-env-file --config=/dev/null -e "') + 'gstack-developer-profile --profile | bun --no-env-file --config=/dev/null -e "'.length;
   const script = tmpl.slice(start, tmpl.indexOf('\n"\necho \'---DISTILL---\'', start));
   const calibration = (inferred: object) => {
     const { spawnSync } = require('child_process');

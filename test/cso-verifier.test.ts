@@ -65,6 +65,19 @@ describe('CSO verifier security judgement',()=>{
     try{expect((await judgeSecurity('before',payloads,disproved.port)).security).toBe('pass');}finally{disproved.server.stop(true);}
   });
 
+  test('a set of safe statuses passes any listed rejection that withholds the marker and nothing else',async()=>{
+    const dotfile:HttpAssertion={name:'dotfile',path:'/.env',method:'GET',expected:{status:[403,404],excludes:'DOTFILE'},vulnerable:{status:200,includes:'DOTFILE'}};
+    const answer=async(status:number,body:string)=>{
+      const server=Bun.serve({port:0,hostname:'127.0.0.1',fetch:()=>new Response(body,{status})});
+      try{return [(await judgeSecurity('before',dotfile,Number(server.port))).security,(await judgeSecurity('after',dotfile,Number(server.port))).security];}finally{server.stop(true);}
+    };
+    expect(await answer(404,'not found')).toEqual(['pass','pass']);
+    expect(await answer(403,'denied')).toEqual(['pass','pass']);
+    expect(await answer(200,'DOTFILE=1')).toEqual(['intended_failure','inconclusive']);
+    expect(await answer(403,'denied DOTFILE=1')).toEqual(['inconclusive','inconclusive']);
+    expect(await answer(400,'bad request')).toEqual(['inconclusive','inconclusive']);
+  });
+
   test('a single assertion keeps its original before and after outcomes',async()=>{
     const vulnerable=serve(new Set()),fixed=serve(ALL);
     try{

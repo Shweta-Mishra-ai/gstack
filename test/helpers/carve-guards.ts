@@ -131,21 +131,23 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       // contain "dispatch the" — so update anchors in lockstep with any
       // touchpoint rewording.
       mustStayInSkeleton: [
-        'v$NEW_VERSION',
-        'gstack-pr-title-rewrite',
+        'The pr-body section prepares the title from that result',
         '## Step 14.5: Documentation audit (every ship)',
         'No documentation writer runs after push',
         'dispatches the /document-release subagent',
       ],
       // ...while the full create/update procedure stays carved into pr-body.md
       // (out of the skeleton, present in the union). Asserts BOTH PR paths
-      // survive: the create path and the idempotent update path. The Step 18
+      // survive: the create path and the idempotent update path, both posted
+      // through gstack-post, and the version-prefixed title preparation that
+      // moved into the section with them (Oct 7 wave B4). The Step 18
       // dispatch imperative stays carved too — pasting that literal into the
       // skeleton (correctly) fails this guard; the skeleton speaks of "the
       // /document-release subagent", never the carved imperative.
       mustMoveToSection: [
-        'gh pr create --base',
-        'gh pr edit --title',
+        'gstack-post pr-create --base',
+        'gstack-post pr-title',
+        'gstack-pr-title-rewrite.sh <new-version> --stdin',
         'Dispatch /document-release as a subagent',
       ],
       // ship is operational (multi-STOP, not a plan review); no single post-STOP gate.
@@ -153,7 +155,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     },
     behavioral: 'external',
     externalTest: 'test/skill-e2e-ship-section-loading.test.ts',
-    maxSkeletonBytes: 79_300, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 78_275
+    maxSkeletonBytes: 81_000, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 78_275. + gate integrity (HONEST_WORK_GATE_INTEGRITY W3): Step 16 stage 4 ZERO-RUN/unknown receipt rows, stage 5 honesty inventory, Step 17 open-gate ready-PR gate; measured 80,540 (2026-10-10).
     minUnionBytes: 181_000, // token-reduction Phases 1-2 (v1.69.x branch); measured union 201,464
     mustContain: ['VERSION', 'CHANGELOG', 'review', 'merge', 'PR'],
     // v1.58.5.0: pre-push-guard install (#2077) stacks on the shared first-run-guidance preamble.
@@ -166,7 +168,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // wave's headline capability) grows the union to 1.195x. Deliberate:
     // the section is on-demand (loads only for Apple store targets), so
     // per-invocation cost for non-iOS ships is one manifest line.
-    maxSizeRatio: 1.428, // Shared advisory identity/dedup + critical-severity validation: 248,065 union bytes / 187,706 baseline = 1.3216 (2026-09-17). + test value bar in the lazy Step 7 section (value cards, weak paths, gate table, base control, machine checks; ~13.6KB): measured 1.396 (2026-09-29). + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.401 (2026-09-30). + the shared QA review step's plan-check timing rule (plan checks and their revalidation run on --timeout-ms after smoke expiry); measured 1.4022 (2026-09-30). + the shared TEST_BOOTSTRAP owned-change undo rules (s03 H1-H3, M1) and the value-bar coverage wording (s03 M2/M3); measured 1.4044 (2026-10-02). + severe fix wave ship-review lane: G1 NO_VERSION dispatch, title and CHANGELOG arms (versionless repos ship without inventing a version), F1 parent-side plan binding before the audit dispatch (binding, docs/designs candidates, exact not-run line) and D3's data-not-instructions line; +2,126 union bytes, measured 1.4135 (2026-10-03). + INV-1 consumer lines (outside review `unverified`/`unavailable` is missing coverage in the readiness note and PR body); measured 1.4148 (2026-10-03). + v1.91.19.0 severe fix wave: verdict-form outside-review callers with sandbox preflight and first-use notice (INV-1/B1/Q2), P0/P1 gate and unverified wording, bound-plan discovery (F1), visible LEARNINGS failures (B5), carved external pointers; measured 267,752 / 187,706 = 1.4264 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 267,874 / 187,706 = 1.4271 (2026-10-04).
+    maxSizeRatio: 1.6690, // Shared advisory identity/dedup + critical-severity validation: 248,065 union bytes / 187,706 baseline = 1.3216 (2026-09-17). + test value bar in the lazy Step 7 section (value cards, weak paths, gate table, base control, machine checks; ~13.6KB): measured 1.396 (2026-09-29). + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.401 (2026-09-30). + the shared QA review step's plan-check timing rule (plan checks and their revalidation run on --timeout-ms after smoke expiry); measured 1.4022 (2026-09-30). + the shared TEST_BOOTSTRAP owned-change undo rules (s03 H1-H3, M1) and the value-bar coverage wording (s03 M2/M3); measured 1.4044 (2026-10-02). + severe fix wave ship-review lane: G1 NO_VERSION dispatch, title and CHANGELOG arms (versionless repos ship without inventing a version), F1 parent-side plan binding before the audit dispatch (binding, docs/designs candidates, exact not-run line) and D3's data-not-instructions line; +2,126 union bytes, measured 1.4135 (2026-10-03). + INV-1 consumer lines (outside review `unverified`/`unavailable` is missing coverage in the readiness note and PR body); measured 1.4148 (2026-10-03). + v1.91.19.0 severe fix wave: verdict-form outside-review callers with sandbox preflight and first-use notice (INV-1/B1/Q2), P0/P1 gate and unverified wording, bound-plan discovery (F1), visible LEARNINGS failures (B5), carved external pointers; measured 267,752 / 187,706 = 1.4264 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 267,874 / 187,706 = 1.4271 (2026-10-04). + Oct 6 fix wave: quota_exhausted preflight branch (#3051) and quoted-heredoc issue template (#3046); measured 268,199 / 187,706 = 1.4288 (2026-10-06). + Step 10's inline no-PR check before the Greptile dispatch (#3020); measured 268,655 / 187,706 = 1.4313 (2026-10-06). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 275,422 / 187,706 = 1.4673 (2026-10-06). Combined Oct 6 wave head (B free-text files + D measure loop + A rework): measured 280,363 / 187,706 = 1.4936 (2026-10-06). + gate-once push rule (no second paid gate after a CI push); measured 280,573 / 187,706 = 1.4947 (2026-10-06). + the measurement bar's decision step (exit-code branches for MEETS, MEETS-qualified, needs-classify with the qualifying and fix-round classes, EXTEND once; the measure prose was tightened to offset most of it); measured 281,058 / 187,706 = 1.4973 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 281,438 / 187,706 = 1.4994 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; measured 281,556 / 187,706 = 1.5000 (2026-10-07). + Oct 7 wave B4: /ship publishes through gstack-post (title prepared in a file in the pr-body section, compose block plus gstack-post exit-code branches replacing the two scans); measured 281,894 / 187,706 = 1.5018 (2026-10-07). + B2 early Greptile PR (lazy Step 6.5 section: detect, public-repo consent, push, provisional title file, open; Step 10's bounded wait; the stop-leaves-the-draft rule); measured 286,626 / 187,706 = 1.5270 (2026-10-07). B3, the classifier, B4 and B2 merged: measured 287,128 / 187,706 = 1.5297 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; measured 281,370 / 187,706 = 1.4990 (2026-10-07). Merged with the guard area: measured 287,440 / 187,706 = 1.5313 (2026-10-07). + Oct 8 wave: the defensive-security framing and fixture summary mode reach the security specialist and the Red Team (stated once in the dispatch, referenced by the Red Team); measured 288,783 / 187,706 = 1.5385 (2026-10-08). + gate integrity (HONEST_WORK_GATE_INTEGRITY W3): the shared GATE_SCAN_BLOCK in the core checklist (2.5) and after Step 7's child, the four-option gate question and record fields in 9.4, tests_ran states in Step 5, Gate edits and per-lane counts in the PR body with draft-while-open; measured 300,143 / 187,706 = 1.5990 (2026-10-10). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10). + Oct 10 multi-agent wave PR E2 (ship/sections/handoff.md: the no-PR automation handoff, with its Section-index row and STOP pointer in the skeleton), offset by tightening Steps 1–3, 12, 14–17 and 20–21 prose so the skeleton stays under 81,000 bytes (80,997); C-pregate landed 1,123 union bytes in tests.md in between; measured 308,619 / 187,706 = 1.6442 on the integrated tree (2026-10-10). + next-wave Lane D (GBRA-40 item 12): the pr-body Issue links step (promotion candidates and `fix #N`, owner-confirmed Supersedes/credit, `--author` for app-identity gh, lookup failures, ISSUE_LINKS_MISSING) and the handoff's issue-links run, with the `## Issues` placeholder shortened; Step 15's `Fixes:` trailer rule offset by tightening Step 15 so the skeleton stays at 80,998; measured 309,483 / 187,706 = 1.6488 (2026-10-14). + GSTA-61 Capy merge asks: the on-demand capy-pr section (What changed with before/after images, Why, Approvals; loads only when Step 19 prints CAPY_PR: on, so a non-Capy ship pays one manifest line and the three-line CAPY_PR check); measured 313,265 / 187,706 = 1.6689 (2026-10-20).
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
@@ -184,12 +186,12 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
         // Fork port wave 2 (#703): the repo-doc-preference block in the design
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
-    maxSkeletonBytes: 80_850, // + depth-specific output and 0H/0I feasibility boundary clarity + the Aside probe's failure reason; measured 80,111. + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 80,649 (2026-09-30); + the same guard in the CEO spec-review metrics block; measured 80,812 (2026-09-30).
+    maxSkeletonBytes: 81_000, // + depth-specific output and 0H/0I feasibility boundary clarity + the Aside probe's failure reason; measured 80,111. + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 80,649 (2026-09-30); + the same guard in the CEO spec-review metrics block; measured 80,812 (2026-09-30). + Oct 10 multi-agent wave PR D1 (reality rows): the 0A/0B reality-rows block (bin command, tier 1 row ids, the REALITY: line grammar, the unattended rule); measured skeleton 80,916 (2026-10-10).
     minUnionBytes: 123_600, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 137,346
     mustContain: ['SCOPE EXPANSION', 'SELECTIVE EXPANSION', 'HOLD SCOPE', 'SCOPE REDUCTION'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
     // prose replacing the smaller opt-in question) lands this ~5.2% over baseline.
-    maxSizeRatio: 1.081, // + the Aside probe's failure reason; measured 1.0803
+    maxSizeRatio: 1.0880, // + the Aside probe's failure reason; measured 1.0803 + Oct 10 multi-agent wave PR D1 (reality rows): 0A/0B block in the skeleton, the Reality rows required output, the Completion Summary row and the checklist row; measured 165,042 / 151,747 = 1.0876 (2026-10-10).
   },
   'plan-eng-review': {
     skill: 'plan-eng-review',
@@ -221,7 +223,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // 1.08 → 1.10: the scope-gate exceptions block (+ its adversarial-review
     // hardening: host-anchored mode signal, precedence, passing-mention
     // guards) and the plan-mode preamble reword land the union at 1.092.
-    maxSizeRatio: 1.175, // + clarity rules for saved decisions/setup gates + the Aside probe's failure reason; measured 1.1504. + test value bar and Tests to Retire in the lazy Test review section (~2.6KB); measured 1.168 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.173 (2026-09-30). + v1.91.12.0 merge of #2999 (headless rule: a disallowed question tool never qualifies) with #3002; measured 1.1741 (2026-10-01).
+    maxSizeRatio: 1.2196, // + clarity rules for saved decisions/setup gates + the Aside probe's failure reason; measured 1.1504. + test value bar and Tests to Retire in the lazy Test review section (~2.6KB); measured 1.168 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.173 (2026-09-30). + v1.91.12.0 merge of #2999 (headless rule: a disallowed question tool never qualifies) with #3002; measured 1.1741 (2026-10-01). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 146,905 / 124,597 = 1.1790 (2026-10-06). Combined Oct 6 wave head (A and B): measured 147,524 / 124,597 = 1.1840 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 147,693 / 124,597 = 1.1854 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; measured 147,752 / 124,597 = 1.1858 (2026-10-07). + fix wave PR D: the prerequisite offer is skipped in spawned/headless sessions (#1958); measured 147,864 / 124,597 = 1.1867 (2026-10-07). + Oct 10 multi-agent wave PR D1 (reality rows): the Scope Challenge reality-rows block, the deep incident table (18 rows, each tied to the incident that earned it), the Completion summary line and the checklist row; measured 151,423 / 124,597 = 1.2153 (2026-10-10). + #280: the Design Doc Check finds the CEO plan (`gstack-ceo-plan-find`) and names it in the data rule, +325 bytes on main's 151,630; measured 151,955 / 124,597 = 1.2196 (2026-10-12). Fix wave PR 4 (owner-approved raise 1.2170 → 1.2196): #3182's timer-bounded native fallback (net −17 bytes) plus #280's cross-branch rule, offset by tightening the Design Doc Check; measured 151,950 / 124,597 = 1.2195 (2026-10-15).
   },
   'plan-design-review': {
     skill: 'plan-design-review',
@@ -243,7 +245,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // tier-2+ skeleton (measured 89,184). Main's v1.64.0.0 adds ~340 B more
     // (telemetry --error-message/--failed-step preamble prose, PR #769).
     // Budget covers the sum of both waves.
-    maxSkeletonBytes: 80_500, // Harness-aware outside voice: validated dispatch and provenance. + v1.91.19.0 wave: design --version probe (B4) and verdict-form outside voice (INV-1) on top of v1.91.17.0's round accounting (#3022); measured 80,443 (2026-10-03).
+    maxSkeletonBytes: 85_900, // Harness-aware outside voice: validated dispatch and provenance. + v1.91.19.0 wave: design --version probe (B4) and verdict-form outside voice (INV-1) on top of v1.91.17.0's round accounting (#3022); measured 80,443 (2026-10-03). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); skeleton measured 84,669 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; skeleton measured 84,804 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; skeleton measured 84,863 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; skeleton measured 84,748 (2026-10-07). Merged with the guard area: measured skeleton 84,945 (2026-10-07). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 99_200, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,293
     mustContain: ['design', 'visual'],
     maxSizeRatio: 1.12, // D1 1.104 + main's ~0.008
@@ -348,10 +350,10 @@ do not launch the downstream skill or open a browser.`,
     // the #538 opt-out + D1 evidence directive — ratio 1.104 measured.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 89_700, // Office-hours + sketch outside voices include host guards and completion checks. + v1.91.19.0 wave: Q<N> open-question prose form (#2729, approved Q3), DESIGN_READY --version probe (B4), Aside ~/.local/bin fallback (E7), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting (#3022) merged in; measured 89,684 (2026-10-03).
+    maxSkeletonBytes: 95_900, // Office-hours + sketch outside voices include host guards and completion checks. + v1.91.19.0 wave: Q<N> open-question prose form (#2729, approved Q3), DESIGN_READY --version probe (B4), Aside ~/.local/bin fallback (E7), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting (#3022) merged in; measured 89,684 (2026-10-03). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); skeleton measured 92,590 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; skeleton measured 92,869 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; skeleton measured 92,930 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; skeleton measured 92,756 (2026-10-07). Merged with the guard area: measured skeleton 93,099 (2026-10-07). + fix wave PR D: the Phase 4.5 builder-profile read before the session log (#2801) and the pre-telemetry design-doc check (#1049); measured skeleton 94,877 (2026-10-07). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 115_800, // Phase 4 wave 4; measured union 118,175
     mustContain: ['design doc', 'problem statement'],
-    maxSizeRatio: 1.12,
+    maxSizeRatio: 1.1800, // + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 149,758 / 131,110 = 1.1422 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 150,037 / 131,110 = 1.1444 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; measured 150,098 / 131,110 = 1.1448 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; measured 150,011 / 131,110 = 1.1442 (2026-10-07). Merged with the guard area: measured 150,354 / 131,110 = 1.1468 (2026-10-07). + fix wave PR D: builder-profile read before the session log with Phase 6 using the carried values (#2801), the inline design doc before approval (#879) and the pre-telemetry design-doc check (#1049); measured 153,206 / 131,110 = 1.1685 (2026-10-07). + empty LAST_ASSIGNMENT/LAST_PROJECT guards in the welcome_back and regular greetings (backfilled profiles); measured 153,469 / 131,110 = 1.1705 (2026-10-08). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
   },
   'document-release': {
     skill: 'document-release',
@@ -411,7 +413,7 @@ do not launch the downstream skill or open a browser.`,
     // eureka log, the office-hours lookup and the taste-profile read; measured
     // 1.0834 (2026-09-30). + named design-direction defaults to avoid in the native
     // subagent prompt (s02 H4a); measured 1.0911 (2026-10-02).
-    maxSizeRatio: 1.112, // + v1.91.19.0 wave: design --version probe (B4), taste-profile load (F3), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting and board/approval blocks (#3022) merged in; measured 100,446 / 90,375 = 1.1114 (2026-10-03).
+    maxSizeRatio: 1.1600, // + v1.91.19.0 wave: design --version probe (B4), taste-profile load (F3), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting and board/approval blocks (#3022) merged in; measured 100,446 / 90,375 = 1.1114 (2026-10-03). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 103,384 / 90,375 = 1.1439 (2026-10-06). + Oct 7 wave B6: Aside rules 1, 4, 6 and 7 (offer a target-origin tab before openTab, a second sign-in wall means a tab- or URL-bound session, no early-return hint, fast [ok without the sentinel is an abort); measured 103,576 / 90,375 = 1.1461 (2026-10-07). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 103,522 / 90,375 = 1.1455 (2026-10-07). Both merged: measured 103,726 / 90,375 = 1.1477 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; measured 103,466 / 90,375 = 1.1449 (2026-10-07). Merged with the guard area: measured 103,804 / 90,375 = 1.1486 (2026-10-07). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
   },
   cso: {
     skill: 'cso',
@@ -447,7 +449,7 @@ do not launch the downstream skill or open a browser.`,
     // The full-audit E2E asserts actual section loading alongside report/proof behavior.
     behavioral: 'external',
     externalTest: 'test/skill-e2e-cso.test.ts',
-    maxSkeletonBytes: 18_000,
+    maxSkeletonBytes: 18_100, // + Oct 10 multi-agent wave PR D2 (sideways review): Phase 12's root-cause-variants sentence becomes the sibling sweep (severity follows the worst sibling), two neighbouring phrases tightened to offset most of it; measured skeleton 18,044 (2026-10-10).
     minUnionBytes: 30_000, // v3 deliberately removes the shared export/startup preamble.
     mustContain: ['OWASP', 'STRIDE', 'daily', 'comprehensive', 'verif'],
     // Existing baseline comparison remains an upper bound; absolute limits above
@@ -482,10 +484,10 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: undefined, // operational multi-STOP skill, like ship
     },
     behavioral: 'plan',
-    maxSkeletonBytes: 74_881, // Shared-code identity/skip/action rules + critical-severity validation; measured 74,493 (2026-09-17). + v1.91.12.0 merge of #2999 (review clarity repairs: await reads, research alongside dispatch, /review deadline and setup authority, findings sources) with #3002 (guarded state-root lines, plan-check checkpoints); each fit alone; measured 74,881 (2026-10-01).
+    maxSkeletonBytes: 80_900, // Shared-code identity/skip/action rules + critical-severity validation; measured 74,493 (2026-09-17). + v1.91.12.0 merge of #2999 (review clarity repairs: await reads, research alongside dispatch, /review deadline and setup authority, findings sources) with #3002 (guarded state-root lines, plan-check checkpoints); each fit alone; measured 74,881 (2026-10-01). + Oct 8 wave: shared voice directive bans "load-bearing" and adds the reply-language rule, offset by tightening the bounded closer (net +17 bytes per tier-2+ skill); measured 74,884 (2026-10-08). + gate integrity (HONEST_WORK_GATE_INTEGRITY W2): Step 3.5 Diff scans with the shared GATE_SCAN_BLOCK, the Step 4 carry, the four-option `review-gate-disposition` question in 5c, gate record fields in 5.8 and the Gate edits report line; measured 80,054 (2026-10-10). + Oct 10 multi-agent wave PR D2 (sideways review): Step 4's enum-only paragraph becomes the sideways sweep with the forced-CRITICAL list, plus the flake-fix number sentence in the Gate Integrity paragraph; measured skeleton 80,812 (2026-10-10).
     minUnionBytes: 89_000, // Phase 4 wave 1; measured union 93,357
     mustContain: ['confidence', 'P1', 'P2', 'Review Army', 'adversarial'],
-    maxSizeRatio: 1.199, // Shared-code feature + critical-severity validation: 128,042 union bytes / 108,523 baseline = 1.1799; preserves content floors. + v1.91.12.0 merge of #2999 (above, plus plan-completion fallback intent and specialist checklist-by-path) with #3002; measured 1.1843 (2026-10-01). + v1.91.19.0 wave: verdict-form Codex callers with sandbox preflight (INV-1/B1), P0/P1 structured gate (B1b), bound-plan discovery and data-not-instructions guard (F1/D3), visible LEARNINGS failures (B5); measured 129,941 / 108,523 = 1.1974 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 130,025 / 108,523 = 1.1981 (2026-10-04).
+    maxSizeRatio: 1.2960, // Shared-code feature + critical-severity validation: 128,042 union bytes / 108,523 baseline = 1.1799; preserves content floors. + v1.91.12.0 merge of #2999 (above, plus plan-completion fallback intent and specialist checklist-by-path) with #3002; measured 1.1843 (2026-10-01). + v1.91.19.0 wave: verdict-form Codex callers with sandbox preflight (INV-1/B1), P0/P1 structured gate (B1b), bound-plan discovery and data-not-instructions guard (F1/D3), visible LEARNINGS failures (B5); measured 129,941 / 108,523 = 1.1974 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 130,025 / 108,523 = 1.1981 (2026-10-04). + Oct 6 fix wave: quota_exhausted preflight branch (#3051); measured 130,359 / 108,523 = 1.2012 (2026-10-06). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 131,314 / 108,523 = 1.2100 (2026-10-06). Combined Oct 6 wave head (A and B): measured 131,966 / 108,523 = 1.2160 (2026-10-06). + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 132,199 / 108,523 = 1.2182 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; measured 132,258 / 108,523 = 1.2187 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site; measured 132,233 / 108,523 = 1.2185 (2026-10-07). Merged with the guard area: measured 132,522 / 108,523 = 1.2211 (2026-10-07). + Oct 8 wave: the defensive-security framing and fixture summary mode reach the security specialist and the Red Team (stated once in the dispatch, referenced by the Red Team); measured 133,902 / 108,523 = 1.2339 (2026-10-08). + gate integrity W2 (above); measured 1.282 (2026-10-10). + Oct 10 multi-agent wave PR D2 (sideways review): sideways sweep and flake-fix number in Step 4; `Diff read` and `Undeclared behavior changes` in the review-mode Scope Check (plan-completion section); measured 140,497 / 108,523 = 1.2946 (2026-10-10).
   },
   codex: {
     skill: 'codex',
@@ -510,7 +512,7 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: 'EXIT PLAN MODE GATE',
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 59_350, // + v1.78 AUQ spawned-trigger objectivity; generated Codex overlay measured 59,307
+    maxSkeletonBytes: 60_200, // + v1.78 AUQ spawned-trigger objectivity; generated Codex overlay measured 59,307 + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 83_400, // Phase 4 wave 1; measured union 84,304
     mustContain: ['GATE: PASS', 'CROSS-MODEL ANALYSIS', 'codex exec resume', 'sandbox_mode="read-only"', 'mktemp'],
     maxSizeRatio: 1.06, // measured 1.040 vs the v1.64.1.0 parity baseline
@@ -537,7 +539,7 @@ do not launch the downstream skill or open a browser.`,
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 74_500, // + Aside browser contract for Step 7 canary ({{ASIDE_SETUP}}); measured 73_523
-    maxSizeRatio: 1.100, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077. + both untrusted-content marker formats in the browser fallback (W7f) + the readiness gate's project test command and live eval-store paths (s06 H6/H7); measured 1.1076 (2026-10-02). Re-measured 1.0943 (2026-10-03); cap = measured + 0.005 headroom.
+    maxSizeRatio: 1.1120, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077. + both untrusted-content marker formats in the browser fallback (W7f) + the readiness gate's project test command and live eval-store paths (s06 H6/H7); measured 1.1076 (2026-10-02). Re-measured 1.0943 (2026-10-03); cap = measured + 0.005 headroom. + Oct 7 wave B6: Aside rules 1, 4, 6 and 7 (offer a target-origin tab before openTab, a second sign-in wall means a tab- or URL-bound session, no early-return hint, fast [ok without the sentinel is an abort); measured 115,226 / 104,578 = 1.1018 (2026-10-07). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 91_000, // Phase 4 wave 1; estimated union ~94.9KB
     mustContain: ['readiness', 'merge', 'canary', 'revert', 'staging'],
   },
@@ -568,14 +570,14 @@ do not launch the downstream skill or open a browser.`,
         'DX DUAL VOICES — CONSENSUS TABLE:',
         '## Implementation Tasks aggregator',
       ],
-      gateAfterStop: 'AskUserQuestion options:',
+      gateAfterStop: 'Write `$_AP/gate.json`',
     },
     // The retired skill-e2e-autoplan-chain was its only section-read proof.
     behavioral: 'none',
     maxSkeletonBytes: 70_000, // Phase-specific outside coverage, native fallback, and harness guard.
     minUnionBytes: 85_000, // measured union 86,926
     mustContain: ['6 Decision Principles', 'TASTE DECISION', 'USER CHALLENGE', 'consensus', 'Restore Point'],
-    maxSizeRatio: 1.12, // Four validated outside invocations replace raw CLI calls; phases keep independent coverage.
+    maxSizeRatio: 1.1490, // Four validated outside invocations replace raw CLI calls; phases keep independent coverage. + Oct 7 wave B3: the Codex probe runs as a command (select-model capture lines, check-sandbox/probe-model/run-with-timeout subcommands) instead of being sourced; measured 114,297 / 101,979 = 1.1208 (2026-10-07). + Oct 7 wave CEO-28/DX-11: review prompts ask for a severity per finding and design proposals use the proposal gate; measured 114,533 / 101,979 = 1.1231 (2026-10-07). + Oct 7 wave guard (CEO-20): conditional `run_in_background` request plus the background-run recovery at each foreground dispatch site, and phase-close publishing each report with the `true autoplan-published <phase>` no-op before the next phase entry in a later message (CEO-1); measured 114,320 / 101,979 = 1.1210 (2026-10-07). Merged with the guard area: measured 115,149 / 101,979 = 1.1291 (2026-10-07). + Oct 8 wave (permission cards after a background reviewer): Step 1 puts RESTORE_PATH, and so every phase artifact, in the project's git-excluded `.gstack/tmp/autoplan/`, which Claude Code reads without a card after the skill turn ends; measured 115,270 / 101,979 = 1.1303 (2026-10-08). + fix wave PR D: the prerequisite offer is skipped in spawned/headless sessions (#1958); measured 115,267 / 101,979 = 1.1303 (2026-10-07). Both merged: measured 115,126 / 101,979 = 1.1289 (2026-10-08). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10). + Oct 10 multi-agent wave B9/B10/B12: Phase 0 ESTIMATE and the phase-close timing record, the final gate as a gate list (`gstack-gate render/parse`, stable ids, gate_rev) and the URGENT block above the summary, offset by tightening the Phase 4 prose and the tasks-section; measured 114,980 / 101,979 = 1.1275 (2026-10-10). + Oct 10 multi-agent wave PR D1 (reality rows): the reality-rows check line in the CEO and Eng phase files, the Pre-Gate rule (unattended miss is `incomplete`, never a warning) and the two Pre-Gate cells; measured 117,042 / 101,979 = 1.1477 (2026-10-10).
   },
   spec: {
     skill: 'spec',
@@ -596,7 +598,7 @@ do not launch the downstream skill or open a browser.`,
       mustMoveToSection: [
         '<<<USER_SPEC>>>',
         'SEMANTIC_REVIEW: clean',
-        'gh issue create --title',
+        'gstack-post issue-create',
         'PIN_SHA=$(git rev-parse HEAD)',
       ],
       gateAfterStop: undefined,
@@ -604,6 +606,7 @@ do not launch the downstream skill or open a browser.`,
     behavioral: 'prompt',
     maxSkeletonBytes: 58_400, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 57_356
     minUnionBytes: 64_500, // measured union 67,430
+    maxSizeRatio: 1.07, // Oct 10 multi-agent wave PR E2: the lazy gate-and-file section renders {{COORDINATOR_CONTRACT}} (the block every spawned lane inherits word for word; `gstack-autoplan contract` prints the same bytes) before the --execute spawn pipe; measured 86,614 / 81,577 = 1.0617 after the contract became a fail-closed `CONTRACT=$(…)` capture (2026-10-10). The skeleton is unchanged (57,107).
     mustContain: ['HARD GATE', 'dedupe', 'quality gate', 'acceptance criteria', 'archive'],
   },
   'setup-gbrain': {
@@ -668,7 +671,7 @@ do not launch the downstream skill or open a browser.`,
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 63_500, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} (replaces the browse setup block); measured 61_253
-    maxSizeRatio: 1.1102, // + v1.81 Aside contract + gstack-browser fallback block (1.080 on v1.91.7.0) + the shared test value bar at 8a.5 ({{TEST_VALUE_BAR:qa}}); measured 1.094 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.101 (2026-09-30) + v1.91.12.0 merge of #2999 (await scope/method Reads, capture --after checkpoints, browser-only empty evidence list) with #3002; measured 1.1028 (2026-10-01). + both untrusted-content marker formats in the browser fallback (W7f); measured 1.1035 (2026-10-02). Re-measured 1.1038 after the W8 probe-loop renames (2026-10-03); the cap already matches. + the annotate-every-capture and superseded rule before materialize (a ship-exploratory-late-input run published evidence that omitted older-snapshot captures); measured 1.1064 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 93,282 / 84,049 = 1.1099 (2026-10-04). + reliability follow-ups C2 from GSTA-21's branch (feasible 180 s Browser Quick, the /qa outcome filename fields and measured timing fields the qa-only judge named; 10/10 judge passes vs 7/10 before), with its trims; measured 93,303 / 84,049 = 1.11010 (2026-10-05).
+    maxSizeRatio: 1.1420, // + v1.81 Aside contract + gstack-browser fallback block (1.080 on v1.91.7.0) + the shared test value bar at 8a.5 ({{TEST_VALUE_BAR:qa}}); measured 1.094 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.101 (2026-09-30) + v1.91.12.0 merge of #2999 (await scope/method Reads, capture --after checkpoints, browser-only empty evidence list) with #3002; measured 1.1028 (2026-10-01). + both untrusted-content marker formats in the browser fallback (W7f); measured 1.1035 (2026-10-02). Re-measured 1.1038 after the W8 probe-loop renames (2026-10-03); the cap already matches. + the annotate-every-capture and superseded rule before materialize (a ship-exploratory-late-input run published evidence that omitted older-snapshot captures); measured 1.1064 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 93,282 / 84,049 = 1.1099 (2026-10-04). + reliability follow-ups C2 (judge-named gaps after trimming the added wording: feasible 180 s Browser Quick, PROBE_DIR's source line, stop goes to the §4 report, written JSON keeps full card values; lane S's {user}/timing fields); measured 93,311 / 84,049 = 1.11020 (2026-10-04). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); measured 94,486 / 84,049 = 1.1242 (2026-10-06). + Oct 7 wave B6: Aside rules 1, 4, 6 and 7 (offer a target-origin tab before openTab, a second sign-in wall means a tab- or URL-bound session, no early-return hint, fast [ok without the sentinel is an abort); measured 94,681 / 84,049 = 1.1265 (2026-10-07). + Oct 8 wave: shared voice directive bans "load-bearing" and adds the reply-language rule, offset by tightening the bounded closer (net +17 bytes per tier-2+ skill); measured 94,736 / 84,049 = 1.12715 (2026-10-08). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 69_500, // measured union 70,385
     // 'aside repl' pins the Aside contract; '$B goto' pins the fallback block in the always-loaded skeleton.
     mustContain: ['bug', 'aside repl', '$B goto', 'fix', 'Health Score Rubric', 'regression'],
@@ -705,7 +708,7 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 32_000, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} skeleton + the STOP-Read pointer; measured 29_986
+    maxSkeletonBytes: 34_700, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} skeleton + the STOP-Read pointer; measured 29_986 + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); skeleton measured 32,532 (2026-10-06). + Oct 7 wave B6: Aside rules 1, 4, 6 and 7 (offer a target-origin tab before openTab, a second sign-in wall means a tab- or URL-bound session, no early-return hint, fast [ok without the sentinel is an abort), and the cookbook's silent-failure list and signed-in-tab recipe (the rule details live here, not in every browsing skill); skeleton measured 34,047 (2026-10-07). + Oct 8 wave: the tier-1 voice directive bans "load-bearing" and adds the reply-language rule (tier 1 has no closer to tighten: +158 bytes); skeleton measured 34,209 (2026-10-08). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 36_000, // skeleton + command-list section (14,240); measured union ~38.5 KB
     // 'BEGIN/END UNTRUSTED EXTERNAL' pins the untrusted-content warning in the
     // command reference; 'aside repl' pins the Aside contract in the skeleton.
@@ -756,7 +759,7 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: undefined, // operational skill, no plan-mode gate
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 55_400, // measured 55,262 (2026-09-09): the detector install offer pointer + its sections-table row (the brief itself lives in sections/detector-install-offer.md); before that 54,545 for the review-cycle trust prose, the Slop Gate's Decisions-Log clause, and the blacklist header's override sentence
+    maxSkeletonBytes: 56_200, // measured 55,262 (2026-09-09): the detector install offer pointer + its sections-table row (the brief itself lives in sections/detector-install-offer.md); before that 54,545 for the review-cycle trust prose, the Slop Gate's Decisions-Log clause, and the blacklist header's override sentence + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 57_500, // Phase 4 wave 4; measured union 58,682
     mustContain: ["Don't make me think", "Users scan, they don't read", 'The Goodwill Reservoir', 'PRETEXT API CHEATSHEET', 'Pattern 3: Text around obstacles'],
   },
@@ -783,9 +786,48 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 55_200, // + v2.0 preamble growth (merged); measured 52_962 + v1.91.19.0 wave: design --version probe (B4) and taste profile (F3) on top of v1.91.17.0's claim-based staging and round accounting (#3022); measured 55,168 (2026-10-03).
+    maxSkeletonBytes: 57_800, // + v2.0 preamble growth (merged); measured 52_962 + v1.91.19.0 wave: design --version probe (B4) and taste profile (F3) on top of v1.91.17.0's claim-based staging and round accounting (#3022); measured 55,168 (2026-10-03). + Oct 6 fix wave A3/CEO-12: free text reaches commands only through agent-written mktemp files (mktemp block, write rule, path rebuild and refusal at each posting, prompt and brief site); skeleton measured 56,880 (2026-10-06). + Honest Work wave merged (W2/W3 gate integrity in review/ship, W4 kernel + DONE line in every tier-2+ skill, W5/W7 in spec/ship): re-measured on the integrated tree (2026-10-10).
     minUnionBytes: 53_200, // Phase 4 wave 4; measured union 54,290
     mustContain: ["Don't make me think", "Users scan, they don't read", 'trunk test', '44px minimum'],
+  },
+
+  // ── Multi-agent wave PR D3 (2026-10-10): investigate recipes carve ──
+  // Five lazy recipes (flake, polluter, race, eval-bisect, backlog) read when
+  // the Phase 2 pattern or the --backlog argument matches; Phases 1–5, the
+  // Iron Law and the Scope Lock stay always-loaded.
+  investigate: {
+    skill: 'investigate',
+    expectedSections: ['flake.md', 'polluter.md', 'race.md', 'eval-bisect.md', 'backlog.md'],
+    requiredReads: ['flake.md'],
+    scenario:
+      'Walk /investigate in SIMULATION — do not run bash, edit files or acquire a freeze lock. The symptom: test/widget.test.ts fails in CI about one run in eight ("expected 3 events, got 2") and passes locally every time; the PR under review only touched src/widget.ts. Do NOT use AskUserQuestion. Read each pointed section before doing its step, apply the matching recipe, and report the investigation plan: what you would run on main and on the branch, the forced probe, and the exact `## Flake evidence` section you would require in the PR body. Stop before Phase 4.',
+    staticInvariants: {
+      mustStayInSkeleton: [
+        '## Iron Law',
+        '## Arguments',
+        '## Phase 1: Root Cause Investigation',
+        '## Scope Lock',
+        '## Phase 3: Hypothesis Testing',
+        '## Phase 5: Verification & Report',
+        'git update-index --refresh',
+      ],
+      mustPrecedeStop: ['## Arguments'],
+      mustMoveToSection: [
+        '## Flake recipe',
+        '## Polluter recipe',
+        '## Race recipe',
+        '## Eval bisect recipe',
+        '## Backlog mode (`/investigate --backlog`)',
+        '## Flake evidence',
+        'ship-measure.ts free --files',
+      ],
+      gateAfterStop: undefined, // operational skill, no plan-mode gate
+    },
+    behavioral: 'prompt',
+    maxSkeletonBytes: 52_000, // D3 carve: Arguments table, Section index, Phase 1 call-site and update-index additions, five STOP pointers; measured 51,532 (2026-10-10)
+    minUnionBytes: 55_000, // D3 carve: skeleton + five recipes; measured union 61,513 (2026-10-10)
+    mustContain: ['root cause', 'hypothes', 'Flake evidence', 'still_open', 'already_fixed', 'P(fail | regression)'],
+    maxSizeRatio: 1.12, // the monolith's cap (parity-harness MONOLITH_INVARIANTS before the carve); measured 61,513 / 60,600 = 1.0151 (2026-10-10)
   },
 };
 

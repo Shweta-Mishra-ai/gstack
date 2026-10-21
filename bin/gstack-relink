@@ -461,19 +461,26 @@ done
 # (in place, like gstack-patch-names). Clearing the list restores the committed
 # bytes. Only a generated router is rewritten, and only from a checkout that
 # carries the generator; a failed render keeps the current router.
+# plan_mode_preamble=off (#3168) renders it without the plan-mode preamble the
+# same way, and turning it back on restores the committed bytes.
 _ROUTER="$INSTALL_DIR/SKILL.md"
 _GEN_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
-if { [ "$DISABLED" != " " ] || grep -q '^Disabled on this install' "$_ROUTER" 2>/dev/null; } \
+_PLAN_MODE_ARG=""
+[ "$("$GSTACK_CONFIG" get plan_mode_preamble 2>/dev/null || true)" != off ] || _PLAN_MODE_ARG="--plan-mode=off"
+if { [ "$DISABLED" != " " ] || grep -q '^Disabled on this install' "$_ROUTER" 2>/dev/null \
+    || [ -n "$_PLAN_MODE_ARG" ] \
+    || { grep -q 'PLAN MODE EXCEPTION' "$_ROUTER" 2>/dev/null && ! grep -q '^## Plan Mode Safe Operations' "$_ROUTER" 2>/dev/null; }; } \
   && grep -q '<!-- AUTO-GENERATED from' "$_ROUTER" 2>/dev/null && [ -f "$_GEN_SRC/scripts/gen-skill-docs.ts" ]; then
   _ROUTER_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gstack-router.XXXXXX")" || _ROUTER_TMP=""
   _DISABLED_CSV="$(printf '%s' "$DISABLED" | xargs | tr ' ' ',')"
   if [ -n "$_ROUTER_TMP" ] && command -v bun >/dev/null 2>&1 \
-    && (cd "$_GEN_SRC" && bun run scripts/gen-skill-docs.ts --host claude --out-dir "$_ROUTER_TMP" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} >/dev/null 2>&1) \
+    && (cd "$_GEN_SRC" && bun --no-env-file --config=/dev/null run scripts/gen-skill-docs.ts --host claude --out-dir "$_ROUTER_TMP" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} ${_PLAN_MODE_ARG:+"$_PLAN_MODE_ARG"} >/dev/null 2>&1) \
     && [ -s "$_ROUTER_TMP/SKILL.md" ] && cp "$_ROUTER_TMP/SKILL.md" "$_ROUTER.tmp.$$" && mv "$_ROUTER.tmp.$$" "$_ROUTER"; then
+    _link_root_skill_alias
     [ -n "$_DISABLED_CSV" ] && echo "Router: disabled skills left out of $_ROUTER"
   else
     rm -f "$_ROUTER.tmp.$$"
-    echo "gstack-relink: could not re-render the router for disabled_skills (bun missing or generation failed); $_ROUTER still lists every skill. Fix: install Bun, then run $0" >&2
+    echo "gstack-relink: could not re-render the router for disabled_skills or plan_mode_preamble (bun missing or generation failed); $_ROUTER is unchanged. Fix: install Bun, then run $0" >&2
   fi
   [ -z "$_ROUTER_TMP" ] || rm -rf "$_ROUTER_TMP"
 fi

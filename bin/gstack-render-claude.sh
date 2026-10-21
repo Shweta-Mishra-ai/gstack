@@ -9,9 +9,14 @@
 # upgrade falls back to `claude` with the reason printed.
 #
 # Each render keeps a plain-text activation record beside it
-# (<render dir>.overlay: overlay, source, model, version, gbrain, render), so
+# (<render dir>.overlay: overlay, source, model, version, gbrain, render, and
+# plan_mode=off for a render without the plan-mode preamble), so
 # `./setup --status` and the change-only banner never need bun. No record
 # means the default `claude` overlay on the committed render.
+#
+# Callers set _PLAN_MODE_ARG to --plan-mode=off when gstack-config
+# plan_mode_preamble is off (#3168); empty or unset means on. The committed
+# files carry the preamble, so with it off the default install is rendered.
 #
 # Callers define `_swap_in_render` (setup and bin/gstack-config each keep
 # their tested copy) and may define `log` and `bun_cmd`; plain echo and bun
@@ -81,15 +86,18 @@ gstack_render_unlock() {
 
 # gstack_claude_render_action RENDER_DIR GBRAIN — what the default install's
 # render dir needs: `user` (brain-aware :user render), `plain` (pinned
-# overlay, no brain blocks), `remove` (serve the committed files) or `keep`.
+# overlay or plan-mode preamble off, no brain blocks), `remove` (serve the
+# committed files) or `keep`.
 # GBRAIN is ok, absent or unknown (detector missing or failed: no brain
-# blocks, and a render is left alone unless an overlay change needs it).
+# blocks, and a render is left alone unless an overlay or plan-mode change
+# needs it).
 gstack_claude_render_action() {
   local render_dir="$1" gbrain="$2" previous
   if [ "$gbrain" = ok ]; then _GSTACK_RENDER_ACTION=user; return 0; fi
-  if [ "$_GSTACK_OVERLAY" != claude ]; then _GSTACK_RENDER_ACTION=plain; return 0; fi
+  if [ "$_GSTACK_OVERLAY" != claude ] || [ -n "${_PLAN_MODE_ARG:-}" ]; then _GSTACK_RENDER_ACTION=plain; return 0; fi
   previous="$(gstack_claude_overlay_field "$render_dir.overlay" overlay)"
-  if [ "$gbrain" = unknown ] && [ "${previous:-claude}" = claude ]; then
+  if [ "$gbrain" = unknown ] && [ "${previous:-claude}" = claude ] \
+    && [ -z "$(gstack_claude_overlay_field "$render_dir.overlay" plan_mode)" ]; then
     _GSTACK_RENDER_ACTION=keep
   else
     _GSTACK_RENDER_ACTION=remove
@@ -102,8 +110,8 @@ gstack_claude_render_plain() {
   local src="$1" RENDER_DIR="$2" RENDER_TMP out rc=0
   RENDER_TMP="$RENDER_DIR.tmp.$$"
   rm -rf "$RENDER_TMP"
-  _gstack_render_say "Rendering Claude skills with the $_GSTACK_OVERLAY overlay into $RENDER_DIR (source checkout stays clean)..."
-  out="$(cd "$src" && _gstack_render_bun run gen:skill-docs --host claude --out-dir "$RENDER_TMP" --link-root "$RENDER_DIR" --model "$_GSTACK_OVERLAY" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} 2>&1)" || rc=$?
+  _gstack_render_say "Rendering Claude skills with the $_GSTACK_OVERLAY overlay${_PLAN_MODE_ARG:+ and no plan-mode preamble} into $RENDER_DIR (source checkout stays clean)..."
+  out="$(cd "$src" && _gstack_render_bun run gen:skill-docs --host claude --out-dir "$RENDER_TMP" --link-root "$RENDER_DIR" --model "$_GSTACK_OVERLAY" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} ${_PLAN_MODE_ARG:+"$_PLAN_MODE_ARG"} 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     rm -rf "$RENDER_TMP"
     printf '%s\n' "$out" | tail -3
@@ -150,9 +158,11 @@ gstack_claude_render_settle() {
   if [ "$render_kind" = committed ] && [ "$_GSTACK_OVERLAY_SOURCE" = default ]; then
     rm -f "$record"
   else
-    printf 'overlay=%s\nsource=%s\nmodel=%s\nversion=%s\ngbrain=%s\nrender=%s\n' \
-      "$served" "$_GSTACK_OVERLAY_SOURCE" "$_GSTACK_OVERLAY_ID" "${version:-unknown}" "$gbrain" "$render_kind" \
-      > "$record.tmp.$$" && mv "$record.tmp.$$" "$record"
+    {
+      printf 'overlay=%s\nsource=%s\nmodel=%s\nversion=%s\ngbrain=%s\nrender=%s\n' \
+        "$served" "$_GSTACK_OVERLAY_SOURCE" "$_GSTACK_OVERLAY_ID" "${version:-unknown}" "$gbrain" "$render_kind"
+      [ "$render_kind" != user ] || [ -z "${_PLAN_MODE_ARG:-}" ] || printf 'plan_mode=off\n'
+    } > "$record.tmp.$$" && mv "$record.tmp.$$" "$record"
   fi
   gstack_render_unlock "$render_dir"
   if [ "$served" != "${previous:-claude}" ]; then

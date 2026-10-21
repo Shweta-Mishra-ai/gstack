@@ -13,9 +13,9 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFile, spawnSync } from 'child_process';
 import { promisify } from 'util';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { createHash } from 'crypto';
 import { runGeneration } from '../scripts/gen-skill-docs';
 import { ALL_HOST_CONFIGS } from '../hosts/index';
@@ -45,9 +45,12 @@ function mustSh(cwd: string, cmd: string) {
 /** A directory that looks like a gstack checkout (VERSION, setup, bin/gstack-config). */
 function makeGstackLike(dir: string, git: boolean) {
   mkdirSync(join(dir, 'bin'), { recursive: true });
+  mkdirSync(join(dir, 'lib'), { recursive: true });
   writeFileSync(join(dir, 'VERSION'), '1.0.0.0\n');
   writeFileSync(join(dir, 'setup'), '#!/bin/sh\necho SETUP_RAN "$@"\n', { mode: 0o755 });
   writeFileSync(join(dir, 'bin', 'gstack-config'), '#!/bin/sh\necho false\n', { mode: 0o755 });
+  writeFileSync(join(dir, 'bin', 'gstack-autoplan'), '#!/bin/sh\necho "## Coordinator contract (fixture)"\n', { mode: 0o755 });
+  writeFileSync(join(dir, 'bin', 'gstack-ff-update'), readFileSync(join(import.meta.dir, '..', 'bin', 'gstack-ff-update')), { mode: 0o755 });
   if (git) mustSh(dir, 'git init -q -b main && git add -A && git commit -q -m init');
 }
 
@@ -90,7 +93,7 @@ async function snapshot(dir: string): Promise<string> {
   return h.digest('hex');
 }
 
-interface HostRender { host: string; upgrade: string[]; spec: string[]; localDir: string }
+interface HostRender { host: string; upgrade: string[]; spec: string[]; localDir: string; globalRoot: string }
 const hostRenders: HostRender[] = [];
 
 beforeAll(async () => {
@@ -109,7 +112,7 @@ beforeAll(async () => {
     const spec = bashFences(readFileSync(specPath, 'utf8'));
     const team = fence(upgrade, 'git rm -r --cached');
     const localDir = team.match(/git rm -r --cached (\S+)\/ /)![1];
-    hostRenders.push({ host: config.name, upgrade, spec, localDir });
+    hostRenders.push({ host: config.name, upgrade, spec, localDir, globalRoot: config.globalRoot });
   }
 });
 
@@ -179,7 +182,7 @@ describe.skipIf(IS_WINDOWS)('C9: destructive upgrade/spec fences refuse bad path
   type Kind = typeof BAD_VALUES[number];
   const UNUSABLE: Kind[] = ['unset', 'empty', 'nonexistent', 'unreadable'];
   const cases: Array<{ name: string; doc: 'upgrade' | 'spec'; marker: string; target: string; kinds?: Kind[]; others: (wd: ReturnType<typeof world>, h: HostRender) => Record<string, string> }> = [
-    { name: 'ff-only upgrade', doc: 'upgrade', marker: 'git pull --ff-only', target: 'INSTALL_DIR', others: () => ({}) },
+    { name: 'ff-only upgrade', doc: 'upgrade', marker: 'bash bin/gstack-ff-update', target: 'INSTALL_DIR', others: () => ({}) },
     { name: 'reset fallback', doc: 'upgrade', marker: 'git reset --hard origin/main', target: 'INSTALL_DIR', others: () => ({}) },
     { name: 'vendored swap', doc: 'upgrade', marker: 'git clone --depth 1', target: 'INSTALL_DIR', others: () => ({}) },
     { name: 'local copy detection', doc: 'upgrade', marker: '_RESOLVED_PRIMARY=', target: 'INSTALL_DIR', kinds: UNUSABLE, others: () => ({}) },
@@ -218,12 +221,16 @@ describe.skipIf(IS_WINDOWS)('C9: destructive upgrade/spec fences refuse bad path
   async function controls(h: HostRender): Promise<string[]> {
     const wd = world(h);
     const problems: string[] = [];
-    const ff = await run(wd, fence(h.upgrade, 'git pull --ff-only'), { INSTALL_DIR: wd.gstack });
+    const ff = await run(wd, fence(h.upgrade, 'bash bin/gstack-ff-update'), { INSTALL_DIR: wd.gstack });
     if (!ff.stdout.includes('FF_OK') || !ff.gitCalls.some(c => c.startsWith('fetch'))) problems.push(`${h.host}: ff-only upgrade did not run: ${ff.stderr}`);
     const local = join(wd.project, h.localDir);
     const team = await run(wd, fence(h.upgrade, 'git rm -r --cached'), { LOCAL_GSTACK: local });
     if (team.status !== 0 || existsSync(local)) problems.push(`${h.host}: team-mode removal did not run: ${team.stderr}`);
     mustSh(wd.project, `git worktree add -q "${join(wd.w, 'wt')}" -b spec/x-1 HEAD`);
+    // The spawn reads the contract from this host's ~/<globalRoot>/bin: install the fixture there.
+    const installed = join(root, 'home', h.globalRoot);
+    mkdirSync(dirname(installed), { recursive: true });
+    if (!existsSync(installed)) symlinkSync(wd.gstack, installed);
     const spawn = await run(wd, fence(h.spec, 'claude -p'), { SPAWN_PATH: join(wd.w, 'wt'), SPAWN_BRANCH: 'spec/x-1', ARCHIVE_PATH: join(wd.gstack, 'VERSION') });
     const deadline = Date.now() + 5_000;
     while (!existsSync(join(wd.w, 'claude.log')) && Date.now() < deadline) await Bun.sleep(50);

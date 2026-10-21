@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Show which E2E and LLM-judge tests would run based on the current git diff.
  *

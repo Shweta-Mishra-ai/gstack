@@ -313,20 +313,13 @@ describe('gstack-evidence check', () => {
   });
 });
 
-describe('gstack-evidence run — bun dotenv autoload must not reach the child', () => {
-  // bun auto-loads .env / .env.<NODE_ENV> / .env.local from the cwd into
-  // process.env, and this binary has a bun shebang, so without scrubbing every
-  // spawned command inherits them. That leaks production credentials into a child
-  // that would not otherwise have them AND changes the behaviour of the command
-  // being certified, which is the worse half: the ledger would vouch for a run
-  // that differs from the one CI performs.
-  //
-  // ⚠️ `bun test` runs with NODE_ENV=test, and bun SKIPS .env.local in test mode
-  // (verified on bun 1.3.11: NODE_ENV=test loads .env but not .env.local). A
-  // .env.local fixture here therefore proves nothing unless NODE_ENV is cleared
-  // for the spawn — the first version of these tests passed for exactly that
-  // wrong reason. Every leak test below asserts the scrub WARNING fired, so a
-  // fixture bun never loaded fails instead of passing silently.
+describe('gstack-evidence run — the repo .env never reaches the child through gstack (GSTA-56)', () => {
+  // gstack-evidence starts with --no-env-file --config=/dev/null
+  // (lib/bun-isolation.ts), so Bun never loads the repo's .env files into the
+  // wrapper and the command under test sees the shell's environment, exactly
+  // as when run by hand. The command may still read .env files itself, as it
+  // would without the wrapper. NODE_ENV is cleared because bun skips
+  // .env.local under NODE_ENV=test, which would make that fixture prove nothing.
 
   function runWith(env: Record<string, string | undefined>, cmd: string) {
     return spawnSync(EVIDENCE, ['run', '--label', 'envprobe', '--', cmd], {
@@ -337,71 +330,115 @@ describe('gstack-evidence run — bun dotenv autoload must not reach the child',
     });
   }
 
-  test('a .env value is scrubbed, and the warning names the key but never the value', () => {
+  test('.env and .env.local values do not reach the child', () => {
     fs.writeFileSync(path.join(repoDir, '.env'), 'ZZ_TOKEN_PROBE="s3cret-value"\n');
-    const r = run(['run', '--label', 'envprobe', '--', 'echo "saw=[${ZZ_TOKEN_PROBE:-absent}]"']);
-    expect(r.status).toBe(0);
-    expect(r.stderr).toContain('ZZ_TOKEN_PROBE');   // positive control: the scrub ran
-    expect(r.stdout).toContain('saw=[absent]');
-    // The diagnostic must not become the leak it prevents.
-    expect(r.stderr).not.toContain('s3cret-value');
-    expect(r.stdout).not.toContain('s3cret-value');
-  });
-
-  test('a .env.local value is scrubbed when bun actually loads it (NODE_ENV cleared)', () => {
     fs.writeFileSync(path.join(repoDir, '.env.local'), 'ZZ_LOCAL_PROBE=leaked\n');
-    const r = runWith({ NODE_ENV: undefined }, 'echo "saw=[${ZZ_LOCAL_PROBE:-absent}]"');
-    expect(r.stderr ?? '').toContain('ZZ_LOCAL_PROBE');  // positive control
-    expect(r.stdout ?? '').toContain('saw=[absent]');
-    expect(r.stdout ?? '').not.toContain('leaked');
-  });
-
-  test('.env.local is left alone under NODE_ENV=test, because bun never loaded it', () => {
-    // Mirrors bun's own precedence. Scrubbing a key bun did not inject would strip
-    // a variable the caller's shell legitimately provided.
-    fs.writeFileSync(path.join(repoDir, '.env.local'), 'ZZ_TESTMODE_PROBE=from_file\n');
-    const r = runWith({ NODE_ENV: 'test', ZZ_TESTMODE_PROBE: 'from_shell' },
-      'echo "saw=[${ZZ_TESTMODE_PROBE:-absent}]"');
-    expect(r.stdout ?? '').toContain('saw=[from_shell]');
-  });
-
-  test('CONTROL — a var the shell exported with a different value SURVIVES', () => {
-    // bun does not override an already-exported var (verified on bun 1.3.11), so a
-    // live value that differs from the file is genuinely the user's environment.
-    fs.writeFileSync(path.join(repoDir, '.env'), 'ZZ_KEEP_PROBE=from_file\n');
-    const r = runWith({ ZZ_KEEP_PROBE: 'from_shell' }, 'echo "saw=[${ZZ_KEEP_PROBE:-absent}]"');
-    expect(r.stdout ?? '').toContain('saw=[from_shell]');
-    expect(r.stderr ?? '').not.toContain('ZZ_KEEP_PROBE');
-  });
-
-  test('GSTACK_EVIDENCE_KEEP_DOTENV=1 restores the old pass-through behaviour', () => {
-    fs.writeFileSync(path.join(repoDir, '.env'), 'ZZ_OPTOUT_PROBE=kept\n');
-    const r = runWith({ GSTACK_EVIDENCE_KEEP_DOTENV: '1' }, 'echo "saw=[${ZZ_OPTOUT_PROBE:-absent}]"');
-    expect(r.stdout ?? '').toContain('saw=[kept]');
-    expect(r.stderr ?? '').not.toContain('scrubbed');
-  });
-
-  test('no dotenv file means no scrub warning at all', () => {
-    const r = run(['run', '--label', 'envprobe', '--', 'echo hi']);
+    const r = runWith({ NODE_ENV: undefined }, 'echo "saw=[${ZZ_TOKEN_PROBE:-absent}][${ZZ_LOCAL_PROBE:-absent}]"');
     expect(r.status).toBe(0);
-    expect(r.stderr).not.toContain('scrubbed');
+    expect(r.stdout).toContain('saw=[absent][absent]');
+    expect(r.stdout + r.stderr).not.toContain('s3cret-value');
+    expect(r.stdout + r.stderr).not.toContain('leaked');
   });
 
-  test('an UNREADABLE .env fails open: evidence still runs, nothing scrubbed', () => {
-    const envPath = path.join(repoDir, '.env');
-    fs.writeFileSync(envPath, 'ZZ_DENIED_PROBE=hidden\n');
-    fs.chmodSync(envPath, 0o000);
-    // chmod 000 cannot create unreadability for root or CAP_DAC_OVERRIDE
-    // environments (reads succeed regardless) — probe functionally and skip
-    // rather than assert a condition the fixture couldn't create.
-    try { fs.readFileSync(envPath); fs.chmodSync(envPath, 0o644); return; } catch {}
-    try {
-      const r = run(['run', '--label', 'envprobe', '--', 'echo hi']);
-      // The scrub must skip the unreadable file and the run must still be recorded.
-      expect(r.status).toBe(0);
-      expect(r.stderr ?? '').not.toContain('ZZ_DENIED_PROBE');
-    } finally {
-      fs.chmodSync(envPath, 0o644); // let afterEach rmSync succeed
+  test('CONTROL — shell-exported variables survive, including one equal to the .env value', () => {
+    fs.writeFileSync(path.join(repoDir, '.env'), 'ZZ_KEEP_PROBE=from_file\nZZ_SAME_PROBE=same\n');
+    const r = runWith({ NODE_ENV: undefined, ZZ_KEEP_PROBE: 'from_shell', ZZ_SAME_PROBE: 'same' },
+      'echo "saw=[${ZZ_KEEP_PROBE:-absent}][${ZZ_SAME_PROBE:-absent}]"');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('saw=[from_shell][same]');
+  });
+});
+
+describe('gstack-evidence tests_ran — zero-run green is a third state, never merged with pass or unknown', () => {
+  // The receipt carries the runner's own executed-test count parsed from a
+  // bounded tail of the streamed output. `run` never changes its exit on it
+  // (TRANSPARENCY INVARIANT); `check` grades 0 as ZERO-RUN (STALE-equivalent,
+  // its own label) and unknown as non-blocking.
+  const bunOutput = (pass: number, skip: number, fail: number) =>
+    `printf 'bun test v1\\n\\n ${pass} pass\\n ${skip} skip\\n ${fail} fail\\nRan ${pass + skip + fail} tests across 1 file. [10.00ms]\\n' >&2`;
+
+  test('bun: executed = pass + fail; the count lands in the receipt and check stays FRESH', () => {
+    const r = run(['run', '--label', 'tests', '--', bunOutput(7, 2, 1) + ' && exit 0']);
+    expect(r.status).toBe(0);
+    expect(records().pop().tests_ran).toBe(8);
+    expect(r.stderr).toContain('recorded label=tests exit=0 tests_ran=8');
+    const chk = run(['check', '--label', 'tests']);
+    expect(chk.status).toBe(0);
+    expect(chk.stdout).toContain('EVIDENCE: FRESH label=tests exit=0 tests_ran=8');
+  });
+
+  test('bun all-skip is ZERO-RUN: run still exits 0, check fails under its own label', () => {
+    const r = run(['run', '--label', 'tests', '--', bunOutput(0, 5, 0)]);
+    expect(r.status).toBe(0);
+    expect(records().pop().tests_ran).toBe(0);
+    const chk = run(['check', '--label', 'tests']);
+    expect(chk.status).toBe(1);
+    expect(chk.stdout).toContain('EVIDENCE: ZERO-RUN label=tests exit=0 tests_ran=0');
+    expect(chk.stdout).toContain('reason=runner reported 0 executed tests');
+    expect(chk.stdout).not.toContain('STALE');
+  });
+
+  test('an unrecognised runner is unknown: non-blocking, labelled in the detail', () => {
+    expect(run(['run', '--label', 'tests', '--', 'echo green']).status).toBe(0);
+    expect(records().pop().tests_ran).toBe('unknown');
+    const chk = run(['check', '--label', 'tests']);
+    expect(chk.status).toBe(0);
+    expect(chk.stdout).toContain('EVIDENCE: FRESH label=tests exit=0 tests_ran=unknown');
+  });
+
+  test('jest, vitest, pytest, rspec and go zero-only summaries', () => {
+    const cases: [string, number | 'unknown'][] = [
+      ["printf 'Tests:       1 failed, 2 passed, 1 skipped, 4 total\\nTime: 1s\\n'", 3],
+      ["printf 'No tests found, exiting with code 0\\n'", 0],
+      ["printf '      Tests  3 passed | 1 skipped (4)\\n   Start at  10:00\\n'", 3],
+      ["printf 'No test files found, exiting with code 1\\n'", 0],
+      ["printf '===== 3 passed, 1 skipped, 2 xfailed in 0.12s =====\\n'", 5],
+      ["printf '============ no tests ran in 0.01s ============\\n'", 0],
+      ["printf 'Finished in 0.2 seconds\\n12 examples, 0 failures, 2 pending\\n'", 10],
+      ["printf '?   \\texample.com/pkg\\t[no test files]\\n?   \\texample.com/other\\t[no test files]\\n'", 0],
+      ["printf 'ok  \\texample.com/pkg\\t0.1s\\n?   \\texample.com/other\\t[no test files]\\n'", 'unknown'],
+    ];
+    for (const [cmd, want] of cases) {
+      expect(run(['run', '--label', 'lane', '--', cmd]).status).toBe(0);
+      expect([cmd, records().pop().tests_ran]).toEqual([cmd, want]);
     }
+  });
+
+  test('the last summary wins when a command runs a suite twice', () => {
+    expect(run(['run', '--label', 'tests', '--', `${bunOutput(9, 0, 0)}; ${bunOutput(0, 3, 0)}`]).status).toBe(0);
+    expect(records().pop().tests_ran).toBe(0);
+    expect(run(['run', '--label', 'tests', '--', `${bunOutput(0, 3, 0)}; ${bunOutput(9, 0, 0)}`]).status).toBe(0);
+    expect(records().pop().tests_ran).toBe(9);
+  });
+
+  test('the summary survives a 2MB+ stream that truncates the saved log', () => {
+    const r = run(['run', '--label', 'big', '--', `head -c 2500000 /dev/zero | tr "\\0" a; echo; ${bunOutput(4, 0, 0)}`]);
+    expect(r.status).toBe(0);
+    expect(records().pop().tests_ran).toBe(4);
+  });
+
+  test('TRANSPARENCY: a parser exception never alters the exit code; the receipt says unknown', () => {
+    const green = spawnSync(EVIDENCE, ['run', '--label', 'tests', '--', bunOutput(3, 0, 0)], {
+      cwd: repoDir, env: { ...process.env, GSTACK_HOME: gstackHome, GSTACK_EVIDENCE_FAULT: 'tests_ran' }, encoding: 'utf-8', timeout: 60000,
+    });
+    expect(green.status).toBe(0);
+    expect(green.stderr).toContain('tests_ran parse failed');
+    expect(records().pop().tests_ran).toBe('unknown');
+    const red = spawnSync(EVIDENCE, ['run', '--label', 'tests', '--', `${bunOutput(3, 0, 0)}; exit 3`], {
+      cwd: repoDir, env: { ...process.env, GSTACK_HOME: gstackHome, GSTACK_EVIDENCE_FAULT: 'tests_ran' }, encoding: 'utf-8', timeout: 60000,
+    });
+    expect(red.status).toBe(3);
+    expect(records().pop()).toMatchObject({ exit: 3, tests_ran: 'unknown' });
+  });
+
+  test('a record without tests_ran (older ledger) grades as unknown, not ZERO-RUN', () => {
+    expect(run(['run', '--label', 'tests', '--', 'echo green']).status).toBe(0);
+    const file = ledgerFile();
+    const rec = JSON.parse(fs.readFileSync(file, 'utf-8').trim());
+    delete rec.tests_ran;
+    fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    const chk = run(['check', '--label', 'tests']);
+    expect(chk.status).toBe(0);
+    expect(chk.stdout).toContain('tests_ran=unknown');
   });
 });

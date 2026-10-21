@@ -347,7 +347,7 @@ browser (the first output line, `ENGINE=aside` or `ENGINE=browse`, says which)
 — and captures each width:
 
 ```bash
-bun run ~/.claude/skills/gstack/bin/gstack-render.ts <path-to-finalized.html> \
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-render.ts <path-to-finalized.html> \
   --screenshot /tmp/gstack-verify-mobile.jpg --width 375 --jpeg \
   --screenshot /tmp/gstack-verify-tablet.jpg --width 768 --jpeg \
   --screenshot /tmp/gstack-verify-desktop.jpg --width 1440 --jpeg

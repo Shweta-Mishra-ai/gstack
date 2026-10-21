@@ -130,6 +130,8 @@ export interface ProducerReceipt {
   durationMs: number;
   firstUsefulResultMs: null;
   toolCalls: number;
+  /** Content-free tool timeline (name, offset, thread) for diagnosing overruns; absent when the adapter has none. */
+  toolTimeline?: Array<{ atMs: number; endMs?: number; tool: string; agent: 'main' | 'subagent' }>;
   output: string;
   outputHash: string;
   usage: {
@@ -148,7 +150,7 @@ export interface ProducerReceipt {
  * Compact trusted index; raw output remains in the separately retained receipt.
  * Collection adds the matrix cell that the receipt's cellRef names.
  */
-export type ProducerReceiptIndex = Omit<ProducerReceipt, 'output' | 'error'> & {
+export type ProducerReceiptIndex = Omit<ProducerReceipt, 'output' | 'error' | 'toolTimeline'> & {
   cell: ProducerCell;
   error?: { code: string };
 };

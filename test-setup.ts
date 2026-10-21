@@ -34,6 +34,11 @@ for (const name of ['GSTACK_STATE_ROOT', 'GSTACK_STATE_DIR']) {
   process.stderr.write(`test-setup: stripped inherited ${name}; tests isolate state via GSTACK_HOME\n`);
 }
 process.env.GSTACK_TEST_LEGACY_ROOT = path.join(os.tmpdir(), `gstack-test-legacy-root-${process.pid}-${Date.now()}-unused`);
+// Workflow leases (bin/gstack-lease) default to the installation's git dir;
+// for the dev checkout under test that is this repo's .git, and a live test
+// runner's lease would make `bin/gstack-upgrade` here refuse UPGRADE_BUSY.
+// Every spawned bin inherits a per-process scratch lease directory instead.
+process.env.GSTACK_LEASE_DIR ??= path.join(os.tmpdir(), `gstack-test-leases-${process.pid}`);
 
 // Narrowly restore PATH after every test. Defends against the recurring
 // pollution class where one test sets `process.env.PATH = '/test/bin:/usr/bin'`

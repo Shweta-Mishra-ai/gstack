@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Release-only proof that a CSO image is public and anonymously pullable. */
 import * as fs from 'node:fs';
 import * as os from 'node:os';

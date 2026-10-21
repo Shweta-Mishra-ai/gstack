@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * test-paid-shards — enumerate, shard, plan and run the paid (gate/periodic/marathon) tiers.
  *
@@ -66,13 +66,18 @@ import { EVAL_POLICY, PERIODIC_CI_EXCLUDE } from '../test/helpers/periodic-exclu
 import {
   getProjectEvalDir, getClaudeCliVersion, isFinalizedEvalResultFile, failureClassOf, panelVerdict,
   sanitizeTrialError, CONTRACT_VIOLATIONS_FILE, TRIAL_ENV, type TrialFailureClass,
+  trialCostKnown, trialFailureFields, trialSessions,
 } from '../test/helpers/eval-store';
+import { STALL_WINDOW_MS } from '../test/helpers/eval-budgets';
+import { readSessionLedger, type SessionLedgerRow } from '../test/helpers/session-ledger';
 import { preflightAnthropicApi } from '../test/helpers/anthropic-preflight';
 import { e2eReuseLaneProblem, prepareE2EShardReuse, selectPlanReceipts } from './e2e-shard-reuse';
 import { E2E_TOUCHFILES, E2E_TIERS } from '../test/helpers/touchfiles';
+import { resolveEvalHost } from '../test/helpers/e2e-hosts';
 import { scopeCodexAccess, shardFile, shardCaseId, shardTrial, trialShardKey, type CaseTrialPlan, caseTrialPlan, excludedCasesNamePattern, caseTestNamePattern, expandCaseShards, expandTrialShards, fileCaseRegistration, partitionCaseExclusions } from './lib/paid-cases';
 import { retriesForFiles, trialPanelKey, sliceExecutionOrder, buildRunManifest, parseRunManifest, type SliceResult, sliceExitCode, guardTrialRecords, formatSlicePlan, formatCapacityPreflight, sliceDeadlineMs } from './lib/paid-plan';
-import { caseFile, runCaseDiagnosis, formatPanelLine, runPaidReport } from './lib/paid-report';
+import { caseSelection, runCaseDiagnosis, formatPanelLine, runPaidReport } from './lib/paid-report';
+import { planRerun } from './lib/paid-rerun';
 import {
   DEFAULT_JOBS, DEFAULT_MAX_FILES_PER_SHARD, DEFAULT_SHARD_TIMEOUT_MS, DEFAULT_TIER, DEFAULT_WITHIN_SHARD_CONCURRENCY, OVERLAY_MAX_ACTIVE_SHARDS,
   PAID_LANE_POLICY, PAID_TIERS, ROOT, SLICE_JOB_STARTED_AT_ENV, SLICE_UPLOAD_RESERVE_MS, isOverlayTestFile,
@@ -93,9 +98,12 @@ export * from './lib/paid-select';
 export * from './lib/paid-cases';
 export * from './lib/paid-plan';
 export * from './lib/paid-report';
+export * from './lib/paid-rerun';
 
-/** Records and contract evidence an isolated shard left in its eval dir. */
-export function readTrialEvidence(evalDir: string | undefined): { records: any[]; contract: string | null } {
+type TrialEvidence = { records: any[]; contract: string | null; sessions?: SessionLedgerRow[] };
+
+/** Records, contract evidence and session-ledger rows an isolated shard left in its eval dir. */
+export function readTrialEvidence(evalDir: string | undefined): TrialEvidence {
   if (!evalDir || !fs.existsSync(evalDir)) return { records: [], contract: null };
   const names = fs.readdirSync(evalDir);
   const parse = (name: string) => { try { return JSON.parse(fs.readFileSync(path.join(evalDir, name), 'utf8')); } catch { return null; } };
@@ -108,28 +116,32 @@ export function readTrialEvidence(evalDir: string | undefined): { records: any[]
     const line = fs.readFileSync(path.join(evalDir, CONTRACT_VIOLATIONS_FILE), 'utf8').split('\n').find(l => l.trim());
     if (line) contract = String(JSON.parse(line).message ?? 'contract violation');
   } catch { /* no sidecar */ }
-  return { records, contract };
+  return { records, contract, sessions: readSessionLedger(evalDir) };
 }
 
 /** Classify one isolated trial shard. Contract evidence always fails the trial. */
 export function classifyTrialShard(
   outcome: Pick<ShardOutcome, 'status' | 'executedTests' | 'skippedTests' | 'elapsedMs' | 'runnerError'>,
   caseId: string, trial: number, plan: CaseTrialPlan,
-  evidence: { records: any[]; contract: string | null },
+  evidence: TrialEvidence,
 ): ShardTrialRecord {
   const failedRecord = evidence.records.find(record => record.passed === false) ?? evidence.records[0];
   const base: ShardTrialRecord = {
     case: caseId, trial, kind: plan.kind, panel: plan.panel, quarantined: plan.quarantined, outcome: null,
     cost_usd: Math.round(evidence.records.reduce((sum, record) => sum + (Number(record.cost_usd) || 0), 0) * 100) / 100,
     duration_ms: outcome.elapsedMs,
-    ...(typeof failedRecord?.model === 'string' ? { model: failedRecord.model } : {}),
+    ...(typeof failedRecord?.model === 'string' ? { model: failedRecord.model } : {}), ...trialSessions(evidence.sessions ?? []),
+    ...trialCostKnown(evidence.records, evidence.sessions),
   };
-  const failed = (failureClass: TrialFailureClass, error?: string): ShardTrialRecord => ({
-    ...base, outcome: 'failed', failure_class: evidence.contract !== null ? 'contract' : failureClass,
-    ...(failedRecord?.exit_reason ? { exit_reason: String(failedRecord.exit_reason) } : {}),
-    ...(Number.isInteger(failedRecord?.timeout_at_turn) ? { timeout_at_turn: failedRecord.timeout_at_turn } : {}),
-    ...(sanitizeTrialError(evidence.contract ?? failedRecord?.error ?? error) ? { error: sanitizeTrialError(evidence.contract ?? failedRecord?.error ?? error) } : {}),
-  });
+  const failed = (failureClass: TrialFailureClass, error?: string): ShardTrialRecord => {
+    const cls = evidence.contract !== null ? 'contract' : failureClass;
+    const raw = evidence.contract ?? failedRecord?.error ?? error;
+    return { ...base, outcome: 'failed', failure_class: cls,
+      ...(failedRecord?.exit_reason ? { exit_reason: String(failedRecord.exit_reason) } : {}),
+      ...(Number.isInteger(failedRecord?.timeout_at_turn) ? { timeout_at_turn: failedRecord.timeout_at_turn } : {}),
+      ...(sanitizeTrialError(raw) ? { error: sanitizeTrialError(raw) } : {}),
+      ...trialFailureFields({ failure_class: cls, exit_reason: failedRecord?.exit_reason, error: raw, sessions: evidence.sessions, record: failedRecord }, STALL_WINDOW_MS) };
+  };
   if (outcome.runnerError !== undefined) return { ...base, harness: `runner error: ${sanitizeTrialError(outcome.runnerError) ?? 'unknown'}` };
   if (outcome.status === 'never-started') return { ...base, harness: 'never started' };
   if (outcome.status === 'passed-empty') return { ...base, harness: 'hollow: executed no case' };
@@ -712,6 +724,8 @@ type CliOptions = {
   reportDir: string | null;
   /** Report mode: merge executed shard wall times into the duration seed. */
   writeDurations: boolean;
+  /** With --report: plan this attempt's rule-16 rerun into this directory instead of reporting. */
+  rerunPlanDir: string | null;
   /** Planner: the workflow matrix cap, for the capacity preflight's wave count. */
   maxParallel: number | null;
   /** Local diagnosis: run one case through the panel runner CI uses (never read by CI). */
@@ -754,6 +768,7 @@ CI modes (the eval workflows):
   --emit-plan PATH (--slices K | --slice-budget SECS --jobs N) [--skip-judges] [--max-parallel N]
   --plan PATH --slice I           execute one slice of a manifest
   --report DIR [--write-durations]  reconcile slice results against the manifest
+  --report DIR --rerun-plan OUT   plan this attempt's one rule-16 rerun of its failed cases (scripts/lib/paid-rerun.ts)
 
 Background runs and CI dispatch: bun run eval:bg:<pr|gate|periodic|release> (scripts/eval-bg.ts --help).`;
 
@@ -785,6 +800,7 @@ export function parseCliOptions(argv: string[], env: NodeJS.ProcessEnv = process
     sliceIndex: null,
     reportDir: null,
     writeDurations: false,
+    rerunPlanDir: null,
     maxParallel: null,
     caseId: null,
     trials: null,
@@ -812,6 +828,7 @@ export function parseCliOptions(argv: string[], env: NodeJS.ProcessEnv = process
     '--slice': (next) => { options.sliceIndex = parsePositiveInt(next(), '--slice'); },
     '--report': pathValue('--report needs a directory', (value) => { options.reportDir = value; }),
     '--write-durations': () => { options.writeDurations = true; },
+    '--rerun-plan': pathValue('--rerun-plan needs a directory', (value) => { options.rerunPlanDir = value; }),
     '--max-parallel': (next) => { options.maxParallel = parsePositiveInt(next(), '--max-parallel'); },
     '--case': (next) => {
       const value = next();
@@ -821,6 +838,7 @@ export function parseCliOptions(argv: string[], env: NodeJS.ProcessEnv = process
     '--trials': (next) => { options.trials = parsePositiveInt(next(), '--trials'); },
   }, PAID_USAGE);
   if (options.writeDurations && !options.reportDir) throw new Error('--write-durations requires --report');
+  if (options.rerunPlanDir && (!options.reportDir || options.writeDurations)) throw new Error('--rerun-plan requires --report and writes no durations');
   if (options.trials !== null && options.caseId === null) throw new Error('--trials requires --case');
   if (options.caseId !== null && (options.emitPlanPath || options.planPath || options.reportDir || options.sliceIndex !== null)) {
     throw new Error('--case is local diagnosis; it cannot combine with --emit-plan, --plan/--slice or --report');
@@ -870,19 +888,25 @@ async function main(): Promise<number> {
 
   // ── Report mode: reconcile slice artifacts against the manifest. Fail-closed:
   // a slice whose artifact never landed is a FAILURE, not an absence.
+  if (options.reportDir && options.rerunPlanDir) {
+    const attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+    const { lines } = planRerun(options.reportDir, Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 1, options.rerunPlanDir);
+    for (const line of lines) console.log(`- ${line}`);
+    return 0;
+  }
   if (options.reportDir) return runPaidReport(options.reportDir, { writeDurations: options.writeDurations });
 
   if (options.caseId && options.listOnly) {
-    const file = caseFile(options.caseId);
+    const { file, mode, reason } = caseSelection(options.caseId);
     const plan = caseTrialPlan(options.caseId);
     const n = options.trials ?? plan.panel.n;
-    console.log(`[test:paid] --case ${options.caseId}: ${n} trial(s) of ${file} (kind ${plan.kind}), list only`);
-    for (let trial = 1; trial <= n; trial++) console.log(`  ${trialShardKey(file, options.caseId, trial)}`);
+    console.log(`[test:paid] --case ${options.caseId}: ${n} trial(s) of ${file} (kind ${plan.kind}), selects ${reason}, list only`);
+    for (let trial = 1; trial <= n; trial++) console.log(`  ${mode === 'file' ? `${file} (trial ${trial})` : trialShardKey(file, options.caseId, trial)}`);
     return 0;
   }
   if (options.caseId) {
     preflightAnthropicApi(process.env);
-    const verdict = await runCaseDiagnosis(options.caseId, { trials: options.trials ?? undefined, jobs: options.jobs,
+    const verdict = await runCaseDiagnosis(options.caseId, { trials: options.trials ?? undefined, jobs: options.jobs, runShards: runPaidShards,
       withinShardConcurrency: options.withinShardConcurrency, timeoutMs: timeoutOverride,
       evalDirBase: process.env.GSTACK_EVAL_DIR || getProjectEvalDir() });
     return verdict.status === 'PASS' ? 0 : 1;
@@ -899,6 +923,9 @@ async function main(): Promise<number> {
     const manifest = parseRunManifest(fs.readFileSync(options.planPath, 'utf-8'));
     if (manifest.tier !== options.tier) {
       throw new Error(`manifest tier ${manifest.tier} != requested tier ${options.tier} — refusing a cross-tier run`);
+    }
+    if ((manifest.host ?? 'claude') !== resolveEvalHost()) {
+      throw new Error(`manifest host ${manifest.host ?? 'claude'} != EVALS_HOST ${resolveEvalHost()} — refusing a cross-host run`);
     }
     const profile = manifest.profile ?? 'full';
     if (options.profileExplicit && options.profile !== profile) throw new Error(`manifest profile ${profile} != requested profile ${options.profile}`);
@@ -947,6 +974,7 @@ async function main(): Promise<number> {
         startedAt,
         finishedAt: Date.now(),
         ...(checkpoint ? { checkpoint: true as const } : {}),
+        ...(manifest.rerun ? { rerun: true as const } : {}),
         outcomes: outcomes.map(({ files, status, exitCode, elapsedMs, executedTests, skippedTests, budget, reused, runnerError, trial, inputKey, sliceDeadline }) =>
           ({ files, status, exitCode, elapsedMs, executedTests, skippedTests, ...(budget ? { budget } : {}), ...(reused ? { reused } : {}),
             ...(runnerError !== undefined ? { runnerError } : {}), ...(trial ? { trial } : {}), ...(inputKey ? { inputKey } : {}),
@@ -976,7 +1004,8 @@ async function main(): Promise<number> {
           expectedCases: Object.fromEntries(mine.map(entry => [entry.file, expectedPrCaseCount(entry.file, manifest.selection!, entry.excludeCases)])),
           casePatterns: Object.fromEntries(mine.map(entry => [entry.file, prProfileTestNamePattern(entry.file, manifest.selection!, entry.excludeCases)])),
           expectedCaseIds: Object.fromEntries(mine.map(entry => [entry.file, prProfileShardIds(entry.file, manifest.selection!, entry.excludeCases)])),
-          reuseFor: e2eReuseLaneProblem(process.env, manifest.prCoverage.mode) !== null ? undefined : (files, env, budget) => {
+          // A rule-16 rerun executes fresh: a receipt would replay the verdict it is rerunning.
+          reuseFor: manifest.rerun || e2eReuseLaneProblem(process.env, manifest.prCoverage.mode) !== null ? undefined : (files, env, budget) => {
             const key = files[0]!;
             const file = shardFile(key);
             if (files.length !== 1 || !/^test\/skill-e2e-/.test(file)) return null;
@@ -1014,7 +1043,7 @@ async function main(): Promise<number> {
       const t = outcome.trial!;
       console.log(`  trial ${t.case} t${t.trial}/${t.panel.n}: ${t.outcome ?? `NO RECORD (${t.harness})`}${t.failure_class ? ` [${t.failure_class}]` : ''}`);
     }
-    return sliceExitCode(guarded);
+    return sliceExitCode(guarded, { caseVerdicts: manifest.tier === 'gate' });
   }
 
   if (options.listOnly && options.sliceBudgetMs !== null) {

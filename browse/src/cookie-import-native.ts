@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { release } from 'node:os';
 import path from 'node:path';
 import { CookieImportError, normalizeCookieDomain, type PlaywrightCookie } from './cookie-import-browser';
+import { emptyBunConfig } from './bun-child-config';
 import { hashNativeFile, nativeCodeHashes, nativeCodeMatches, readNativeQualifications, type NativeQualifiedBuild } from './cookie-import-native-integrity';
 
 type BrowserName = 'Chrome' | 'Chromium' | 'Brave' | 'Edge';
@@ -119,7 +120,7 @@ export async function importNativeCookies(options: {
   }
   if (Date.now() >= deadline) throw new CookieImportError('Native cookie import exceeded its operation deadline.', 'native_timeout');
   const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => /^(systemroot|windir|temp|tmp|userprofile|localappdata|appdata|programfiles|programfiles\(x86\)|programdata|path|pathext)$/i.test(key) && typeof value === 'string'));
-  const worker = spawn(bunExecutable, ['--no-env-file', '--no-install', '--no-macros', '--config=NUL', path.join(import.meta.dir, 'cookie-import-native-worker.ts')], {
+  const worker = spawn(bunExecutable, ['--no-env-file', '--no-install', '--no-macros', `--config=${emptyBunConfig()}`, path.join(import.meta.dir, 'cookie-import-native-worker.ts')], {
     env,
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,

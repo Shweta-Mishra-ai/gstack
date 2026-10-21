@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 // gstack-taste-update — update the persistent taste profile at
 // ~/.gstack/projects/$SLUG/taste-profile.json
 //

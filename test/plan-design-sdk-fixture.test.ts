@@ -18,6 +18,7 @@ async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'secon
   const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-design-free-')));
   const home = path.join(scratch, 'home'); fs.mkdirSync(home);
   const env = { PATH: process.env.PATH ?? '', HOME: home, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'maintenance.auto', GIT_CONFIG_VALUE_0: 'false', GIT_CONFIG_KEY_1: 'gc.auto', GIT_CONFIG_VALUE_1: '0',
     GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
     ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) };
   const callbacks: Array<{ name: string; fn: () => Promise<void>; timeout: number }> = [];
@@ -25,6 +26,8 @@ async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'secon
   const recordBudgets: number[] = [];
   let launched = false, sdkSignal: AbortSignal | undefined;
   let inputVerified = false, saved = '', resultError: unknown;
+  const removals: string[] = [];
+  const survivors = () => `surviving fixture dirs: ${dirs.filter(dir => fs.existsSync(dir)).join(', ') || '(none)'}; removals: ${removals.join('; ') || '(none)'}`;
   const owned = (p: string) => {
     const full = path.resolve(p);
     expect(full.startsWith(scratch + path.sep)).toBe(true);
@@ -43,13 +46,17 @@ async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'secon
     },
     copyFileSync(a: string, b: string) { owned(b); fs.copyFileSync(a, b); },
     cpSync(a: string, b: string, opts: any) { owned(b); fs.cpSync(a, b, opts); },
-    rmSync(p: string, opts: any) { owned(p); fs.rmSync(p, opts); },
+    rmSync(p: string, opts: any) {
+      owned(p);
+      try { fs.rmSync(p, opts); } catch (error) { removals.push(`${p}: ${error}`); throw error; }
+      if (fs.existsSync(p)) removals.push(`${p}: rmSync returned but the path survived`);
+    },
   };
   const args = {
     ROOT, fs: localFs, path, os: { tmpdir: () => scratch }, expect,
     CAPTURE_MS, CAPTURE_LONG_MS, OFFICE_HOURS_BUN_GRACE_MS, resolveEvalModel, runId: 'free-legacy-design',
     evalCollector: { addTest(entry: any) {
-      expect(dirs.every(dir => !fs.existsSync(dir))).toBe(true);
+      expect(dirs.every(dir => !fs.existsSync(dir)), survivors()).toBe(true);
       rows.push(entry);
     } },
     runRecordedOfficeHoursAttempt: (options: Parameters<typeof runRecordedOfficeHoursAttempt>[0]) => {
@@ -134,7 +141,7 @@ async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'secon
     expect(callbacks).toHaveLength(1); expect(callbacks[0]!.timeout).toBe(CAPTURE_LONG_MS);
     try { await callbacks[0]!.fn(); } catch (error) { resultError = error; }
     expect(inputVerified).toBe(true); expect(dirs).toHaveLength(1);
-    expect(dirs.every(dir => !fs.existsSync(dir))).toBe(true);
+    expect(dirs.every(dir => !fs.existsSync(dir)), survivors()).toBe(true);
     expect(recordBudgets).toEqual([CAPTURE_LONG_MS - OFFICE_HOURS_BUN_GRACE_MS]);
     expect(sdkSignal?.aborted).toBe(true);
     return { resultError, rows, saved };

@@ -22,6 +22,7 @@
 import { expect, beforeAll, afterAll } from 'bun:test';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
+import { resolveEvalModel } from '../lib/eval-model';
 import type { EvalTestEntry } from './helpers/eval-store';
 import {
   ROOT, runId,
@@ -166,7 +167,7 @@ After writing the file with that ONE Phase 4 question, stop. Do not continue to 
       timeout: CAPTURE_MS,
       testName: 'office-hours-phase4-fork',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/office-hours Phase 4 fork', result);

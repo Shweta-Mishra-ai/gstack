@@ -100,7 +100,7 @@ fi
 # bun, which this installer already requires. It used to need jq, which it
 # never checked for, so a successful install reported failure (#1675).
 pkg_field() {
-  GSTACK_PKG_JSON="$1" GSTACK_PKG_FIELD="$2" bun -e '
+  GSTACK_PKG_JSON="$1" GSTACK_PKG_FIELD="$2" bun --no-env-file --config=/dev/null -e '
     try {
       const pkg = JSON.parse(require("fs").readFileSync(process.env.GSTACK_PKG_JSON, "utf8"));
       const v = process.env.GSTACK_PKG_FIELD.split(".").reduce((o, k) => (o == null ? o : o[k]), pkg);
@@ -198,7 +198,7 @@ _bun_exe_hint() {
   [ "$IS_WINDOWS" -eq 1 ] || return 0
   command -v bun.exe >/dev/null 2>&1 && return 0
   local real_bun
-  real_bun=$(bun -e 'console.log(process.execPath)' 2>/dev/null | tr -d '\r' || true)
+  real_bun=$(bun --no-env-file --config=/dev/null -e 'console.log(process.execPath)' 2>/dev/null | tr -d '\r' || true)
   echo "  detected: bun was installed via npm — bun.exe is NOT on %PATH%, and the gbrain.exe shim needs it." >&2
   if [ -n "$real_bun" ]; then
     echo "  fix: add bun.exe's directory to PATH (persist it in your shell profile):" >&2

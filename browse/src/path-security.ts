@@ -16,20 +16,45 @@
  *      classic TEMP_DIR plus os.tmpdir(), which differ on macOS and under
  *      TMPDIR-honoring CI/sandbox environments)
  *   4. TEMP_ONLY = [TEMP_DIR] for remote file serving (prevents project file exfil)
+ *   5. Safe directories and targets go through the same realpath (#3104):
+ *      on Windows `fs.realpathSync` keeps an 8.3 short name such as
+ *      C:\Users\BURCIN~1 while `fs.realpathSync.native` expands it, so mixing
+ *      them rejected paths inside the temp dir. Resolved paths compare exactly;
+ *      only a tail that does not exist yet is case-folded on Windows.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { TEMP_DIR, TEMP_DIRS, isPathWithin } from './platform';
 
-// Resolve safe directories through realpathSync to handle symlinks (e.g., macOS /tmp → /private/tmp)
-export const SAFE_DIRECTORIES = [...TEMP_DIRS, process.cwd()].map(d => {
-  try { return fs.realpathSync(d); } catch { return d; }
-});
+const realpath = fs.realpathSync.native;
+const foldMissing = (component: string) => process.platform === 'win32' ? component.toLowerCase() : component;
 
-const TEMP_ONLY = [TEMP_DIR].map(d => {
-  try { return fs.realpathSync(d); } catch { return d; }
-});
+/**
+ * Resolve the longest existing prefix of `filePath` with the one realpath
+ * function and append the missing tail, case-folded on Windows. Throws for
+ * resolution errors other than ENOENT.
+ */
+export function resolveRealPath(filePath: string): string {
+  const absolute = path.resolve(filePath);
+  try {
+    return realpath(absolute);
+  } catch (err: any) {
+    const parent = path.dirname(absolute);
+    if (err?.code !== 'ENOENT' || parent === absolute) throw err;
+    return path.join(resolveRealPath(parent), foldMissing(path.basename(absolute)));
+  }
+}
+
+const resolveSafeDir = (dir: string) => {
+  try { return resolveRealPath(dir); } catch { return path.resolve(dir); }
+};
+
+// Resolved like every target, so symlinks (macOS /tmp → /private/tmp) and
+// Windows 8.3 names compare equal.
+export const SAFE_DIRECTORIES = [...TEMP_DIRS, process.cwd()].map(resolveSafeDir);
+
+const TEMP_ONLY = [TEMP_DIR].map(resolveSafeDir);
 
 /**
  * Validate a file path for writing (screenshot, pdf, download, scrape, archive).
@@ -52,15 +77,16 @@ export function validateOutputPath(filePath: string): void {
         resolved = path.dirname(resolved);
         continue;
       }
-      resolved = path.join(resolved, component);
+      const next = path.join(resolved, component);
       try {
-        fs.lstatSync(resolved);
+        fs.lstatSync(next);
       } catch (err: any) {
+        resolved = path.join(resolved, foldMissing(component));
         if (err?.code === 'ENOENT' && SAFE_DIRECTORIES.some(dir => isPathWithin(resolved, dir))) continue;
         reject();
       }
       try {
-        resolved = fs.realpathSync.native(resolved);
+        resolved = realpath(next);
       } catch {
         reject();
       }
@@ -71,21 +97,11 @@ export function validateOutputPath(filePath: string): void {
 
 /** Validate a file path for reading (eval command). */
 export function validateReadPath(filePath: string): void {
-  const resolved = path.resolve(filePath);
   let realPath: string;
   try {
-    realPath = fs.realpathSync(resolved);
+    realPath = resolveRealPath(filePath);
   } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      try {
-        const dir = fs.realpathSync(path.dirname(resolved));
-        realPath = path.join(dir, path.basename(resolved));
-      } catch {
-        realPath = resolved;
-      }
-    } else {
-      throw new Error(`Cannot resolve real path: ${filePath} (${err.code})`);
-    }
+    throw new Error(`Cannot resolve real path: ${filePath} (${err.code})`);
   }
   const isSafe = SAFE_DIRECTORIES.some(dir => isPathWithin(realPath, dir));
   if (!isSafe) {
@@ -95,10 +111,9 @@ export function validateReadPath(filePath: string): void {
 
 /** Validate a file path for remote serving (GET /file). TEMP_DIR only, not cwd. */
 export function validateTempPath(filePath: string): void {
-  const resolved = path.resolve(filePath);
   let realPath: string;
   try {
-    realPath = fs.realpathSync(resolved);
+    realPath = realpath(path.resolve(filePath));
   } catch (err: any) {
     if (err.code === 'ENOENT') {
       throw new Error('File not found');

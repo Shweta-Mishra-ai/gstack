@@ -17,6 +17,18 @@
       "trigger": "running the test suites and (if prompt files changed) the eval suites (Steps 4-6)"
     },
     {
+      "id": "greptile-early",
+      "file": "greptile-early.md",
+      "title": "Early Greptile PR",
+      "trigger": "opening the PR early for a parallel Greptile review after the free tests pass (Step 6.5)"
+    },
+    {
+      "id": "measure",
+      "file": "measure.md",
+      "title": "Measure-then-fix loop for a red eval or free shard",
+      "trigger": "a paid eval case is red or a free-suite shard failed (Steps 5-6) \u2014 read from the tests section; diagnostic reruns, then the gate once"
+    },
+    {
       "id": "test-coverage",
       "file": "test-coverage.md",
       "title": "Test coverage audit (subagent)",
@@ -68,7 +80,19 @@
       "id": "pr-body",
       "file": "pr-body.md",
       "title": "PR/MR creation and documentation outcome",
-      "trigger": "creating or updating the PR/MR with the verified documentation outcome (Step 19)"
+      "trigger": "preparing the title and creating or updating the PR/MR with the verified documentation outcome (Steps 18-19)"
+    },
+    {
+      "id": "capy-pr",
+      "file": "capy-pr.md",
+      "title": "Capy PR body: What changed (before/after images), Why, Approvals",
+      "trigger": "Step 19 printed CAPY_PR: on (a Capy session, GSTACK_CAPY=1) — read before composing the PR body"
+    },
+    {
+      "id": "handoff",
+      "file": "handoff.md",
+      "title": "Handoff without a PR (automation lanes)",
+      "trigger": "handing the branch to a coordinator instead of opening a PR (--no-pr or an automation lane; Step 18)"
     }
   ]
 }

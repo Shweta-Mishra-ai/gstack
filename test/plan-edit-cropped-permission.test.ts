@@ -3,10 +3,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {createHash} from 'node:crypto';
-import {createFilePermissionRecorder,currentFilePermissionEpoch,currentFilePermissionBinding} from './helpers/plan-count-file-permission';
+import {createFilePermissionRecorder,currentFilePermissionEpoch,currentFilePermissionBinding,recordFilePermission,isCroppedEditPermissionVisible} from './helpers/plan-count-file-permission';
 import {readPlanCountTranscript} from './helpers/plan-count-transcript';
 import {createPlanCountPermissionGuard,isPermissionDialogVisible,classifyPlanCountFrame} from './helpers/claude-pty-runner';
 import captured from './fixtures/plan-edit-cropped-permission-1579.json';
+import editPrepublication from './fixtures/plan-ceo-floor-edit-prepublication.json';
 
 function fixture(){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'cropped-edit-')),cwd=path.join(dir,'owned'),config=path.join(dir,'config');fs.mkdirSync(cwd);
@@ -125,6 +126,124 @@ test.each(['foreign-basename','foreign-header','quoted','fenced','auq','old-menu
   if(mode==='wrong-number')screen=screen.replace(' 30 +',' 31 +');
   if(mode==='partial-footer')screen=screen.replace('Tab to amend','Tab to');
   if(mode==='plain-prose')screen='Here is an example:\n'+screen;
+  expect(f.read(screen)).toBeFalsy();
+  expect(createPlanCountPermissionGuard()(screen,'',f.read(screen))).not.toBe('grant');
+ }finally{f.close();}
+});
+
+// Ship-measure plan-ceo-finding-floor baseline at 6f32737: after the owned Write was
+// granted, t04 (three published Edits pending at once) and t07/t08 (Edit menu shown
+// before Claude Code published the Edit) stalled on the owned working-plan Edit menu.
+function edits(trial:string){
+ const c=editPrepublication.cases.find(c=>c.trial===trial)!;
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'edit-prepub-')),cwd=path.join(dir,'owned'),config=path.join(dir,'config');fs.mkdirSync(cwd);
+ const expected=path.join(cwd,c.basename),sid=c.sessionId,journal=path.join(config,'projects','owned',sid+'.jsonl');
+ fs.mkdirSync(path.dirname(journal),{recursive:true});
+ const startedAt=Date.now()-1000,recorder=createFilePermissionRecorder(cwd,config,expected)!;
+ const native=(role:string,content:any[],session=sid)=>({cwd,sessionId:session,isSidechain:false,timestamp:new Date().toISOString(),message:{role,content}});
+ const hook=(kind:string,tool:string,id:string,input:any,extra={})=>recordFilePermission(JSON.stringify({hook_event_name:kind,tool_name:tool,session_id:sid,
+  tool_use_id:id,cwd,transcript_path:journal,tool_input:input,...extra}),recorder.file,cwd,config,expected);
+ const writeInput={file_path:expected,content:c.writeContent};
+ const base=[native('assistant',[{type:'tool_use',id:'owned-write',name:'Write',input:writeInput}]),
+  native('user',[{type:'tool_result',tool_use_id:'owned-write',content:'ok'}])];
+ hook('PreToolUse','Write','owned-write',writeInput);fs.writeFileSync(expected,c.writeContent);hook('PostToolUse','Write','owned-write',writeInput);
+ const write=(rows:any[]=base)=>fs.writeFileSync(journal,rows.map(r=>JSON.stringify(r)).join('\n')+'\n');write();
+ const pending=c.edits.map(e=>({id:e.toolUseId,input:{file_path:expected,...e.input}}));
+ const block=(e:{id:string;input:any})=>({type:'tool_use',id:e.id,name:'Edit',input:e.input});
+ const read=(screen=c.screen)=>currentFilePermissionEpoch(recorder.file,expected,cwd,config,startedAt,readPlanCountTranscript(config,cwd),screen);
+ return {c,dir,cwd,config,expected,sid,journal,recorder,native,hook,base,write,pending,block,read,startedAt,
+  close(){recorder.dispose();fs.rmSync(dir,{recursive:true,force:true});}};
+}
+
+test.each(['t07','t08'])('%s: an unpublished owned Edit is granted once from its own PreToolUse input',trial=>{
+ const f=edits(trial);try{
+  expect(f.c.recorded).toMatchObject({outcome:'permission_unanswered',transcriptStatus:'ready',publishedEdits:0});
+  expect(createHash('sha256').update(f.c.screen).digest('hex')).toBe(f.c.screenSha256);
+  expect(isCroppedEditPermissionVisible(f.c.screen)).toBe(true);
+  const [edit]=f.pending;expect(f.read()).toBeNull();
+  f.hook('PreToolUse','Edit',edit!.id,edit!.input);
+  expect(fs.readFileSync(f.recorder.file,'utf8')).not.toContain(edit!.input.new_string);
+  expect(fs.statSync(f.recorder.file+'.edit.json').mode&0o777).toBe(0o600);
+  const owned=currentFilePermissionBinding([{file:f.recorder.file,expected:f.expected}],f.cwd,f.config,f.startedAt,readPlanCountTranscript(f.config,f.cwd),f.c.screen);
+  expect(owned?.epoch.pendingId).toBe(`${f.sid}:${edit!.id}`);
+  const guard=createPlanCountPermissionGuard();expect(guard(f.c.screen,'',f.read())).toBe('grant');expect(guard(f.c.screen,'',f.read())).toBe('handled');
+  // Publication later must agree with the witness; completion retires it.
+  f.write([...f.base,f.native('assistant',[f.block(edit!)])]);expect(f.read()?.pendingId).toBe(`${f.sid}:${edit!.id}`);
+  f.write([...f.base,f.native('assistant',[f.block({...edit!,input:{...edit!.input,new_string:edit!.input.new_string+'\nhidden'}})])]);expect(f.read()).toBeNull();
+  f.write();f.hook('PostToolUse','Edit',edit!.id,edit!.input);
+  expect(fs.existsSync(f.recorder.file+'.edit.json')).toBe(false);expect(f.read()).toBeNull();
+ }finally{f.close();}
+});
+
+// Gate 39293281037 attempt 1: the viewport kept the bare cwd-relative file row above the diff rule.
+test('ci-39293281037-a1: a crop headed by the owned cwd-relative file row is granted once from its PreToolUse input',()=>{
+ const f=edits('ci-39293281037-a1');try{
+  expect(f.c.recorded).toMatchObject({outcome:'timeout',transcriptStatus:'ready',publishedEdits:0});
+  expect(createHash('sha256').update(f.c.screen).digest('hex')).toBe(f.c.screenSha256);
+  expect(f.c.screen.split('\n')[0]).toBe(' gstack-test-plan-ceo-floor.md');
+  expect(isCroppedEditPermissionVisible(f.c.screen)).toBe(true);
+  const [edit]=f.pending;expect(f.read()).toBeNull();
+  f.hook('PreToolUse','Edit',edit!.id,edit!.input);
+  expect(f.read()?.pendingId).toBe(`${f.sid}:${edit!.id}`);
+  const guard=createPlanCountPermissionGuard();expect(guard(f.c.screen,'',f.read())).toBe('grant');expect(guard(f.c.screen,'',f.read())).toBe('handled');
+  expect(isPermissionDialogVisible(f.c.screen)).toBe(false);
+ }finally{f.close();}
+});
+
+test.each(['foreign-directory','foreign-basename','numbered-row','changed-row','unwitnessed'])('ci-39293281037-a1 header negative control: %s is refused',mode=>{
+ const f=edits('ci-39293281037-a1');try{
+  const [edit]=f.pending;let screen=f.c.screen;
+  if(mode!=='unwitnessed')f.hook('PreToolUse','Edit',edit!.id,edit!.input);
+  if(mode==='foreign-directory')screen=screen.replace(' gstack-test-plan-ceo-floor.md\n',' other/gstack-test-plan-ceo-floor.md\n');
+  if(mode==='foreign-basename')screen=screen.replace(' gstack-test-plan-ceo-floor.md\n',' notes.md\n');
+  if(mode==='numbered-row')screen=screen.replace(' gstack-test-plan-ceo-floor.md\n',' 58  gstack-test-plan-ceo-floor.md\n');
+  if(mode==='changed-row')screen=screen.replace('Header: Premise','Header: Pricing');
+  expect(f.read(screen)).toBeFalsy();
+  expect(createPlanCountPermissionGuard()(screen,'',f.read(screen))).not.toBe('grant');
+ }finally{f.close();}
+});
+
+test.each(['before','after'])('t04: the menu binds to the one of three pending owned Edits its diff shows (later hooks %s the menu)',order=>{
+ const f=edits('t04');try{
+  expect(f.c.recorded).toMatchObject({outcome:'permission_unanswered',publishedEdits:3});
+  f.write([...f.base,f.native('assistant',f.pending.map(f.block))]);
+  for(const e of order==='before'?f.pending:f.pending.slice(0,1))f.hook('PreToolUse','Edit',e.id,e.input);
+  const [shown,...rest]=f.pending;
+  expect(f.read()?.pendingId).toBe(`${f.sid}:${shown!.id}`);
+  const guard=createPlanCountPermissionGuard();expect(guard(f.c.screen,'',f.read())).toBe('grant');expect(guard(f.c.screen,'',f.read())).toBe('handled');
+  // After the shown Edit lands, its stale render never binds to the other two.
+  const before=fs.readFileSync(f.expected,'utf8');
+  fs.writeFileSync(f.expected,before.replace(shown!.input.old_string,shown!.input.new_string));
+  f.hook('PostToolUse','Edit',shown!.id,shown!.input);
+  f.write([...f.base,f.native('assistant',f.pending.map(f.block)),f.native('user',[{type:'tool_result',tool_use_id:shown!.id,content:'ok'}])]);
+  if(order==='after')for(const e of rest)f.hook('PreToolUse','Edit',e.id,e.input);
+  expect(f.read()).toBeNull();
+ }finally{f.close();}
+});
+
+test.each(['foreign-file-published','foreign-file-hook','no-match','two-matches-witnessed','two-matches-published','unwitnessed','foreign-session','foreign-session-journal','changed-witness','sidechain'])
+('owned Edit menu negative control: %s is refused',mode=>{
+ const f=edits(mode.includes('published')||mode==='unwitnessed'?'t04':'t07');try{
+  const [edit]=f.pending;let screen=f.c.screen;
+  if(mode==='foreign-file-published'){
+   f.write([...f.base,f.native('assistant',[...f.pending.map(f.block),f.block({id:'foreign-edit',input:{...edit!.input,file_path:path.join(f.dir,'foreign.md')}})])]);
+   for(const e of f.pending)f.hook('PreToolUse','Edit',e.id,e.input);
+  }
+  if(mode==='foreign-file-hook')f.hook('PreToolUse','Edit',edit!.id,{...edit!.input,file_path:path.join(f.dir,f.c.basename)});
+  if(mode==='no-match'){f.hook('PreToolUse','Edit',edit!.id,edit!.input);screen=screen.replace('Recommendation: B','Recommendation: A');}
+  if(mode==='two-matches-witnessed'){f.hook('PreToolUse','Edit',edit!.id,edit!.input);f.hook('PreToolUse','Edit','twin-edit',edit!.input);}
+  if(mode==='two-matches-published'){
+   f.write([...f.base,f.native('assistant',[...f.pending.map(f.block),f.block({id:'twin-edit',input:edit!.input})])]);
+   for(const e of f.pending)f.hook('PreToolUse','Edit',e.id,e.input);
+  }
+  if(mode==='unwitnessed'){f.write([...f.base,f.native('assistant',f.pending.map(f.block))]);for(const e of f.pending.slice(1))f.hook('PreToolUse','Edit',e.id,e.input);}
+  if(mode==='foreign-session'||mode==='foreign-session-journal'){
+   const foreign='11111111-2222-4333-8444-555555555555',journal=path.join(f.config,'projects','owned',foreign+'.jsonl');
+   if(mode==='foreign-session-journal')fs.writeFileSync(journal,JSON.stringify(f.native('assistant',[f.block(edit!)],foreign))+'\n');
+   f.hook('PreToolUse','Edit',edit!.id,edit!.input,{session_id:foreign,transcript_path:journal});
+  }
+  if(mode==='changed-witness'){f.hook('PreToolUse','Edit',edit!.id,edit!.input);fs.appendFileSync(f.recorder.file+'.edit.json',' ');}
+  if(mode==='sidechain')f.hook('PreToolUse','Edit',edit!.id,edit!.input,{agent_id:'helper'});
   expect(f.read(screen)).toBeFalsy();
   expect(createPlanCountPermissionGuard()(screen,'',f.read(screen))).not.toBe('grant');
  }finally{f.close();}

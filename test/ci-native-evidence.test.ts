@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runPaidShard, shardSlug } from '../scripts/test-paid-shards';
+import { CENSUS_ARMS } from '../scripts/census-arms';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const workflows = ['evals.yml', 'evals-periodic.yml', 'evals-marathon.yml'].map(name => ({
@@ -43,7 +44,7 @@ function render(template: string, fields: Record<string, string>): string {
 
 test('every direct CI paid executor binds a safe unique run/attempt/job/slice identity', () => {
   expect(executors.map(({ name, jobName }) => `${name}:${jobName}`)).toEqual([
-    'evals.yml:eval-slices', 'evals-periodic.yml:eval-slices', 'evals-periodic.yml:eval-codex-slices', 'evals-periodic.yml:gate-census', 'evals-marathon.yml:eval-slices',
+    'evals.yml:eval-slices', 'evals.yml:eval-rerun', 'evals-periodic.yml:eval-slices', 'evals-periodic.yml:eval-codex-slices', 'evals-periodic.yml:gate-census', 'evals-marathon.yml:eval-slices',
   ]);
   const ids = new Set<string>();
   for (const [workflowIndex, { job, step }] of executors.entries()) {
@@ -52,19 +53,24 @@ test('every direct CI paid executor binds a safe unique run/attempt/job/slice id
     else expect(step.run).toContain('--user "$(id -u):$(id -g)"');
     const env = executorEnv(job, step);
     expect(env.EVALS_RUN_ID).toBeString();
+    // The gate census matrix is one row per census arm and planned slice (scripts/census-arms.ts).
+    const armed = job.strategy.matrix.include !== undefined;
     for (const run of ['36302678692', '36302678693']) {
       for (const attempt of ['1', '2']) {
         // The planner sizes the matrix; cover more slices than any live plan.
-        expect(job.strategy.matrix.slice).toMatch(/^\$\{\{ fromJSON\(needs\.plan-slices\.outputs\.(?:[a-z]+_)*slices\) \}\}$/);
-        for (let slice = 1; slice <= 64; slice++) {
-          const id = render(env.EVALS_RUN_ID, {
-            'github.run_id': `${run}${workflowIndex}`,
-            'github.run_attempt': attempt, 'matrix.slice': String(slice),
-          });
-          expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
-          expect(id.length).toBeLessThan(120);
-          expect(ids.has(id)).toBe(false);
-          ids.add(id);
+        expect(armed ? job.strategy.matrix.include : job.strategy.matrix.slice)
+          .toMatch(armed ? /^\$\{\{ fromJSON\(needs\.plan-slices\.outputs\.gate_matrix\) \}\}$/ : /^\$\{\{ fromJSON\(needs\.(?:plan-slices|rerun-plan)\.outputs\.(?:[a-z]+_)*slices\) \}\}$/);
+        for (const arm of armed ? Object.keys(CENSUS_ARMS) : ['']) {
+          for (let slice = 1; slice <= 64; slice++) {
+            const id = render(env.EVALS_RUN_ID, {
+              'github.run_id': `${run}${workflowIndex}`,
+              'github.run_attempt': attempt, 'matrix.slice': String(slice), 'matrix.arm': arm,
+            });
+            expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+            expect(id.length).toBeLessThan(120);
+            expect(ids.has(id)).toBe(false);
+            ids.add(id);
+          }
         }
       }
     }
@@ -79,7 +85,7 @@ for (const { name, jobName, job, step } of executors) {
     fs.mkdirSync(home); fs.mkdirSync(bin); fs.mkdirSync(path.join(root, 'test'));
     const configured = executorEnv(job, step);
     const runId = render(configured.EVALS_RUN_ID, {
-      'github.run_id': '36302678692', 'github.run_attempt': '2', 'matrix.slice': '4',
+      'github.run_id': '36302678692', 'github.run_attempt': '2', 'matrix.slice': '4', 'matrix.arm': 'codex-sol',
     });
     const evalDir = path.join(root, path.basename(configured.GSTACK_EVAL_DIR));
     const file = 'test/native-launch.test.ts';

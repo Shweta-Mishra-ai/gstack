@@ -20,6 +20,7 @@ allowed-tools:
   - Bash
   - AskUserQuestion
   - WebSearch
+{{CEO_MODE_HANDOFF_HOOK}}
 triggers:
   - think bigger
   - expand scope
@@ -157,10 +158,7 @@ Read ETHOS.md at the preamble's Search Before Building path. Before challenging 
 - "[key feature] alternatives"
 - "why [incumbent/conventional approach] [succeeds/fails]"
 
-```bash
-{{ASIDE_EXEC_PRELUDE}}
-_aside_exec "Search the web for [product category] landscape {current year} and [key feature] alternatives. Read-only: do not sign in, submit, or change anything. Reply with up to 8 bullets, each with its source URL, then stop."
-```
+Prompt file text (create, write and send it with the Web research runs in Aside blocks above): `[product category] landscape {current year} and [key feature] alternatives. Reply with up to 8 bullets, each with its source URL.`
 
 If the Aside check did not print `READY`, run the same queries with the WebSearch tool when the host provides it; with neither, skip this check and note: "Search unavailable — proceeding with in-distribution knowledge only."
 
@@ -251,6 +249,8 @@ solves the pain directly or only a proxy.
 ### 0B. Existing Code Leverage
 Map each sub-problem to reusable code. For any rebuild, explain why refactoring
 the existing path is worse.
+
+{{PLAN_REALITY_ROWS:ceo}}
 
 ### 0C. Dream State Mapping
 Describe the 12-month ideal and whether this plan moves toward it.
@@ -407,7 +407,7 @@ Follow the preamble's session rules; `CONDUCTOR_SESSION: true` changes transport
    wins. When `QUESTION_TUNING: true`, include `<gstack-qid:plan-ceo-review-mode>`.
    These modes differ in kind, not coverage; do NOT score completeness.
 
-4. **Mode handoff:** After selection, before other tools or further questions, run `~/.claude/skills/gstack/bin/gstack-ceo-mode-handoff "<selected mode>" --decisions "<rows or none>"` (add `--auto` for `plan-ceo-review-mode: AUTO_DECIDE`). It prints the matching line below. Then send brief chat beginning with that line: the mode's application and rationale; every governing approved row's ID, answer reference and accepted scope. Keep rows separate.
+4. **Mode handoff:** After selection, before other tools or further questions, run `~/.claude/skills/gstack/bin/gstack-ceo-mode-handoff "<selected mode>" --decisions "<rows or none>"` (add `--auto` for `plan-ceo-review-mode: AUTO_DECIDE`). It prints the matching line below. Then send brief chat beginning with that line, copied verbatim (the terminal collapses tool output, so the user sees it only in your chat; never a paraphrase such as "I've set review mode…"), before any other tool call, plan write or section load, and never skip the helper: the mode's application and rationale; every governing approved row's ID, answer reference and accepted scope. Keep rows separate.
 - `plan-ceo-review-mode: AUTO_DECIDE`: `Auto-decided review mode → <selected mode> (your preference). Change with /plan-tune. Approved decisions: <rows or none>. <Application and rationale>.`
 - Other selections: `Mode: <selected mode>; approved decisions: <rows or none>. <Application and rationale>.`
 

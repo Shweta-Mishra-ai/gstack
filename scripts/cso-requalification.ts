@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Requalification triggers: the inputs a runtime qualification was measured
  * under. A promoted catalog records them; a catalog whose recorded triggers

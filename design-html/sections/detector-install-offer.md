@@ -34,7 +34,7 @@ Net: a pinned, logged 16 MB download for machine-checked findings, versus every 
 On **A**, run the install and read its first line (`IMPECCABLE_INSTALLED: <path>` then the fresh probe lines, or `IMPECCABLE_INSTALL_REFUSED: <reason>`, after which this skill continues without scans):
 
 ```bash
-bun --no-env-file run $HOME/.claude/skills/gstack/bin/gstack-design-detect.ts install --host claude
+bun --no-env-file --config=/dev/null run $HOME/.claude/skills/gstack/bin/gstack-design-detect.ts install --host claude
 ```
 
 On **B**, continue without scans. On **C**, run `~/.claude/skills/gstack/bin/gstack-config set design_detector_install_prompted true`. On **D**, run `~/.claude/skills/gstack/bin/gstack-config set design_detector off`. Never pass `--sha256` or `--base` yourself: they exist for maintainers and mirrors. If the user also wants the `/impeccable` skill and its hook, they run `npx impeccable install` themselves; gstack never does.

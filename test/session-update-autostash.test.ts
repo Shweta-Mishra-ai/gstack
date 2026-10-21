@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test';
+import { afterEach, describe, test, expect } from 'bun:test';
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -138,7 +138,7 @@ describe('gstack-session-update lock identity + TTL (#2613)', () => {
     const realGit = execFileSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
     fs.writeFileSync(
       path.join(shimDir, 'git'),
-      `#!/usr/bin/env bash\ncase "$*" in *pull*) sleep ${sleepSecs};; esac\nexec "${realGit}" "$@"\n`,
+      `#!/usr/bin/env bash\ncase "$*" in *fetch*) sleep ${sleepSecs};; esac\nexec "${realGit}" "$@"\n`,
       { mode: 0o755 },
     );
     return shimDir;
@@ -249,9 +249,8 @@ describe('gstack-session-update lock identity + TTL (#2613)', () => {
     // even that one is ownership-checked (see the static pin below).
     const bareRms = src.match(/rm -rf "\$LOCK_DIR"(?!\.)/g) || [];
     expect(bareRms.length).toBe(1);
-    expect(src).toContain(
-      `trap 'kill "$HB_PID" 2>/dev/null; [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR" 2>/dev/null' EXIT`,
-    );
+    expect(src).toContain('[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR" 2>/dev/null');
+    expect(src).toContain('trap cleanup_session_update EXIT');
   });
 
   test('EXIT trap is ownership-checked and a heartbeat runs during pull/setup (static pins)', () => {
@@ -259,9 +258,10 @@ describe('gstack-session-update lock identity + TTL (#2613)', () => {
     // (a) After a TTL reclaim by another updater, $LOCK_DIR belongs to the
     // NEW holder — the old holder's trap must remove the lock ONLY while the
     // pidfile still contains ITS pid (MYPID captured at write time).
-    const trapLine = src.split('\n').find((l) => l.includes("trap '") && l.includes('rm -rf "$LOCK_DIR"'));
-    expect(trapLine).toBeDefined();
-    expect(trapLine!).toContain('[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR"');
+    const cleanup = src.match(/\n  cleanup_session_update\(\) \{\n[\s\S]*?\n  \}\n/)?.[0];
+    expect(cleanup).toBeDefined();
+    expect(src).toContain('trap cleanup_session_update EXIT');
+    expect(cleanup!).toContain('[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR"');
     // MYPID is written to the pidfile (the identity the trap compares against).
     expect(src).toContain('MYPID="${BASHPID:-$(sh -c \'echo $PPID\')}"');
     expect(src).toContain('echo "$MYPID" > "$LOCK_DIR/pid"');
@@ -270,11 +270,12 @@ describe('gstack-session-update lock identity + TTL (#2613)', () => {
     // got reclaimed while ALIVE. The loop re-checks ownership each beat and
     // exits instead of touching a reclaimed holder's pidfile.
     expect(src).toMatch(
-      /while :; do sleep 300; \[ "\$\(cat "\$LOCK_DIR\/pid" 2>\/dev\/null\)" = "\$MYPID" \] \|\| exit 0; touch "\$LOCK_DIR\/pid" 2>\/dev\/null; done/,
+      /while :; do\n\s+sleep 300 &\n\s+wait "\$!" \|\| exit 0\n\s+\[ "\$\(cat "\$LOCK_DIR\/pid" 2>\/dev\/null\)" = "\$MYPID" \] \|\| exit 0\n\s+touch "\$LOCK_DIR\/pid" 2>\/dev\/null\n\s+done/,
     );
     expect(src).toContain('HB_PID=$!');
     // The trap stops the heartbeat so it can never outlive the holder.
-    expect(trapLine!).toContain('kill "$HB_PID"');
+    expect(cleanup!).toContain('kill "$heartbeat"');
+    expect(cleanup!).toContain('${HB_PID:-$(jobs -p)}');
   });
 
   test('an expired-TTL lock is reclaimed even when its pid is alive (PID reuse)', async () => {
@@ -299,4 +300,288 @@ describe('gstack-session-update lock identity + TTL (#2613)', () => {
       fs.rmSync(base, { recursive: true, force: true });
     }
   }, 30000);
+});
+
+// ── A conflicting autostash pop: judged by unmerged files, never by exit code ──
+//
+// When the carried-over edits conflict with the incoming revision, git (2.56
+// at least) still exits 0 from `merge --ff-only --autostash` and leaves
+// conflict markers in the live checkout, where Claude Code runs hooks from.
+// The updater reads the unmerged files instead: it puts the checked revision
+// back and keeps the edits. It never drops a stash entry, because refs/stash is
+// shared with every worktree and its top entry may not be the autostash.
+
+describe.skipIf(process.platform === 'win32')('gstack-session-update: a conflicting autostash pop', () => {
+  const bases: string[] = [];
+  afterEach(() => { for (const b of bases.splice(0)) fs.rmSync(b, { recursive: true, force: true }); });
+
+  function makeConflictFixture() {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-supd-pop-')));
+    bases.push(base);
+    const origin = path.join(base, 'origin.git');
+    const seed = path.join(base, 'seed');
+    const install = path.join(base, 'install');
+    const state = path.join(base, 'state');
+    const home = path.join(base, 'home');
+    fs.mkdirSync(state, { recursive: true });
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin], { timeout: 30_000 });
+    fs.mkdirSync(path.join(seed, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(seed, 'VERSION'), '1.0.0\n');
+    fs.writeFileSync(path.join(seed, 'notes.txt'), 'top\nmiddle\nbottom\n');
+    fs.writeFileSync(path.join(seed, 'bin', 'gstack-config'),
+      '#!/usr/bin/env bash\nif [ "$1" = "get" ]; then case "$2" in auto_upgrade) echo true;; skill_prefix) echo false;; *) echo "";; esac; fi\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(seed, 'bin', 'gstack-patch-names'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(seed, 'setup'), '#!/usr/bin/env bash\necho "$*" >> "$SETUP_CALLS"\nexit 0\n', { mode: 0o755 });
+    git(seed, 'init', '-q');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'seed');
+    git(seed, 'branch', '-M', 'main');
+    git(seed, 'remote', 'add', 'origin', origin);
+    git(seed, 'push', '-q', 'origin', 'main');
+    execFileSync('git', ['clone', '-q', origin, install], { timeout: 30_000 });
+    return { base, seed, install, state, home, calls: path.join(base, 'calls') };
+  }
+  type Fx = ReturnType<typeof makeConflictFixture>;
+
+  function release(fx: Fx, version: string, notes: string): string {
+    fs.writeFileSync(path.join(fx.seed, 'notes.txt'), notes);
+    fs.writeFileSync(path.join(fx.seed, 'VERSION'), `${version}\n`);
+    git(fx.seed, 'add', '-A');
+    git(fx.seed, 'commit', '-qm', `release ${version}`);
+    git(fx.seed, 'push', '-q', 'origin', 'main');
+    return git(fx.seed, 'rev-parse', 'HEAD');
+  }
+
+  function runHook(fx: Fx, pathPrefix = '', extraEnv: Record<string, string> = {}) {
+    return spawnSync('bash', [SCRIPT], {
+      encoding: 'utf8',
+      env: { PATH: `${pathPrefix}${path.dirname(process.execPath)}:${process.env.PATH}`, HOME: fx.home, GSTACK_DIR: fx.install, GSTACK_STATE_ROOT: fx.state, SETUP_CALLS: fx.calls, TMPDIR: fx.base, ...extraEnv },
+      timeout: 20_000,
+    });
+  }
+
+  // The real git binary, pinned once: `git --exec-path` runs through any PATH
+  // wrapper (a guard that resolves "the next git on PATH" would loop back
+  // into a shim) and names the directory of the binary itself.
+  function realGit(): string {
+    const dir = execFileSync('git', ['--exec-path'], { encoding: 'utf8', timeout: 30_000 }).trim();
+    const bin = path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git');
+    try { fs.accessSync(bin, fs.constants.X_OK); } catch { throw new Error(`cannot pin the real git binary: ${bin} (from git --exec-path) is not executable`); }
+    return bin;
+  }
+  // shim(fx, name, tool, body): a PATH prefix whose <tool> runs <body> first
+  // and otherwise execs the real one ("$REAL").
+  function shim(fx: Fx, name: string, tool: string, body: string): string {
+    const dir = path.join(fx.base, name);
+    fs.mkdirSync(dir, { recursive: true });
+    const real = tool === 'git' ? realGit() : execFileSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf8', timeout: 30_000 }).trim();
+    fs.writeFileSync(path.join(dir, tool), `#!/bin/bash\nREAL="${real}"\n${body}\nexec "$REAL" "$@"\n`, { mode: 0o755 });
+    return `${dir}:`;
+  }
+  const FIXED_DATES = { GIT_AUTHOR_DATE: '2026-10-15T12:00:00Z', GIT_COMMITTER_DATE: '2026-10-15T12:00:00Z' };
+  /** The rescue commit id gstack-ff-update makes for this install, from a copy of it. */
+  function predictRescue(fx: Fx): string {
+    const copy = path.join(fx.base, 'predict');
+    fs.cpSync(fx.install, copy, { recursive: true });
+    const r = spawnSync('bash', [path.join(ROOT, 'bin', 'gstack-ff-update'), copy, 'origin/main'], { encoding: 'utf8', env: { ...process.env, ...FIXED_DATES }, timeout: 30_000 });
+    const m = r.stdout.match(/^rescued \S+ \S+ refs\/gstack\/rescue\/([0-9a-f]{40}) /);
+    if (!m) throw new Error(`no rescue predicted: ${r.stdout}${r.stderr}`);
+    fs.rmSync(copy, { recursive: true, force: true });
+    return m[1];
+  }
+  // A git whose `ls-files -u` fails with empty output from call <from> on.
+  const unreadableIndexGit = (fx: Fx, from: number) =>
+    shim(fx, 'unreadable-index-git', 'git', [
+      'case " $* " in *" ls-files -u "*)',
+      `  n=$(( $(cat "${fx.base}/ls-files-calls" 2>/dev/null || echo 0) + 1 )); echo "$n" > "${fx.base}/ls-files-calls"`,
+      `  [ "$n" -ge ${from} ] && { echo "fatal: index file corrupt" >&2; exit 128; } ;;`,
+      'esac',
+    ].join('\n'));
+
+  async function waitFor(fx: Fx, pattern: RegExp, ms = 30_000): Promise<string> {
+    const logFile = path.join(fx.state, 'analytics', 'session-update.log');
+    const deadline = Date.now() + ms;
+    let content = '';
+    while (Date.now() < deadline) {
+      content = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+      if (pattern.test(content) && !fs.existsSync(path.join(fx.state, '.setup-lock'))) return content;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`timed out waiting for ${pattern}; log:\n${content}`);
+  }
+
+  const unmerged = (fx: Fx) => git(fx.install, 'ls-files', '-u');
+  const notes = (fx: Fx) => fs.readFileSync(path.join(fx.install, 'notes.txt'), 'utf8');
+
+  test('leaves no conflict markers, keeps the edits, and still sets up', async () => {
+    const fx = makeConflictFixture();
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    const incoming = release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx);
+    const log = await waitFor(fx, /Z UPDATED from=1\.0\.0 to=1\.1\.0/);
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(incoming);
+    expect(unmerged(fx)).toBe('');
+    expect(notes(fx)).toBe('top UPSTREAM\nmiddle\nbottom\n');
+    const kept = log.match(/AUTOSTASH_CONFLICT_RECOVERED tree_reset=1 kept_stash=([0-9a-f]{40}) kept_ref=refs\/gstack\/rescue\/([0-9a-f]{40}) unmerged=0/);
+    expect(kept, log).not.toBeNull();
+    expect(kept![2]).toBe(kept![1]);
+    expect(git(fx.install, 'stash', 'show', '-p', kept![1])).toContain('+top LOCAL');
+    expect(spawnSync('git', ['rev-parse', '-q', '--verify', 'refs/stash'], { cwd: fx.install, timeout: 30_000 }).status).not.toBe(0);
+    expect(fs.readFileSync(fx.calls, 'utf8')).toContain('--refresh-registered');
+  }, 60_000);
+
+  test('never drops a stash entry it did not make', async () => {
+    const fx = makeConflictFixture();
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top\nmiddle\nbottom MINE\n');
+    git(fx.install, 'stash', 'push', '-q', '-m', 'keep me');
+    const mine = git(fx.install, 'rev-parse', 'refs/stash');
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx);
+    const log = await waitFor(fx, /Z UPDATED /);
+    const kept = log.match(/kept_stash=([0-9a-f]{40})/);
+    expect(kept, log).not.toBeNull();
+    expect(git(fx.install, 'stash', 'list', '--format=%H').split('\n')).toEqual([mine]);
+    expect(git(fx.install, 'rev-parse', 'refs/stash')).toBe(mine);
+    expect(git(fx.install, 'rev-parse', `refs/gstack/rescue/${kept![1]}`)).toBe(kept![1]);
+  }, 60_000);
+
+  test('a held refs/stash.lock does not matter: the edits are anchored outside refs/stash', async () => {
+    const fx = makeConflictFixture();
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+    // A held lock: git prints "cannot store <id>" and nothing references the
+    // autostash commit.
+    const lock = path.join(fx.install, '.git', 'refs', 'stash.lock');
+    fs.writeFileSync(lock, '');
+
+    runHook(fx);
+    const log = await waitFor(fx, /Z UPDATED /);
+    fs.rmSync(lock);
+    expect(unmerged(fx)).toBe('');
+    const kept = log.match(/kept_stash=([0-9a-f]{40}) kept_ref=(refs\/gstack\/rescue\/[0-9a-f]{40})/);
+    expect(kept, log).not.toBeNull();
+    expect(git(fx.install, 'rev-parse', kept![2])).toBe(kept![1]);
+    expect(git(fx.install, 'stash', 'show', '-p', kept![1])).toContain('+top LOCAL');
+  }, 60_000);
+
+  test('a rescue ref that already names another commit is never overwritten, and nothing moves', async () => {
+    const fx = makeConflictFixture();
+    const oldHead = git(fx.install, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+    git(fx.install, 'fetch', '-q');
+    const oid = predictRescue(fx);
+    git(fx.install, 'update-ref', `refs/gstack/rescue/${oid}`, oldHead);
+
+    runHook(fx, '', FIXED_DATES);
+    const log = await waitFor(fx, /Z HELD /);
+    expect(log).toContain(`HELD autostash-unrecoverable: rescue ref refs/gstack/rescue/${oid} already exists and names another commit`);
+    expect(log).not.toContain('AUTOSTASH_CONFLICT_RECOVERED');
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(git(fx.install, 'rev-parse', `refs/gstack/rescue/${oid}`)).toBe(oldHead);
+    expect(notes(fx)).toBe('top LOCAL\nmiddle\nbottom\n');
+    expect(fs.existsSync(fx.calls)).toBe(false);
+  }, 60_000);
+
+  test('a held update clears once its cause is gone, and setup runs', async () => {
+    const fx = makeConflictFixture();
+    const oldHead = git(fx.install, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    const incoming = release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+    git(fx.install, 'fetch', '-q');
+    const oid = predictRescue(fx);
+    git(fx.install, 'update-ref', `refs/gstack/rescue/${oid}`, oldHead);
+    runHook(fx, '', FIXED_DATES);
+    await waitFor(fx, /Z HELD autostash-unrecoverable/);
+    expect(runHook(fx, '', FIXED_DATES).stdout).toContain('update held (autostash-unrecoverable: ');
+
+    // The person deletes the unrelated ref; the next check (past the throttle) updates.
+    git(fx.install, 'update-ref', '-d', `refs/gstack/rescue/${oid}`);
+    fs.rmSync(path.join(fx.state, '.last-session-update'), { force: true });
+    runHook(fx, '', FIXED_DATES);
+    const after = await waitFor(fx, /Z UPDATED from=1\.0\.0 to=1\.1\.0/);
+    expect(after).toContain(`kept_ref=refs/gstack/rescue/${oid}`);
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(incoming);
+    expect(notes(fx)).toBe('top UPSTREAM\nmiddle\nbottom\n');
+    expect(fs.readFileSync(fx.calls, 'utf8')).toContain('--refresh-registered');
+  }, 90_000);
+
+  test('an index that cannot be read before the merge holds the checkout where it is', async () => {
+    const fx = makeConflictFixture();
+    const oldHead = git(fx.install, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx, unreadableIndexGit(fx, 1));
+    const log = await waitFor(fx, /Z PULL_FAILED /);
+    expect(log).toContain('cannot read the index');
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(notes(fx)).toBe('top LOCAL\nmiddle\nbottom\n');
+    expect(fs.existsSync(fx.calls)).toBe(false);
+  }, 60_000);
+
+  test('an index that cannot be read after the merge is never taken as clean', async () => {
+    const fx = makeConflictFixture();
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx, unreadableIndexGit(fx, 2));
+    const log = await waitFor(fx, /Z PULL_FAILED /);
+    expect(log).toContain('cannot read the index');
+    expect(log).not.toContain('UPDATED');
+    expect(fs.existsSync(fx.calls)).toBe(false);
+  }, 60_000);
+
+  test('without a file for git\'s messages, the update is held before the merge', async () => {
+    const fx = makeConflictFixture();
+    const oldHead = git(fx.install, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top LOCAL\nmiddle\nbottom\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx, shim(fx, 'no-pull-tmp', 'mktemp', 'case " $* " in *gstack-session-pull*) exit 1 ;; esac'));
+    const log = await waitFor(fx, /Z HELD /);
+    expect(log).toContain('HELD temp-file-unavailable');
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(notes(fx)).toBe('top LOCAL\nmiddle\nbottom\n');
+    expect(fs.existsSync(fx.calls)).toBe(false);
+  }, 60_000);
+
+  test('files left unmerged before the update hold the checkout where it is', async () => {
+    const fx = makeConflictFixture();
+    const oldHead = git(fx.install, 'rev-parse', 'HEAD');
+    // Someone's own merge or stash pop left a conflict: three index stages.
+    const blob = (body: string) => execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: fx.install, input: body, encoding: 'utf8', timeout: 30_000 }).trim();
+    const stages = [blob('top\nmiddle\nbottom\n'), blob('top OURS\nmiddle\nbottom\n'), blob('top THEIRS\nmiddle\nbottom\n')];
+    git(fx.install, 'update-index', '--force-remove', 'notes.txt');
+    execFileSync('git', ['update-index', '--index-info'], {
+      cwd: fx.install, timeout: 30_000,
+      input: stages.map((sha, i) => `100644 ${sha} ${i + 1}\tnotes.txt\n`).join(''),
+    });
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), '<<<<<<< ours\ntop OURS\n=======\ntop THEIRS\n>>>>>>> theirs\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx);
+    const log = await waitFor(fx, /Z HELD /);
+    expect(log).toContain('HELD unmerged-files: 1 unmerged file(s) in the install (first: notes.txt)');
+    expect(log).not.toContain('AUTOSTASH_CONFLICT_RECOVERED');
+    expect(git(fx.install, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(unmerged(fx).split('\n')).toHaveLength(3);
+    expect(notes(fx)).toContain('top THEIRS');
+    expect(fs.existsSync(fx.calls)).toBe(false);
+  }, 60_000);
+
+  test('a local edit that does not conflict rides over the update (control)', async () => {
+    const fx = makeConflictFixture();
+    fs.writeFileSync(path.join(fx.install, 'notes.txt'), 'top\nmiddle\nbottom LOCAL\n');
+    release(fx, '1.1.0', 'top UPSTREAM\nmiddle\nbottom\n');
+
+    runHook(fx);
+    const log = await waitFor(fx, /Z UPDATED /);
+    expect(log).not.toContain('AUTOSTASH_CONFLICT_RECOVERED');
+    expect(notes(fx)).toBe('top UPSTREAM\nmiddle\nbottom LOCAL\n');
+  }, 60_000);
 });

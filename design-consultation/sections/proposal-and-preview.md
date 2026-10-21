@@ -119,7 +119,9 @@ Write the product brief to that path; remember its absolute path across fresh Ba
 **Check Codex availability:**
 ```bash
 
-if ( # GSTACK_ACTIVE_HOST names the harness, never the model.
+if ! _OUTSIDE_CFG=$("$HOME/.claude/skills/gstack/bin/gstack-config" get --stored codex_reviews) || [ "$_OUTSIDE_CFG" = disabled ]; then
+  echo 'CODEX_MODE: disabled'
+elif ( # GSTACK_ACTIVE_HOST names the harness, never the model.
 if { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
   echo 'Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage.' >&2
   if { [ -n "${CLAUDECODE:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = claude ]; } && { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
@@ -136,9 +138,9 @@ else
 fi
 ```
 
-The historical `CODEX_MODE` variable describes **Codex** availability here. Authentication and configured model validity are checked by the actual invocation, without overriding either. Missing/broken CLI: install or repair Codex; authentication failure: run `codex login`. Honor this caller’s existing opt-in/skip choice. Any non-ready outcome is missing outside coverage; follow the caller’s existing fallback. Never substitute another external provider.
+The historical `CODEX_MODE` variable describes **Codex** availability here. `CODEX_MODE: disabled` or a send's `consent_missing` line: `codex_reviews` is off or unreadable; do not ask; record `outside_status: disabled`. Authentication and configured model validity are checked by the actual invocation, without overriding either. Missing/broken CLI: install or repair Codex; authentication failure: run `codex login`. Otherwise honor this caller’s opt-in/skip choice. Any non-ready outcome is missing outside coverage; follow the caller’s existing fallback. Never substitute another external provider.
 
-Non-ready CLI: retain its repair notice and use only the native voice. The invocation deliberately rechecks the harness before spawning; native success never replaces external coverage.
+`CODEX_MODE: disabled` or a non-ready CLI: retain any repair notice and use only the native voice. The invocation deliberately rechecks the harness before spawning; native success never replaces external coverage.
 
 **When ready**, run both voices and await both before synthesis. Overlap calls
 if supported; keep the native call blocking.
@@ -178,16 +180,19 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
-_gstack_codex_sandbox_preflight >/dev/null || exit 1
-_gstack_codex_first_use_notice
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+_CODEX_OUT=$("$_CODEX_PROBE" select-model exec) || exit 1
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" check-sandbox || exit 1
+"$_CODEX_PROBE" show-first-use-notice
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 300 codex exec - -C "$_REPO_ROOT" -s "${_GSTACK_CODEX_SANDBOX:?}" -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+"$_CODEX_PROBE" run-with-timeout --effort medium 300 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 _OUTSIDE_RC=0
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" proposal "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
 case "$_OUTSIDE_RC" in
   0|3) ;;
   4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
@@ -198,7 +203,7 @@ echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 
 Use Bash `timeout: 360000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing Recommendation markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Continue completed proposals; native completion does not count as outside coverage. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
-2. **Claude design subagent** (Agent tool, `run_in_background: false`; await its result):
+2. **Claude design subagent** (Agent tool, `run_in_background: false` when available; await its result. A launch receipt means it went background: await its completion notice.):
 "Read the complete product brief at [the absolute DESIGN_BRIEF path printed above].
 
 Propose a surprising indie-studio direction beyond conventional enterprise UI.
@@ -303,20 +308,35 @@ mkdir -p "$_DESIGN_DIR"
 echo "DESIGN_DIR: $_DESIGN_DIR"
 ```
 
-Brief: Phase 3 aesthetic/colors/type/spacing/layout plus Phase 1 product context:
+Brief: Phase 3 aesthetic/colors/type/spacing/layout plus Phase 1 product context, written into a private file:
 
 ```bash
-_OUT=$($D variants --brief "<product name: [name]. Product type: [type]. Aesthetic: [direction]. Colors: primary [hex], secondary [hex], neutrals [range]. Typography: display [font], body [font]. Layout: [approach]. Show a realistic [page type] screen with [specific content for this product].>" --count 3 --output-dir "$_DESIGN_DIR/"); _RC=$?
+_GT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp"
+mkdir -p "$_GT" && chmod 700 "$_GT" || { echo "Not sent: cannot create $_GT for the text file." >&2; exit 1; }
+_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }
+BRIEF_FILE=$(mktemp "${_GT:?}/brief.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "BRIEF_FILE: $BRIEF_FILE (name: ${BRIEF_FILE##*/})"
+```
+
+Write the text into each printed file with your file-write tool (Claude Code's Write tool needs a Read of the empty file first), exactly as it should appear. The text never goes into a shell command, heredoc or quoted argument. If a write fails or is refused, do not send: print the cause, the file path and the command below for sending by hand.
+
+Brief shape: `Product name: [name]. Product type: [type]. Aesthetic: [direction]. Colors: primary [hex], secondary [hex], neutrals [range]. Typography: display [font], body [font]. Layout: [approach]. Show a realistic [page type] screen with [specific content for this product].` Then substitute the printed name for `<brief-file-name>`:
+
+```bash
+BRIEF_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<brief-file-name>"
+[ -s "$BRIEF_FILE" ] || { echo "Not run: $BRIEF_FILE is missing or empty. Write the brief, then rerun this block." >&2; exit 1; }
+_OUT=$($D variants --brief "$(cat "$BRIEF_FILE")" --count 3 --output-dir "$_DESIGN_DIR/"); _RC=$?
 printf '%s\n' "$_OUT"; echo "EXIT: $_RC"
 ```
 
 <!-- design:round-accounting -->
 **Round accounting:** names are never overwritten (a taken one is bumped), so use only the printed `saved` paths. Tell the user how many of `requested` paid images were saved and name each `failures` entry. Exit 2 means nothing was saved: report `failures` and stop here (offer Path B or skip); run no `$D check` or board.
 
-Run quality check on each saved path, starting with the first; never include failed variants:
+Run quality check on each saved path, starting with the first, against the same brief file; never include failed variants:
 
 ```bash
-$D check --image "<first path from the printed saved list>" --brief "<the original brief>"
+BRIEF_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<brief-file-name>"
+[ -s "$BRIEF_FILE" ] || { echo "Not run: $BRIEF_FILE is missing or empty. Write the brief, then rerun this block." >&2; exit 1; }
+$D check --image "<first path from the printed saved list>" --brief "$(cat "$BRIEF_FILE")"
 ```
 
 Read JSON, not exit code: `pass: false` means regenerate addressing `issues`, then recheck. `pass: true` with an unavailable/skipped warning is missing automated coverage; disclose it and inspect visually.
@@ -354,7 +374,7 @@ After the response, read current feedback next to the board HTML:
 **Board or chat:** revisions regenerate; a final choice needs summary confirmation; skip goes to Phase 6 without a mockup. Ask if no choice/detail; never infer approval from a missing file. Submit with revision notes is a revision.
 
 **Regenerate:**
-1. Revise the brief, preserving unrelated constraints. Archive this round's feedback files so old Submit cannot approve new images (the board block does this on rebuild).
+1. Revise the brief in the brief file, preserving unrelated constraints. Archive this round's feedback files so old Submit cannot approve new images (the board block does this on rebuild).
 2. Run `$D variants` with the new brief (no session), with the same capture and round accounting. Re-run the quality check and visual self-gate on every new image (its printed path).
 3. Rebuild with the board block above (it rewrites board-images.json), without `--serve`.
 4. Reload at the saved URL (keep its per-board path; legacy uses root):
@@ -381,7 +401,7 @@ _EXTRACT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gstack-design-extract-XXXXXXXX") || ex
 
 Compare extracted tokens with the approved image and verified fonts; show discrepancies at Q-final. Empty arrays, an "Unable to extract" mood or command failure → disclose fallback to Phase 3 values, never invent measured tokens.
 
-Late visual changes return to the feedback loop: regenerate, recheck, reconfirm, then extract again. Only `generate` supplies `sessionFile` for `$D iterate --session "<returned sessionFile>" --feedback "<feedback>" --output "$_DESIGN_DIR/refined.png"`; use its printed `outputPath`. Variants must regenerate.
+Late visual changes return to the feedback loop: regenerate, recheck, reconfirm, then extract again. Only `generate` supplies `sessionFile` for `$D iterate --session "<returned sessionFile>" --feedback "$(cat "$FEEDBACK_FILE")" --output "$_DESIGN_DIR/refined.png"`; use its printed `outputPath`. Variants must regenerate.
 
 **Plan mode:** Carry the approved mockup paths/tokens into Phase 6's "## Proposed DESIGN.md" plan section. Its Q-final approval governs saving that content; defer the actual DESIGN.md to implementation.
 
@@ -557,7 +577,7 @@ components:
 | [today] | Initial design system created | Created by /design-consultation based on [product context / research] |
 ```
 
-Use real token values, no placeholders; omit invented `components` entries and unverified fontFamily values. Describe pending font roles in prose instead. Outside plan mode, after writing DESIGN.md, run `bun --no-env-file run ~/.claude/skills/gstack/bin/gstack-design-md.ts check DESIGN.md`: require `DESIGN_MD_FORMAT: spec` for new/fresh/converted/spec files, `legacy` with `legacy-keep` for a kept legacy file, or the disclosed `unknown` format for a preserved unknown file. Never convert a kept file just to make validation say spec.
+Use real token values, no placeholders; omit invented `components` entries and unverified fontFamily values. Describe pending font roles in prose instead. Outside plan mode, after writing DESIGN.md, run `bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-design-md.ts check DESIGN.md`: require `DESIGN_MD_FORMAT: spec` for new/fresh/converted/spec files, `legacy` with `legacy-keep` for a kept legacy file, or the disclosed `unknown` format for a preserved unknown file. Never convert a kept file just to make validation say spec.
 
 **Outside plan mode, update CLAUDE.md** (or create it if it doesn't exist) — append this section:
 

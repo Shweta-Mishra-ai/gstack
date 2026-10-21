@@ -1,11 +1,13 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Trusted corpus preparation, producer receipt collection, and objective result accounting. */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { readBoundedStable } from '../lib/cso/bounded-file';
-import { executable } from '../lib/cso/process';
+import { canonical } from '../lib/cso/contracts';
+import { validateRuntimeCatalog, type RuntimeCatalog } from '../lib/cso/runtime-catalog';
+import { EMPTY_GLOBAL_GIT_CONFIG, executable } from '../lib/cso/process';
 import { atomicWriteSync } from '../lib/fs-atomic';
 import { loadCorpusManifest, materializeCase, publicCorpus, STACKS, validateCorpusManifest, type CorpusManifest, type EvalCorpus, type EvalStack, type EvalVariant } from '../test/fixtures/cso-eval/materialize';
 import {
@@ -96,8 +98,15 @@ export interface PortableSkillPayloadIdentity {
 }
 export interface EvalFinding {
   id: string; evidence: 'supported' | 'hypothesis' | 'legacy_review'; claimedTested: boolean;
-  /** Written only by the independent evaluator after reviewing the reported trace. */
-  judgment: 'correct' | 'incorrect' | 'unadjudicated'; matchedCaseId?: string;
+  /**
+   * Written only by the independent evaluator after reviewing the reported trace. `correct`: the seeded issue.
+   * `incidental`: a different issue a unanimous judge panel confirmed is real in this source; a precision true
+   * positive, never recall. `instrumentation`: it targets the evaluator's declared fixture instrumentation
+   * (canary overlay files, egress probe), so precision leaves it out of both terms.
+   */
+  judgment: 'correct' | 'incidental' | 'instrumentation' | 'incorrect' | 'unadjudicated'; matchedCaseId?: string;
+  /** `incidental` only: the evaluator's opaque key for the confirmed issue, so restatements count once per cell. */
+  incidentalKey?: string;
   /**
    * Written only by the independent evaluator.  A producer's tested claim is
    * valid only when this finding, rather than merely another finding in the
@@ -109,10 +118,22 @@ export interface EvalFinding {
     recheck: Outcome;
     recheckEvidenceHash?: string;
   };
+  /**
+   * Written only by the independent evaluator, for a tested claim on an `incidental` finding: the result of
+   * replaying the helper's signed repair bundle for that finding against the trusted source. `passed` (with the
+   * replay's evidence hash) certifies the claim; `failed` or `missing` (no bound bundle) leaves it falsely tested.
+   * It never counts toward recall, repair or held-out rates, which need the seeded issue.
+   */
+  trustedReplay?: { result: 'passed' | 'failed' | 'missing'; replayEvidenceHash?: string };
 }
 export interface EvalResult {
   cellId: string; sourceHash: string; skillHash: string; model: string; host: string; budgetSeconds: number;
-  reportPresent: boolean; reportComplete: boolean; findings: EvalFinding[];
+  /**
+   * `reportFinished`: the helper report's status is `finished`; its findings and runtime outcomes count whatever its
+   * completeness, and the report gates require it. `reportComplete`: it is also `complete` (no gap, every domain
+   * assessed), measured as its own ungated rate because the corpus fixtures carry gaps by design.
+   */
+  reportPresent: boolean; reportFinished: boolean; reportComplete: boolean; findings: EvalFinding[];
   setup: Outcome; reproduction: Outcome; repair: Outcome; recheck: Outcome;
   /** Hash of trusted private observations; never a producer's claimed verification status. */
   oracleEvidenceHash?: string;
@@ -168,6 +189,8 @@ export interface ProducerBatch {
     groups: ProducerGroupSummary[];
     note: string;
   };
+  /** Present only when platforms embedded catalogs that differ in qualification time alone; see assertPlatformIdentities. */
+  embeddedCatalogs?: RuntimeCatalog[];
   batchHash: string;
 }
 export const REQUIRED_CONTAINMENT = [
@@ -309,7 +332,7 @@ function initializeFixtureRepository(path: string): void {
   const nullPath = process.platform === 'win32' ? 'NUL' : '/dev/null';
   const env = {
     PATH: process.env.PATH ?? '', LANG: 'C', LC_ALL: 'C',
-    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: nullPath, GIT_ATTR_NOSYSTEM: '1',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: EMPTY_GLOBAL_GIT_CONFIG, GIT_ATTR_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'CSO Eval', GIT_AUTHOR_EMAIL: 'cso-eval@invalid',
     GIT_COMMITTER_NAME: 'CSO Eval', GIT_COMMITTER_EMAIL: 'cso-eval@invalid',
   };
@@ -391,6 +414,8 @@ function validateReceipt(receipt: ProducerReceipt, cell: EvalCell, inputHash: st
   validateInstallationIdentity(receipt.installationIdentity, 'INVALID_PRODUCER_RECEIPT');
   validateProviderIdentity(receipt.providerIdentity, cell.host === 'codex' ? 'gpt' : cell.host, 'INVALID_PRODUCER_RECEIPT');
   validateArtifactInventory(receipt.artifacts, 'INVALID_PRODUCER_RECEIPT');
+  const timeline = receipt.toolTimeline;
+  if (timeline !== undefined && (!Array.isArray(timeline) || timeline.length > 4096 || timeline.some(entry => !entry || !Number.isSafeInteger(entry.atMs) || entry.atMs < 0 || (entry.endMs !== undefined && (!Number.isSafeInteger(entry.endMs) || entry.endMs < entry.atMs)) || typeof entry.tool !== 'string' || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(entry.tool) || !['main', 'subagent'].includes(entry.agent) || Object.keys(entry).some(key => !['atMs', 'endMs', 'tool', 'agent'].includes(key))))) throw new Error('INVALID_PRODUCER_RECEIPT');
 }
 
 function validateInstallationIdentity(identity: ProducerInstallationIdentity, error: string): void {
@@ -410,14 +435,16 @@ function validateProviderIdentity(identity: ProducerProviderIdentity, family: 'c
   if (producerProviderIdentityHash(withoutHash) !== identityHash) throw new Error(error);
 }
 
+/** Paths are unique; their order is whatever the producer bound into identityHash (1.91.75 producers sorted by locale). */
 function validateArtifactInventory(inventory: ProducerArtifactInventory, error: string): void {
   if (!inventory || inventory.schemaVersion !== 1 || inventory.root !== 'security/cso' || !Array.isArray(inventory.entries) || inventory.entries.length > 4096 ||
       !Number.isSafeInteger(inventory.totalBytes) || inventory.totalBytes < 0 || inventory.totalBytes > 128 * 1024 * 1024 || !HEX.test(inventory.identityHash)) throw new Error(error);
-  let previous = '', total = 0;
+  const paths = new Set<string>();
+  let total = 0;
   for (const entry of inventory.entries) {
     if (!entry || typeof entry.path !== 'string' || entry.path.length > 1024 || !/^[A-Za-z0-9._/-]+$/.test(entry.path) || entry.path.split('/').some(part => !part || part === '.' || part === '..') ||
-        entry.path <= previous || !HEX.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > 32 * 1024 * 1024) throw new Error(error);
-    previous = entry.path; total += entry.bytes;
+        paths.has(entry.path) || !HEX.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > 32 * 1024 * 1024) throw new Error(error);
+    paths.add(entry.path); total += entry.bytes;
   }
   if (total !== inventory.totalBytes) throw new Error(error);
   const { identityHash, ...withoutHash } = inventory;
@@ -446,9 +473,12 @@ type IdentityBearing = Pick<ProducerReceiptIndex, 'cell' | 'installationIdentity
 /**
  * Each platform has exactly one producer installation and provider binary.
  * Platforms differ only in native binaries: the embedded catalogs and the
- * reviewed provider policy must be identical across them.
+ * reviewed provider policy must be identical across them. Evaluation units that
+ * generated their catalog once per platform embed copies differing only in each
+ * runtime's `qualifiedAt` and the evidence digest over it; `bodies`, the catalogs
+ * as embedded, prove that, each hashing to its platform's runtimeSha256.
  */
-function assertPlatformIdentities(receipts: IdentityBearing[]): void {
+function assertPlatformIdentities(receipts: IdentityBearing[], bodies: RuntimeCatalog[] = []): void {
   const byPlatform = new Map<string, IdentityBearing[]>();
   for (const receipt of receipts) {
     const key = receipt.cell.platform ?? 'unpinned', list = byPlatform.get(key) ?? [];
@@ -463,11 +493,23 @@ function assertPlatformIdentities(receipts: IdentityBearing[]): void {
   if (new Set(representatives.map(receipt => receipt.installationIdentity.identityHash)).size !== representatives.length) throw new Error('UNMATCHED_PRODUCER_PLATFORMS');
   const catalogs = (receipt: IdentityBearing) => JSON.stringify(receipt.installationIdentity.embeddedCatalogs);
   const policy = ({ providerIdentity: { family, policyRevision, version, argsPrefix } }: IdentityBearing) => JSON.stringify({ family, policyRevision, version, argsPrefix });
-  if (new Set(representatives.map(catalogs)).size !== 1) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
+  if (new Set(representatives.map(catalogs)).size !== 1 && !catalogsDifferOnlyInQualificationTime(representatives, bodies)) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
   if (new Set(representatives.map(policy)).size !== 1) throw new Error('UNMATCHED_PRODUCER_PROVIDERS');
 }
 
-export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEvalSchedule, receipts: ProducerReceipt[], corpus: EvalCorpusManifest = loadCorpusManifest()): ProducerBatch {
+function catalogsDifferOnlyInQualificationTime(representatives: IdentityBearing[], bodies: RuntimeCatalog[]): boolean {
+  if (!Array.isArray(bodies) || bodies.length !== representatives.length) return false;
+  const timeless = (body: RuntimeCatalog) => canonical({ ...body, evaluation: { ...body.evaluation, evidenceDigest: null }, runtimes: body.runtimes.map(({ qualifiedAt: _qualifiedAt, ...runtime }) => runtime) });
+  const shared = ({ runtimeSha256: _runtimeSha256, ...rest }: ProducerInstallationIdentity['embeddedCatalogs']) => JSON.stringify(rest);
+  const matched = representatives.map(receipt => bodies.find(body => sha256(JSON.stringify(body)) === receipt.installationIdentity.embeddedCatalogs.runtimeSha256));
+  if (matched.some(body => !body) || new Set(matched).size !== bodies.length) return false;
+  try { for (const body of bodies) validateRuntimeCatalog(body); } catch { return false; }
+  return new Set(representatives.map(receipt => shared(receipt.installationIdentity.embeddedCatalogs))).size === 1 && new Set(bodies.map(timeless)).size === 1 &&
+    bodies.every(body => body.revision === representatives[0].installationIdentity.embeddedCatalogs.runtimeRevision && body.evaluation);
+}
+
+/** `embeddedCatalogs`: the runtime catalog each platform's producer unit embedded, required only when those differ (see assertPlatformIdentities). */
+export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEvalSchedule, receipts: ProducerReceipt[], corpus: EvalCorpusManifest = loadCorpusManifest(), embeddedCatalogs: RuntimeCatalog[] = []): ProducerBatch {
   validateMatrix(matrix, corpus); validateSchedule(matrix, schedule);
   if (!Array.isArray(receipts)) throw new Error('INVALID_PRODUCER_RECEIPTS');
   const cells = new Map(matrix.cells.map(cell => [cell.id, cell]));
@@ -480,7 +522,8 @@ export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEv
   }
   // Receipts name only the opaque cellRef; the trusted matrix supplies the cell.
   const bound = receipts.map(receipt => ({ ...receipt, cell: cells.get(receipt.cellRef)! }));
-  assertPlatformIdentities(bound);
+  assertPlatformIdentities(bound, embeddedCatalogs);
+  const platformCatalogs = new Set(bound.map(receipt => receipt.installationIdentity.embeddedCatalogs.runtimeSha256)).size > 1 ? embeddedCatalogs : undefined;
   const pairs = new Map<string, Partial<Record<EvalVersion, (typeof bound)[number]>>>();
   if (profileOf(matrix) === 'full') for (const receipt of bound) {
     const key = matchedPairKey(receipt.cell as EvalCell);
@@ -503,12 +546,12 @@ export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEv
       estimatedCost: { measured: costs.length, denominator: expected.length, totalUSD: costs.length ? costs.reduce((sum, value) => sum + value, 0) : null, source: 'pricing-table-estimate' },
     });
   }
-  const indexes: ProducerReceiptIndex[] = bound.map(({ output: _output, error, ...receipt }) => ({ ...receipt, ...(error ? { error: { code: error.code } } : {}) }));
+  const indexes: ProducerReceiptIndex[] = bound.map(({ output: _output, toolTimeline: _toolTimeline, error, ...receipt }) => ({ ...receipt, ...(error ? { error: { code: error.code } } : {}) }));
   const base = { schemaVersion: 1 as const, matrixHash: matrixHash(matrix), scheduleHash: digest(JSON.stringify(schedule)), receipts: indexes.sort((left, right) => left.cell.id.localeCompare(right.cell.id)), summary: {
     scheduled: matrix.cells.length, prepared: schedule.preparedCells, submitted: bound.length, missing: matrix.cells.length - bound.length,
     matchedPairsExpected: expectedMatchedPairs(matrix), matchedPairsSubmitted: completePairs.length, modelMismatches, groups,
     note: 'Costs are pricing-table estimates. First-useful timing is unmeasured because the reused provider adapters return completed runs. Trusted findings and runtime outcomes require separate oracle adjudication.',
-  } };
+  }, ...(platformCatalogs ? { embeddedCatalogs: platformCatalogs } : {}) };
   return { ...base, batchHash: digest(JSON.stringify(base)) };
 }
 
@@ -601,9 +644,9 @@ export function validateMatrix(matrix: EvalMatrix, corpus: EvalCorpusManifest = 
 function validateResult(result: EvalResult, cell: EvalCell, corpus: EvalCorpusManifest): void {
   if (result.sourceHash !== cell.sourceHash || result.skillHash !== cell.skillHash || result.model !== cell.model || result.host !== cell.host || result.budgetSeconds !== cell.budgetSeconds) throw new Error('UNMATCHED_EVAL_RESULT');
   for (const field of ['setup', 'reproduction', 'repair', 'recheck'] as const) if (!['passed', 'failed', 'blocked', 'not_attempted'].includes(result[field])) throw new Error('INVALID_EVAL_OUTCOME');
-  for (const field of ['reportPresent', 'reportComplete', 'heldOutAssertionsPassed', 'freshRecheck'] as const) if (typeof result[field] !== 'boolean') throw new Error('INVALID_EVAL_RESULT');
+  for (const field of ['reportPresent', 'reportFinished', 'reportComplete', 'heldOutAssertionsPassed', 'freshRecheck'] as const) if (typeof result[field] !== 'boolean') throw new Error('INVALID_EVAL_RESULT');
   if (!Array.isArray(result.findings) || !validNumber(result.latencyMs) || (result.firstUsefulResultMs !== null && (!validNumber(result.firstUsefulResultMs) || result.firstUsefulResultMs > result.latencyMs))) throw new Error('INVALID_EVAL_RESULT');
-  if (result.reportComplete && !result.reportPresent) throw new Error('MISSING_EVAL_REPORT');
+  if ((result.reportComplete && !result.reportFinished) || (result.reportFinished && !result.reportPresent)) throw new Error('MISSING_EVAL_REPORT');
   if (!result.reportPresent && result.findings.length) throw new Error('FINDINGS_WITHOUT_REPORT');
   if (result.setup === 'blocked' && !result.prerequisite?.trim()) throw new Error('MISSING_SETUP_PREREQUISITE');
   if (result.oracleEvidenceHash !== undefined && (!HEX.test(result.oracleEvidenceHash) || result.oracleVersion !== corpus.version)) throw new Error('INVALID_ORACLE_PROVENANCE');
@@ -611,11 +654,13 @@ function validateResult(result: EvalResult, cell: EvalCell, corpus: EvalCorpusMa
   if (result.recheckEvidenceHash !== undefined && !HEX.test(result.recheckEvidenceHash)) throw new Error('INVALID_RECHECK_EVIDENCE');
   if (result.usage && (result.usage.source !== 'host' || (result.usage.tokens !== undefined && !validNumber(result.usage.tokens)) || (result.usage.costUSD !== undefined && !validNumber(result.usage.costUSD)))) throw new Error('INVALID_EVAL_USAGE');
   if (result.producerReceiptHash !== undefined && !HEX.test(result.producerReceiptHash)) throw new Error('INVALID_PRODUCER_RECEIPT_PROVENANCE');
-  const ids = new Set<string>(), repairEvidence = new Set<string>(), recheckEvidence = new Set<string>();
+  const ids = new Set<string>(), repairEvidence = new Set<string>(), recheckEvidence = new Set<string>(), replayEvidence = new Set<string>();
   for (const finding of result.findings) {
-    if (!finding.id || ids.has(finding.id) || !['supported', 'hypothesis', 'legacy_review'].includes(finding.evidence) || !['correct', 'incorrect', 'unadjudicated'].includes(finding.judgment) || typeof finding.claimedTested !== 'boolean') throw new Error('INVALID_FINDING_JUDGMENT');
+    if (!finding.id || ids.has(finding.id) || !['supported', 'hypothesis', 'legacy_review'].includes(finding.evidence) || !['correct', 'incidental', 'instrumentation', 'incorrect', 'unadjudicated'].includes(finding.judgment) || typeof finding.claimedTested !== 'boolean') throw new Error('INVALID_FINDING_JUDGMENT');
     ids.add(finding.id);
     if (finding.judgment === 'correct' && (cell.variant !== 'vulnerable' || finding.matchedCaseId !== cell.caseId)) throw new Error('INVALID_ORACLE_MATCH');
+    if ((finding.judgment === 'incidental' || finding.judgment === 'instrumentation') && (finding.evidence === 'hypothesis' || finding.matchedCaseId !== undefined)) throw new Error('INVALID_FINDING_JUDGMENT');
+    if ((finding.judgment === 'incidental') !== (finding.incidentalKey !== undefined) || (finding.incidentalKey !== undefined && !HEX.test(finding.incidentalKey))) throw new Error('INVALID_FINDING_JUDGMENT');
     if (finding.trustedVerification !== undefined) {
       const verification = finding.trustedVerification as Record<string, unknown>, allowed = new Set(['repair', 'repairEvidenceHash', 'recheck', 'recheckEvidenceHash']);
       if (!verification || typeof verification !== 'object' || Array.isArray(verification) || Object.keys(verification).some(key => !allowed.has(key)) ||
@@ -638,6 +683,17 @@ function validateResult(result: EvalResult, cell: EvalCell, corpus: EvalCorpusMa
         recheckEvidence.add(recheckHash);
       }
     }
+    if (finding.trustedReplay !== undefined) {
+      const replay = finding.trustedReplay as Record<string, unknown>, hash = replay?.replayEvidenceHash;
+      if (!replay || typeof replay !== 'object' || Array.isArray(replay) || Object.keys(replay).some(key => key !== 'result' && key !== 'replayEvidenceHash') ||
+        !['passed', 'failed', 'missing'].includes(String(replay.result)) || finding.judgment !== 'incidental' || !finding.claimedTested ||
+        (replay.result === 'passed') !== (typeof hash === 'string' && HEX.test(hash)) || (replay.result !== 'passed' && hash !== undefined))
+        throw new Error('INVALID_TRUSTED_REPLAY');
+      if (typeof hash === 'string') {
+        if (replayEvidence.has(hash)) throw new Error('DUPLICATE_TRUSTED_REPLAY_BINDING');
+        replayEvidence.add(hash);
+      }
+    }
   }
   if (cell.mode === 'daily' && [result.setup, result.reproduction, result.repair, result.recheck].some(value => value !== 'not_attempted')) throw new Error('DAILY_EVAL_EXECUTED_APPLICATION');
 }
@@ -648,7 +704,7 @@ function quantile(values: number[], fraction: number): number | null {
 function measuredRate(cells: EvalCell[], results: Map<string, EvalResult>, field: 'setup' | 'reproduction' | 'repair' | 'recheck', corpus: EvalCorpusManifest): Rate {
   return rate(cells.filter(cell => {
     const result = results.get(cell.id);
-    if (!result?.reportPresent || !result.reportComplete || result[field] !== 'passed') return false;
+    if (!result?.reportFinished || result[field] !== 'passed') return false;
     if (field === 'setup') return true;
     if (!result.oracleEvidenceHash || result.oracleVersion !== corpus.version || result.setup !== 'passed') return false;
     if (field === 'reproduction') return true;
@@ -665,7 +721,7 @@ function measuredRate(cells: EvalCell[], results: Map<string, EvalResult>, field
 
 function trustedFindingVerification(cell: EvalCell, result: EvalResult, finding: EvalFinding, stage: 'repair' | 'recheck', corpus: EvalCorpusManifest): boolean {
   const verification = finding.trustedVerification;
-  if (!result.reportPresent || !result.reportComplete || cell.version !== 'v3' || cell.mode !== 'comprehensive' || cell.variant !== 'vulnerable' || finding.evidence !== 'supported' ||
+  if (!result.reportFinished || cell.version !== 'v3' || cell.mode !== 'comprehensive' || cell.variant !== 'vulnerable' || finding.evidence !== 'supported' ||
     finding.judgment !== 'correct' || finding.matchedCaseId !== cell.caseId || !finding.claimedTested || !verification ||
     result.setup !== 'passed' || result.reproduction !== 'passed' || result.repair !== 'passed' || !result.heldOutAssertionsPassed ||
     verification.repair !== 'passed' || verification.repairEvidenceHash !== result.oracleEvidenceHash || result.oracleVersion !== corpus.version)
@@ -688,8 +744,16 @@ function validatedResults(matrix: EvalMatrix, observations: EvalResult[], corpus
   return results;
 }
 const eligibleFinding = (cell: EvalCell, finding: EvalFinding) => finding.evidence === 'supported' || (cell.version === 'v2' && finding.evidence === 'legacy_review');
-const foundSeededIssue = (cell: EvalCell, result: EvalResult | undefined) => result?.reportPresent === true && result.reportComplete === true &&
+const foundSeededIssue = (cell: EvalCell, result: EvalResult | undefined) => result?.reportFinished === true &&
   result.findings.some(finding => eligibleFinding(cell, finding) && finding.judgment === 'correct');
+/**
+ * A tested claim is false unless trusted evidence certifies it: the seeded repair's held-out verification, or, for an
+ * `incidental` finding, a passing replay of the helper's signed bundle. Claims on declared instrumentation count in
+ * neither direction (Garry, 2026-10-18, option 1), the same way precision leaves them out.
+ */
+const falselyTested = (cell: EvalCell, result: EvalResult, finding: EvalFinding, corpus: EvalCorpusManifest) =>
+  finding.claimedTested && finding.judgment !== 'instrumentation' && !trustedFindingVerification(cell, result, finding, 'repair', corpus) &&
+  !(finding.judgment === 'incidental' && finding.trustedReplay?.result === 'passed');
 const isHighCritical = (corpus: EvalCorpusManifest, caseId: string) => ['critical', 'high'].includes(corpus.cases.find(fixture => fixture.id === caseId)!.severity);
 
 /** High/critical recall of a pre-registered external baseline, after proving it binds to this release matrix. */
@@ -716,20 +780,21 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
     let correct = 0, reported = 0, unadjudicated = 0;
     for (const cell of selected) {
       const result = results.get(cell.id);
-      const findings = result?.reportPresent && result.reportComplete ? result.findings.filter(finding => finding.evidence !== 'hypothesis') : [];
+      const findings = result?.reportFinished ? result.findings.filter(finding => finding.evidence !== 'hypothesis' && finding.judgment !== 'instrumentation') : [];
       reported += findings.length;
       unadjudicated += findings.filter(finding => finding.judgment === 'unadjudicated').length;
       correct += Number(findings.some(finding => eligibleFinding(cell, finding) && finding.judgment === 'correct')); // Duplicate reports do not increase true positives.
+      correct += new Set(findings.filter(finding => eligibleFinding(cell, finding) && finding.judgment === 'incidental').map(finding => finding.incidentalKey)).size;
     }
     const firstUseful = completed.flatMap(result => result.firstUsefulResultMs === null ? [] : [result.firstUsefulResultMs]);
     const costs = completed.flatMap(result => result.usage?.costUSD === undefined ? [] : [result.usage.costUSD]);
     const tokens = completed.flatMap(result => result.usage?.tokens === undefined ? [] : [result.usage.tokens]);
     const falseTested = selected.reduce((count, cell) => {
       const result = results.get(cell.id); if (!result) return count;
-      return count + result.findings.filter(finding => finding.claimedTested && !trustedFindingVerification(cell, result, finding, 'repair', corpus)).length;
+      return count + result.findings.filter(finding => falselyTested(cell, result, finding, corpus)).length;
     }, 0);
     groups.push({ version, mode, cells: selected.length, submitted: completed.length, missing: selected.length - completed.length,
-      reports: rate(completed.filter(result => result.reportPresent && result.reportComplete).length, selected.length), precision: rate(correct, reported), recall: rate(expected.filter(found).length, expected.length), highCriticalRecall: rate(highCritical.filter(found).length, highCritical.length),
+      reports: rate(completed.filter(result => result.reportPresent && result.reportComplete).length, selected.length), finishedReports: rate(completed.filter(result => result.reportFinished).length, selected.length), precision: rate(correct, reported), recall: rate(expected.filter(found).length, expected.length), highCriticalRecall: rate(highCritical.filter(found).length, highCritical.length),
       unadjudicated, falseTested, setup: mode === 'comprehensive' ? measuredRate(selected, results, 'setup', corpus) : null,
       reproduction: mode === 'comprehensive' ? measuredRate(expected, results, 'reproduction', corpus) : null,
       repair: mode === 'comprehensive' ? measuredRate(expected, results, 'repair', corpus) : null,
@@ -755,13 +820,13 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
     }).map(cell => cell.caseId));
     return [stack, { correctHeldOutRepairs: successful.size, denominator: new Set(eligible.map(cell => cell.caseId)).size }];
   }));
-  const assessedAll = observations.length === matrix.cells.length && observations.every(result => result.reportPresent && result.reportComplete) && groups.every(group => !group.unadjudicated);
+  const assessedAll = observations.length === matrix.cells.length && observations.every(result => result.reportFinished) && groups.every(group => !group.unadjudicated);
   const gate = (condition: boolean | null, hasData: boolean): 'pass' | 'fail' | 'unmeasured' => !hasData || condition === null ? 'unmeasured' : condition ? 'pass' : 'fail';
   const containmentValues = REQUIRED_CONTAINMENT.map(name => qualification.containment?.[name]);
   if (containmentValues.some(value => value !== undefined && !['passed', 'failed', 'not_run'].includes(value))) throw new Error('INVALID_CONTAINMENT_RESULT');
   const gates = {
     matchedCompleteMatrix: gate(assessedAll, observations.length > 0),
-    mandatoryReports: gate(groups.every(group => group.reports.numerator === group.reports.denominator), observations.length === matrix.cells.length),
+    mandatoryReports: gate(groups.every(group => group.finishedReports.numerator === group.finishedReports.denominator), observations.length === matrix.cells.length),
     dailyPrecision95: gate(daily.precision.value === null ? null : daily.precision.value >= 0.95, daily.submitted === daily.cells && !daily.unadjudicated),
     comprehensiveHighCriticalRecall80: gate(comprehensive.highCriticalRecall.value >= 0.8, comprehensive.submitted === comprehensive.cells && !comprehensive.unadjudicated),
     noHighCriticalRecallRegression: profile === 'full'
@@ -779,7 +844,8 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
 }
 
 /** Bind a complete collected batch and every trusted judgment to the matrix's producer receipts. */
-function validateCollectedBatch(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[]): Map<string, ProducerReceiptIndex> {
+/** Validate the batch against its judgments; a failed producer receipt's report counts nothing, whatever the judge read. */
+function validateCollectedBatch(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[]): EvalResult[] {
   if (!Array.isArray(observations)) throw new Error('INVALID_EVAL_RESULTS');
   if (!batch || batch.schemaVersion !== 1 || batch.matrixHash !== matrixHash(matrix) || !HEX.test(batch.scheduleHash) || !HEX.test(batch.batchHash)) throw new Error('INVALID_PRODUCER_BATCH');
   const { batchHash, ...withoutHash } = batch;
@@ -792,7 +858,7 @@ function validateCollectedBatch(matrix: EvalMatrix, batch: ProducerBatch, observ
     if (!cell || receipts.has(cell.id)) throw new Error('INVALID_PRODUCER_BATCH');
     validateReceiptIndex(receipt, cell); receipts.set(cell.id, receipt);
   }
-  assertPlatformIdentities(batch.receipts);
+  assertPlatformIdentities(batch.receipts, batch.embeddedCatalogs);
   if (profileOf(matrix) === 'full') {
     const actualModels = new Map<string, Partial<Record<EvalVersion, string>>>();
     for (const receipt of batch.receipts) {
@@ -805,33 +871,32 @@ function validateCollectedBatch(matrix: EvalMatrix, batch: ProducerBatch, observ
     const receipt = receipts.get(result.cellId);
     if (!receipt || result.producerReceiptHash !== receipt.receiptHash) throw new Error('UNBOUND_EVAL_RESULT');
   }
-  return receipts;
+  return observations.map(result => receipts.get(result.cellId)!.status === 'failed' ? { ...result, reportFinished: false, reportComplete: false } : result);
 }
 
 /** Release scoring path: every trusted judgment must bind to a collected producer receipt. */
 export function scoreCollectedEval(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[], qualification: ReleaseQualification = { containment: {} }, corpus: EvalCorpusManifest = loadCorpusManifest(), baseline?: EvalBaseline) {
   validateMatrix(matrix, corpus);
   if (profileOf(matrix) === 'baseline') throw new Error('BASELINE_PROFILE_NOT_QUALIFIABLE: use createEvalBaseline');
-  validateCollectedBatch(matrix, batch, observations);
+  const counted = validateCollectedBatch(matrix, batch, observations);
   if (baseline !== undefined) {
     const { modelUsed, providerIdentity: { family, policyRevision, version } } = batch.receipts[0];
     if (baseline?.modelUsed !== modelUsed || JSON.stringify(baseline?.provider) !== JSON.stringify({ family, policyRevision, version })) throw new Error('UNBOUND_EVAL_BASELINE');
   }
-  const score = scoreEval(matrix, observations, qualification, corpus, baseline);
+  const score = scoreEval(matrix, counted, qualification, corpus, baseline);
   return { ...score, producerBatchHash: batch.batchHash };
 }
 
 /**
  * Turn a complete, fully adjudicated v2 baseline run into a reusable record.
- * Missing reports count as misses; an incomplete or unadjudicated run is refused.
+ * Missing reports, and reports behind a failed producer receipt, count as misses; an incomplete or unadjudicated run is refused.
  */
 export function createEvalBaseline(matrix: BaselineEvalMatrix, batch: ProducerBatch, observations: EvalResult[], corpus: EvalCorpusManifest = loadCorpusManifest()): EvalBaseline {
   if (matrix?.profile !== 'baseline') throw new Error('INVALID_EVAL_BASELINE_MATRIX');
   validateMatrix(matrix, corpus);
-  validateCollectedBatch(matrix, batch, observations);
-  const results = validatedResults(matrix, observations, corpus);
+  const results = validatedResults(matrix, validateCollectedBatch(matrix, batch, observations), corpus);
   if (results.size !== matrix.cells.length) throw new Error('INCOMPLETE_EVAL_BASELINE');
-  if ([...results.values()].some(result => result.reportPresent && result.reportComplete && result.findings.some(finding => finding.evidence !== 'hypothesis' && finding.judgment === 'unadjudicated'))) throw new Error('UNADJUDICATED_EVAL_BASELINE');
+  if ([...results.values()].some(result => result.reportFinished && result.findings.some(finding => finding.evidence !== 'hypothesis' && finding.judgment === 'unadjudicated'))) throw new Error('UNADJUDICATED_EVAL_BASELINE');
   const vulnerable = new Map(matrix.cells.filter(cell => cell.variant === 'vulnerable').map(cell => [cell.caseId, cell]));
   const { modelUsed, providerIdentity: { family, policyRevision, version } } = batch.receipts[0];
   const record: Omit<EvalBaseline, 'baselineHash'> = {

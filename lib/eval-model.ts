@@ -12,26 +12,33 @@
  *   per-kind default                                         — last resort
  *
  * Kinds and their defaults:
- *   capture — AskUserQuestion SDK capture runs: current frontier Claude model
+ *   capture — the model under test in every Claude session, PTY and Agent SDK
+ *             eval run: CLAUDE_CAPTURE_EVAL_MODEL
  *   warmup  — PTY warm-up ping (cheapest thing that answers): haiku
  *   distill — free-text distillation (cheap, structured): haiku (pinned)
- *   judge   — LLM-judge rubric calls: current frontier Claude model
+ *   judge   — LLM-judge rubric calls: CLAUDE_JUDGE_EVAL_MODEL
  */
 
-export const CLAUDE_FRONTIER_EVAL_MODEL = "claude-fable-5-1";
+/** The model under test: Anthropic's best code model (Garry, 2026-10-18). */
+export const CLAUDE_CAPTURE_EVAL_MODEL = "claude-opus-5-5";
+/**
+ * The judge is the ruler, not the model under test: its calibration fixtures
+ * (test/fixtures/judge-calibration) are keyed to it, so it moves only with a
+ * recalibration, never with the model under test.
+ */
+export const CLAUDE_JUDGE_EVAL_MODEL = "claude-fable-5-1";
 export const DEFAULT_JUDGE_MAX_TOKENS = 8192;
 
 // `as const satisfies` keeps EvalModelKind the literal union
 // 'capture' | 'warmup' | 'distill' — a `Record<string, string>` annotation
 // would widen it to string and let any typo through the type gate.
 const DEFAULTS = {
-  // Keep eval capture/judge on the current frontier Claude model by default.
-  // Tests needing a cheaper or historical ruler pass it explicitly or set
+  // Tests needing a cheaper or historical model pass it explicitly or set
   // GSTACK_EVAL_MODEL_CAPTURE / GSTACK_EVAL_MODEL_JUDGE / GSTACK_EVAL_MODEL.
-  capture: CLAUDE_FRONTIER_EVAL_MODEL,
+  capture: CLAUDE_CAPTURE_EVAL_MODEL,
   warmup: "claude-haiku-4-5",
   distill: "claude-haiku-4-5-20251001",
-  judge: CLAUDE_FRONTIER_EVAL_MODEL,
+  judge: CLAUDE_JUDGE_EVAL_MODEL,
 } as const satisfies Record<string, string>;
 
 export type EvalModelKind = keyof typeof DEFAULTS;

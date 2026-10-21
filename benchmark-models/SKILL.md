@@ -16,18 +16,6 @@ allowed-tools:
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
-
-## When to invoke this skill
-
-Runs the same prompt through Claude,
-GPT (via Codex CLI), and Gemini side-by-side — compares latency, tokens, cost,
-and optionally quality via LLM judge. Answers "which model is actually best
-for this skill?" with data instead of vibes. Separate from /benchmark, which
-measures web page performance. Use when: "benchmark models", "compare models",
-"which model is best for X", "cross-model comparison", "model shootout".
-
-Voice triggers (speech-to-text aliases): "compare models", "model shootout", "which model is best".
-
 ## Preamble (run first)
 
 ```bash
@@ -67,14 +55,15 @@ If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay
 
 ## Artifacts Sync (skill start)
 
-The skill-start output above already ran artifacts sync. Act on its lines:
-GBrain hint text (if present) tells you when to prefer `gbrain` over Grep;
-`ARTIFACTS_SYNC:` reports sync health (`off`, `mode=... | queue=N`,
-`remote-mode`, or a restore hint naming `gstack-brain-restore`).
+Skill-start already ran artifacts sync. GBrain hint text (if any) says
+when to prefer `gbrain` over Grep. `ARTIFACTS_SYNC:` reports sync health
+(`off`, `mode=... | queue=N`, `remote-mode`, or a `gstack-brain-restore`
+hint). On an `attention:` line, tell the user in one sentence what
+it says and the command it names, then continue.
 
-The one-time privacy stop-gate (artifacts-sync consent) arrives as a
-`GSTACK_INSTRUCTION` block from skill-start when consent is actually pending
-— fire it via AskUserQuestion exactly as the block instructs.
+The one-time privacy stop-gate arrives as a `GSTACK_INSTRUCTION` block
+from skill-start when consent is pending; fire it via AskUserQuestion
+exactly as instructed.
 
 ## Model-Specific Behavioral Patch (claude)
 
@@ -99,14 +88,16 @@ find, grep). The dedicated tools are cheaper and clearer.
 
 Direct, concrete, builder-to-builder. Name the file, function, command, and user-visible impact. No filler.
 
-No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted. Never corporate or academic. Short paragraphs. End with what to do.
+No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted, load-bearing. Never corporate or academic. Short paragraphs. End with what to do.
+
+Reply in the language of the user's latest message unless asked otherwise. Code, commands, paths, identifiers and quoted output stay verbatim.
 
 The user has context you do not. Cross-model agreement is a recommendation, not a decision. The user decides.
 
 ## Completion Status Protocol
 
 When completing a skill workflow, report status using one of:
-- **DONE** — completed with evidence.
+- **DONE** — completed with evidence valid for the final consumed inputs; name reuse and anything not independently verified.
 - **DONE_WITH_CONCERNS** — completed, but list concerns.
 - **BLOCKED** — cannot proceed; state blocker and what was tried.
 - **NEEDS_CONTEXT** — missing info; state exactly what is needed.
@@ -187,7 +178,16 @@ Use AskUserQuestion with the preamble format:
 
 If A: list top-level gstack skills that have SKILL.md files (from `find . -maxdepth 2 -name SKILL.md -not -path './.*'`), ask the user to pick one via a second AskUserQuestion. Use the picked SKILL.md path as the prompt file.
 
-If B: ask the user for the inline prompt. Use it verbatim via `--prompt "<text>"`.
+If B: ask the user for the inline prompt. It never goes into a shell command: create a prompt file and write the prompt into it verbatim, then use the printed path as the prompt file.
+
+```bash
+_GT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp"
+mkdir -p "$_GT" && chmod 700 "$_GT" || { echo "Not sent: cannot create $_GT for the text file." >&2; exit 1; }
+_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }
+PROMPT_FILE=$(mktemp "${_GT:?}/benchmark-prompt.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "PROMPT_FILE: $PROMPT_FILE (name: ${PROMPT_FILE##*/})"
+```
+
+Write the text into each printed file with your file-write tool (Claude Code's Write tool needs a Read of the empty file first), exactly as it should appear. The text never goes into a shell command, heredoc or quoted argument. If a write fails or is refused, do not send: print the cause, the file path and the command below for sending by hand.
 
 If C: ask for the path. Verify it exists. Use as positional argument.
 
@@ -235,10 +235,12 @@ If judge is NOT available, skip this question and omit the `--judge` flag.
 Construct the command from Step 1, 2, 3 decisions:
 
 ```bash
-"$BIN" <prompt-spec> --models <picked-models> [--judge] --output table
+PROMPT_PATH="<prompt-path>"
+[ -s "$PROMPT_PATH" ] || { echo "ERROR: $PROMPT_PATH is missing or empty; the benchmark needs a prompt file." >&2; exit 1; }
+"$BIN" --models <picked-models> [--judge] --output table -- "$PROMPT_PATH"
 ```
 
-Where `<prompt-spec>` is either `--prompt "<text>"` (Step 1B), a file path (Step 1A or 1C), and `<picked-models>` is the comma-separated list from Step 2.
+`<prompt-path>` is the prompt file from Step 1 (the SKILL.md path, the printed prompt file, or the user's path) and `<picked-models>` is the comma-separated list from Step 2. Use a path only if it has no `'`, `"`, backtick, `$` or `\`; otherwise copy the file into a new Step 1B prompt file and use that.
 
 Stream the output as it arrives. This is slow — each provider runs the prompt fully. Expect 30s-5min depending on prompt complexity and whether `--judge` is on.
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Test-code type-debt ratchet: `bun run typecheck:test [--write-baseline]`.
  *

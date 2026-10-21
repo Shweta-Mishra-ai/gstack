@@ -195,7 +195,7 @@ gbrain is not installed); skipped weight is redistributed proportionally among
 the scored categories:
 
 ```bash
-bun -e '
+bun --no-env-file --config=/dev/null -e '
 const w = { typecheck: 0.22, lint: 0.18, test: 0.28, deadcode: 0.13, shell: 0.09, gbrain: 0.10 };
 const s = { typecheck: <N|null>, lint: <N|null>, test: <N|null>, deadcode: <N|null>, shell: <N|null>, gbrain: <N|null> };
 const scored = Object.keys(w).filter(k => s[k] !== null);

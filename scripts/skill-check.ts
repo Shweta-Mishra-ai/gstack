@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Validate all host renders and the freshness of repository-owned outputs.
  * Optional installed host caches are never read or changed. */
 

@@ -16,6 +16,9 @@ import { getProjectEvalDir } from './eval-store';
 import { hermeticChildEnv, isHermeticEnabled } from './hermetic-env';
 import { killProcessGroup } from '../../scripts/test-strict-output';
 import { resolveEvalModel } from '../../lib/eval-model';
+import { SessionObserver, appendSessionLedger, sessionKey, type SessionEnd } from './session-ledger';
+import { resolveEvalHost } from './e2e-hosts';
+import type { CodexTokenUsage } from './codex-session-runner';
 
 const GSTACK_DEV_DIR = path.join(os.homedir(), '.gstack-dev');
 const HEARTBEAT_PATH = path.join(GSTACK_DEV_DIR, 'e2e-live.json'); // heartbeat stays global
@@ -54,6 +57,10 @@ export interface SkillTestResult {
   firstResponseMs: number;
   /** Peak latency between consecutive tool calls, in ms */
   maxInterTurnMs: number;
+  /** Codex host: token classes behind costEstimate.estimatedCost. */
+  tokenUsage?: CodexTokenUsage;
+  /** Codex host: false when the session completed no turn or its model has no price row. */
+  costKnown?: boolean;
 }
 
 /** Local default startup grace: 90s covers observed API queue latency
@@ -74,6 +81,14 @@ const BROWSE_ERROR_PATTERNS = [
   /Server failed to start/,
   /no such file or directory.*\bbrowse(?:\.exe)?(?=$|[\s'":),])/i,
 ];
+
+/** First match of each browse failure pattern in tool output plus stderr. */
+export function scanBrowseErrors(text: string): string[] {
+  return BROWSE_ERROR_PATTERNS.flatMap(pattern => {
+    const match = text.match(pattern);
+    return match ? [match[0].slice(0, 200)] : [];
+  });
+}
 
 // --- Testable NDJSON parser ---
 
@@ -226,7 +241,9 @@ export async function runSkillTest(options: {
   allowedTools?: string[];
   /** Optional built-in tool availability. Omit to preserve the CLI defaults. */
   tools?: string[];
-  /** Opt-in public block timing/input-size diagnostics; never completion evidence. */
+  /** Keep public block timing/input-size diagnostics in the transcript; never completion evidence.
+   *  Partial messages always stream for the session ledger's liveness summary; without
+   *  this flag their rows are observed and dropped, so transcripts keep their size. */
   publicStreamDiagnostics?: boolean;
   timeout?: number;
   testName?: string;
@@ -253,6 +270,8 @@ export async function runSkillTest(options: {
   };
 }): Promise<SkillTestResult> {
   const startTime = Date.now();
+  const startMono = performance.now();
+  const observer = new SessionObserver(startMono);
   options.signal?.throwIfAborted();
   const {
     prompt,
@@ -295,6 +314,7 @@ Setup, CLI startup and API queueing consume this same window; it never resets.
 Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. After each saved checkpoint, compare the latest evidence capture's printed completedAt with the times above; run that clock read again only when no capture has completed since your last clock read. When remaining time is at most ${reserve / 1000} seconds, prioritize the remaining required completion outputs and verification. No required content or gate may be skipped. If the clock read fails, report timing unavailable; do not invent remaining time or restart the deadline.`;
     systemPrompt = systemPrompt ? `${systemPrompt}\n\n${notice}` : notice;
   }
+  if (resolveEvalHost() === 'codex') return (await import('./codex-host-runner')).runCodexHostSkillTest({ ...options, appendSystemPrompt: systemPrompt, completionReserveMs: undefined });
 
   // Set up per-run log directory if runId is provided
   let runDir: string | null = null;
@@ -322,7 +342,7 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
   // only --tools removes unrelated built-ins such as Agent, Bash, and Skill.
   // Keep this opt-in: existing workflow evals intentionally use CLI defaults.
   if (options.tools !== undefined) args.push('--tools', options.tools.join(','));
-  if (options.publicStreamDiagnostics) args.push('--include-partial-messages');
+  args.push('--include-partial-messages');
   // Hermetic children get zero MCP servers (no --mcp-config is passed).
   // Gated on the same call-time check as the env scrub so EVALS_HERMETIC=0
   // restores operator MCP along with the operator env.
@@ -499,8 +519,9 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
         buf = lines.pop() || '';
         for (const rawLine of lines) {
           if (!rawLine.trim()) continue;
-          const line = projectLine(rawLine);
-          collectedLines.push(line);
+          let raw: any;
+          try { raw = JSON.parse(rawLine); } catch { /* projected below */ }
+          observer.observe(raw, performance.now());
 
           // Track time to first NDJSON line (measures latency from spawn to first Claude response)
           if (!workPhaseArmed) {
@@ -513,6 +534,9 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
             // REMAINING budget (total wall stays <= timeout).
             armWorkPhase(firstResponseMs);
           }
+          if (!options.publicStreamDiagnostics && raw?.type === 'stream_event') continue;
+          const line = projectLine(rawLine);
+          collectedLines.push(line);
 
           // Real-time progress to stderr + persistent logs
           try {
@@ -572,7 +596,10 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
     stdoutDone = true;
 
     // Flush remaining buffer
-    if (buf.trim()) {
+    let tail: any;
+    try { tail = buf.trim() ? JSON.parse(buf) : undefined; } catch { /* projected below */ }
+    observer.observe(tail, performance.now());
+    if (buf.trim() && (options.publicStreamDiagnostics || tail?.type !== 'stream_event')) {
       const line = projectLine(buf);
       collectedLines.push(line);
       if (options.publicStreamDiagnostics && runDir && safeName) {
@@ -635,19 +662,21 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
   }
 
   const duration = Date.now() - startTime;
+  const structured = observer.verdict();
+  const end: SessionEnd = timedOut ? (signal?.aborted ? 'aborted' : 'session_timeout')
+    : structured?.end ?? (exitReason === 'success' ? 'completed' : 'error');
+  appendSessionLedger({ key: sessionKey('claude-p', testName), ...(testName ? { test_name: testName } : {}), runner: 'claude-p',
+    started_at: startedAt, budget_ms: timeout, elapsed_ms: performance.now() - startMono, end,
+    ...(timedOut ? { evidence: timedOutInStartup ? `no output within the ${startupGraceMs}ms startup grace` : `armed ${timeout}ms session timeout fired` }
+      : structured ? { evidence: structured.evidence } : {}),
+    liveness: observer.summary(performance.now()), billed: observer.billed });
 
   // Parse all collected NDJSON lines
   const parsed = parseNDJSON(collectedLines);
   const { transcript, resultLine, toolCalls } = parsed;
   const browseErrors: string[] = [];
 
-  const allText = toolCalls.filter(call => call.tool === 'Bash').map(call => call.output).join('\n') + '\n' + stderr;
-  for (const pattern of BROWSE_ERROR_PATTERNS) {
-    const match = allText.match(pattern);
-    if (match) {
-      browseErrors.push(match[0].slice(0, 200));
-    }
-  }
+  browseErrors.push(...scanBrowseErrors(toolCalls.filter(call => call.tool === 'Bash').map(call => call.output).join('\n') + '\n' + stderr));
 
   // Native Claude uses exit 1 for its structured max-turns result. Preserve
   // that existing semantic outcome only after a complete, uncancelled drain;

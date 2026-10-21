@@ -57,6 +57,29 @@ export function gitDiffHeaderPaths(line: string): [string, string] | undefined {
   }
 }
 
+/**
+ * Replace every diff section touching a path `withheld` names with one marker line, so a file the snapshot keeps
+ * out of the readable tree cannot come back through retained history. An unparseable diff header is withheld too.
+ */
+export function withholdHistory(raw: string, withheld: (path: string) => string | undefined): string {
+  const output: string[] = [];
+  let skipping = false;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('commit ')) skipping = false;
+    else if (line.startsWith('diff --git ')) {
+      const paths = gitDiffHeaderPaths(line)?.map((value) => value.replace(/^[ab]\//, '')),
+        reason = paths ? paths.map(withheld).find(Boolean) : 'unparseable diff header';
+      skipping = Boolean(reason);
+      if (reason) {
+        output.push(`diff withheld: ${paths?.[1] ?? 'unknown path'} (${reason})`);
+        continue;
+      }
+    }
+    if (!skipping) output.push(line);
+  }
+  return output.join('\n');
+}
+
 /** Return only exact path hunks, keeping one commit preamble per matching commit. */
 export function historyForPath(raw: string, path: string): string | undefined {
   const expected = new Set([`a/${path}`, `b/${path}`]),

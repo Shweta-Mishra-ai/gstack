@@ -29,7 +29,7 @@ function withFixture(check: (fixture: {
     fs.writeFileSync(path.join(home, '.gstack', 'config.yaml'), 'operator sentinel\n');
     const env = {
       PATH: process.env.PATH!, HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp,
-      GSTACK_HOME: state, CONDUCTOR_WORKSPACE_PATH: project,
+      GSTACK_HOME: state, GSTACK_LEASE_DIR: path.join(tmp, 'gstack-leases'), CONDUCTOR_WORKSPACE_PATH: project,
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'),
     };
     execFileSync('git', ['init', '-b', 'main'], { cwd: project, env, stdio: 'pipe', timeout: 10_000 });

@@ -8,6 +8,7 @@ import {
   logCost, recordE2E, createEvalCollector, finalizeEvalCollector,
 } from './helpers/e2e-helpers';
 import { extractSkillSections, REVIEW_ARMY_E2E_SECTIONS, sliceBetween } from './helpers/skill-fixture';
+import { makeStateMatrixRepo, STATE_MACHINES_CHECKLIST, STATE_MATRIX_FIXTURE, type StateMatrixRepo } from './helpers/state-matrix-fixture';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -584,6 +585,56 @@ Write ONLY JSON findings (no preamble) to ${dir}/findings.json`,
   }, JUDGE_MS);
 });
 
+// --- Review Army: State-machine round-trip matrix (field list 2, W3) ---
+// Contract: on the #6792-shaped diff (two new proposal kinds that fall through
+// to the remove path, tests only for add, remove and a new-claim replace), the
+// live State Machines specialist, given Step 4.5's dispatch instructions
+// extracted from review-army.md, returns a matrix that gstack-state-matrix
+// check passes against the fixture's ground truth: every kind x owner action
+// cell, each untested cell reported as a finding. The free regression on a
+// captured run is test/state-matrix.test.ts.
+
+describeIfSelected('Review Army: State-machine matrix', ['review-army-state-matrix'], () => {
+  let repo: StateMatrixRepo;
+
+  beforeAll(() => {
+    repo = makeStateMatrixRepo('skill-e2e-army-state-matrix-');
+    const specDir = path.join(repo.work, 'review-specialists');
+    fs.mkdirSync(specDir, { recursive: true });
+    fs.copyFileSync(STATE_MACHINES_CHECKLIST, path.join(specDir, 'state-machines.md'));
+  });
+
+  afterAll(() => { try { fs.rmSync(repo.root, { recursive: true, force: true }); } catch {} });
+
+  testConcurrentIfSelected('review-army-state-matrix', async () => {
+    const dispatch = sliceBetween(readReviewSection('review-army.md'), '"You are a specialist code reviewer.', '**Subagent configuration:**')
+      .trim().replace(/^"|"$/g, '').replace(/\\"/g, '"')
+      .replace('{checklist path}', 'review-specialists/state-machines.md').replace('origin/<base>', 'origin/main')
+      .replace('{TEST_FW}', 'unknown').replace('{STACK}', 'node').replace("{learnings or 'none'}", 'none');
+    const out = path.join(repo.work, 'review-output.jsonl');
+    const result = await runSkillTest({
+      prompt: `You are the State Machines specialist that /review's Step 4.5 dispatched for branch trust-guard (gstack-state-matrix detect printed SCOPE_STATE_MACHINE=true). These are your dispatch instructions:
+
+${dispatch}
+
+Write your raw output, exactly as those instructions define it, to ${out} and nothing else. After saving it, finish with a brief acknowledgement.`,
+      workingDirectory: repo.work,
+      maxTurns: 20,
+      timeout: 180_000,
+      testName: 'review-army-state-matrix',
+      runId,
+    });
+
+    logCost('/review army state matrix', result);
+    recordE2E(evalCollector, '/review army state-machine matrix', 'Review Army', result);
+    expect(result.exitReason).toBe('success');
+    expect(fs.existsSync(out)).toBe(true);
+    const check = spawnSync(path.join(ROOT, 'bin', 'gstack-state-matrix'), ['check', out, '--repo', repo.work, '--expect', path.join(STATE_MATRIX_FIXTURE, 'expect.json')], { cwd: repo.work, encoding: 'utf-8', timeout: 60_000 });
+    expect(check.stdout, check.stdout + check.stderr).toMatch(/^STATE_MATRIX_CHECK: ok/m);
+    expect(check.status).toBe(0);
+  }, 240_000);
+});
+
 // --- Review Army: Red Team (periodic) ---
 
 describeIfSelected('Review Army: Red Team', ['review-army-red-team'], () => {
@@ -752,6 +803,7 @@ Write ${dir}/review-output.md with only the selection line, the SPECIALIST REVIE
 
 describeIfSelected('Review Army: Simplification activation', ['review-army-simplification'], () => {
   let dir: string;
+  let observations: string;
 
   beforeAll(() => {
     const repo = setupRepo('army-simplification');
@@ -769,24 +821,27 @@ describeIfSelected('Review Army: Simplification activation', ['review-army-simpl
     repo.run('git', ['add', '.']);
     repo.run('git', ['commit', '-m', 'add date utils']);
 
-    copyReviewFiles(dir);
+    observations = stageReviewArmySession(dir, `SCOPE_FRONTEND=false
+SCOPE_BACKEND=true
+SCOPE_PROMPTS=false
+SCOPE_TESTS=false
+SCOPE_DOCS=false
+SCOPE_CONFIG=false
+SCOPE_MIGRATIONS=false
+SCOPE_API=false
+SCOPE_AUTH=false`, ['simplification'], ['simplification']);
   });
 
   afterAll(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
   testConcurrentIfSelected('review-army-simplification', async () => {
     const result = await runSkillTest({
-      prompt: `You are in a git repo on a feature branch that adds a JS utility file.
-Read review-SKILL.md for instructions. Also read review-checklist.md.
-The specialist checklists are in review-specialists/ (testing.md, simplification.md, etc.).
+      prompt: `You are the /review parent on branch feature/date-utils, a JS utility change. The caller invoked /review --simplification.
+${reviewArmyScope(observations, 'its Step 4.6 merge')}
+Selection: --simplification force-includes the Simplification specialist; the recorded DIFF_LINES is below its size gate, so only the flag selects it. Dispatch no other specialist.
+The checklist for this capture is review-specialists/simplification.md. Instead of launching a subagent, read it and apply it yourself against the recorded diff.
 
-Skip the preamble, lake intro, telemetry sections.
-Run Step 4.5 (Review Army) only.
-The base branch is main. The diff is over 100 lines, so the Simplification specialist should activate.
-
-For the specialist dispatch, read review-specialists/simplification.md and apply it against the diff.
-
-Write your findings to ${dir}/review-output.md`,
+Write ${dir}/review-output.md with only the selection line and the SPECIALIST REVIEW block with its PR Quality Score and Simplification footer, in at most 30 lines. After saving the report, finish with a brief acknowledgement rather than repeating the findings in the final response.`,
       workingDirectory: dir,
       maxTurns: 20,
       timeout: 180_000,

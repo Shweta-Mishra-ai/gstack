@@ -9,7 +9,7 @@ describe("gstack-learnings-search injection prevention", () => {
 
   test("no shell interpolation inside bun -e string", () => {
     // Extract the bun -e block (everything between `bun -e "` and the closing `"`)
-    const bunBlock = script.slice(script.indexOf('bun -e "'));
+    const bunBlock = script.slice(script.indexOf('bun --no-env-file --config=/dev/null -e "'));
 
     // Should NOT contain ${VAR} patterns (shell interpolation)
     // These are RCE vectors: a malicious learnings entry with '; rm -rf / ;' in the
@@ -27,7 +27,7 @@ describe("gstack-learnings-search injection prevention", () => {
   });
 
   test("uses process.env for all user-controlled values", () => {
-    const bunBlock = script.slice(script.indexOf('bun -e "'));
+    const bunBlock = script.slice(script.indexOf('bun --no-env-file --config=/dev/null -e "'));
 
     // Must use process.env for TYPE, QUERY, LIMIT.
     // SLUG and CROSS are no longer threaded as env vars inside the bun
@@ -52,7 +52,7 @@ describe("gstack-learnings-search injection prevention", () => {
   });
 
   test("current vs cross-project rows distinguished by inline tags, not SLUG env (#1619)", () => {
-    const bunBlock = script.slice(script.indexOf('bun -e "'));
+    const bunBlock = script.slice(script.indexOf('bun --no-env-file --config=/dev/null -e "'));
     // The bun block must inspect the per-line tag to mark cross-project rows.
     // The current shape emits `current\t<json>` or `cross\t<json>` from the
     // upstream pipe (via emit_tagged_file). Inside the bun block, the script

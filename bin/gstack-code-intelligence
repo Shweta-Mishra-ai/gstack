@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-code-intelligence — pick a code-intelligence provider and use it to
  * index and search this repo. OPTIONAL: with nothing selected, gstack works

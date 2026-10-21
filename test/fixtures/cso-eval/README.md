@@ -247,7 +247,9 @@ unknown, and wall-clock budgets are not represented as model-spend caps.
 
 The scorer checks 95% daily precision, 80% comprehensive high/critical recall,
 no aggregate high/critical recall regression against v2, all core cold starts,
-zero falsely certified runtime-tested repairs, and a correct held-out repair in
+zero falsely certified runtime-tested repairs (claims on declared instrumentation
+count in neither direction; an incidental claim needs a passing replay of its
+signed bundle), and a correct held-out repair in
 every application stack. It also requires complete matched results, mandatory
 reports, containment/canary receipts, and enforced oracle separation. Missing
 evaluations return

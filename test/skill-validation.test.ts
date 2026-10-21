@@ -939,6 +939,16 @@ describe('Enum & Value Completeness in review checklist', () => {
     expect(checklist).toContain('allowlist');
   });
 
+  test('Enum & Value Completeness covers loosened input acceptance and stale user-facing strings', () => {
+    const start = checklist.indexOf('#### Enum & Value Completeness');
+    const section = checklist.slice(start, checklist.indexOf('### Pass 2', start));
+    expect(section).toContain('loosens what an input accepts');
+    expect(section).toContain('Loosened acceptance breaks unchanged consumers');
+    const maintainability = fs.readFileSync(path.join(ROOT, 'review', 'specialists', 'maintainability.md'), 'utf-8');
+    const stale = maintainability.slice(maintainability.indexOf('### Stale Comments & Docstrings'));
+    expect(stale.slice(0, stale.indexOf('\n### ', 5))).toContain('User-facing strings (errors, toasts, labels) whose guarding condition changed');
+  });
+
   test('Enum & Value Completeness is in the severity classification as CRITICAL', () => {
     const gateSection = checklist.slice(checklist.indexOf('## Severity Classification'));
     // The ASCII art has CRITICAL on the left and INFORMATIONAL on the right
@@ -1368,8 +1378,9 @@ describe('ship step numbering', () => {
   // by test/ship-apple-gate.test.ts), 8.1 (Plan Verification), 8.2 (Scope
   // Drift), 9.1 (Review Army), 9.2 (Findings Merge), 9.3 (Cross-review dedup),
   // 9.4 (Fix-First and persistence), 15.0 (WIP context), 15.1 (Bisectable commits),
-  // 15.2 (safe optional WIP consolidation).
-  const ALLOWED_SUBSTEPS = new Set(['0.9', '8.1', '8.2', '9.1', '9.2', '9.3', '9.4', '11.5', '14.5', '15.0', '15.1', '15.2']);
+  // 15.2 (safe optional WIP consolidation), 6.5 (early Greptile PR, which must
+  // follow the free tests and precede the reviews it runs in parallel with).
+  const ALLOWED_SUBSTEPS = new Set(['0.9', '6.5', '8.1', '8.2', '9.1', '9.2', '9.3', '9.4', '11.5', '14.5', '15.0', '15.1', '15.2']);
 
   test('ship/SKILL.md.tmpl contains no unexpected fractional step numbers', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md.tmpl'), 'utf-8');
@@ -1517,8 +1528,8 @@ describe('Codex skill', () => {
     const resumeCommand = match![0];
     expect(resumeCommand).not.toContain(' -C ');
     expect(resumeCommand).not.toMatch(/ -s /);
-    // resume takes the sandbox only as config; _gstack_codex_select_model sets it (read-only by default).
-    expect(resumeCommand).toContain('-c "sandbox_mode=\\"${_GSTACK_CODEX_SANDBOX:?}\\""');
+    // resume takes the sandbox only as config; the probe's select-model reports it (read-only by default).
+    expect(resumeCommand).toContain('-c "sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\""');
   });
 
   test('codex union contains cost tracking', () => {
@@ -1598,7 +1609,7 @@ describe('Codex skill', () => {
     expectMentions(content, [['only', 'disabled', 'passes']], 'content');
     // Review log
     expect(content).toContain('adversarial-review');
-    expect(content).toContain('reasoning_effort="high"');
+    expect(content).toContain('run-with-timeout --effort high ');
     expect(content).toContain('ADVERSARIAL REVIEW SYNTHESIS');
     // Large diff structured review still gated
     expectMentions(content, [['only', 'structured', 'review']], 'content');
@@ -1609,7 +1620,7 @@ describe('Codex skill', () => {
     const content = readShipUnion();
     expect(content).toContain('Adversarial review (always-on)');
     expect(content).toContain('adversarial-review');
-    expect(content).toContain('reasoning_effort="high"');
+    expect(content).toContain('run-with-timeout --effort high ');
     expect(content).toContain('Investigate and fix');
     expect(content).toContain('Claude adversarial subagent (always runs)');
   });
@@ -1768,14 +1779,13 @@ describe('Skill trigger phrases', () => {
   ];
 
   for (const skill of SKILLS_REQUIRING_TRIGGERS) {
-    test(`${skill}/SKILL.md has "Use when" trigger phrases`, () => {
-      const skillPath = path.join(ROOT, skill, 'SKILL.md');
+    test(`${skill}/SKILL.md.tmpl has "Use when" trigger phrases`, () => {
+      const skillPath = path.join(ROOT, skill, 'SKILL.md.tmpl');
       if (!fs.existsSync(skillPath)) return;
       const content = fs.readFileSync(skillPath, 'utf-8');
-      // v1.45.0.0 catalog trim moved trigger prose out of frontmatter into a
-      // body "## When to invoke" section. Search the full file content, not
-      // just frontmatter. The trigger phrase must still appear somewhere in
-      // the skill so agents can match user requests to the skill.
+      // The catalog trim drops trigger prose from the Claude SKILL.md, so check
+      // the template description: --catalog-mode=full and the other hosts
+      // still route on it.
       expect(content).toMatch(/Use when/i);
     });
   }
@@ -1788,11 +1798,11 @@ describe('Skill trigger phrases', () => {
   ];
 
   for (const skill of SKILLS_REQUIRING_PROACTIVE) {
-    test(`${skill}/SKILL.md has proactive routing phrase`, () => {
-      const skillPath = path.join(ROOT, skill, 'SKILL.md');
+    test(`${skill}/SKILL.md.tmpl has proactive routing phrase`, () => {
+      const skillPath = path.join(ROOT, skill, 'SKILL.md.tmpl');
       if (!fs.existsSync(skillPath)) return;
       const content = fs.readFileSync(skillPath, 'utf-8');
-      // Same catalog-trim consideration — search the full file content.
+      // Same catalog-trim consideration — check the template description.
       expect(content).toMatch(/Proactively (suggest|invoke)/i);
     });
   }

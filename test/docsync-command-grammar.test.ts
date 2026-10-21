@@ -2,8 +2,8 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fixtureDocs, gitAt, repoSnapshot } from './helpers/docsync-fixture';
-import { docsCommandAllowed, docsNativeInterface, docsSessionOptions, docsToolFailures } from './helpers/docsync-observer';
+import { DOC_PATH, fixtureDocs, gitAt, repoSnapshot } from './helpers/docsync-fixture';
+import { docsCommandAllowed, docsCompletedRead, docsNativeInterface, docsSessionOptions, docsToolFailures } from './helpers/docsync-observer';
 import { parseNDJSON, type SkillTestResult } from './helpers/session-runner';
 
 let fixture: ReturnType<typeof fixtureDocs>;
@@ -57,7 +57,7 @@ test('captured check-ignore read is declared, executes without changing the repo
   expect(result.stdout).toContain('.qa-state');
   expect(docsToolFailures(nativeResult(command, result.stdout), fixture, [], true)).toEqual([]);
   expect(repoSnapshot(fixture.repo)).toEqual(before);
-  for (const denied of ['git check-ignore -v .qa-state; ls', 'git check-ignore -v .qa-state > out.txt']) {
+  for (const denied of ['git check-ignore -v .qa-state; git add .qa-state', 'git check-ignore -v .qa-state > out.txt']) {
     expect(docsCommandAllowed(denied, fixture)).toBe(false);
   }
 });
@@ -72,7 +72,7 @@ test('captured tracked-file listing is a declared read and leaves the repository
   expect(result.status).toBe(0);
   expect(docsToolFailures(nativeResult(command, result.stdout), fixture, [], true)).toEqual([]);
   expect(repoSnapshot(fixture.repo)).toEqual(before);
-  for (const rejected of ['git ls-tree -r HEAD > tree.txt', 'git ls-tree -r HEAD | head', 'git -c core.pager=less ls-tree HEAD']) {
+  for (const rejected of ['git ls-tree -r HEAD > tree.txt', 'git ls-tree -r HEAD | tee tree.txt', 'git -c core.pager=less ls-tree HEAD']) {
     expect(docsCommandAllowed(rejected, fixture)).toBe(false);
   }
 });
@@ -96,8 +96,8 @@ test.each([
   '{ git rev-parse HEAD; }', 'git rev-parse HEAD^{tree,commit}', 'git rev-parse HEAD@{0..2}',
   'git rev-parse HEAD^{tree}{,x}', 'git rev-parse HEAD^{tree', 'git rev-parse HEAD^{tree}}',
   'git rev-parse {HEAD}', 'git rev-parse HEAD$(pwd)', 'git rev-parse "HEAD$(pwd)"',
-  'git rev-parse `pwd`', 'git rev-parse ${HEAD}', 'git rev-parse HEAD; git status',
-  'git rev-parse HEAD && git status', 'git rev-parse HEAD | cat',
+  'git rev-parse `pwd`', 'git rev-parse ${HEAD}', 'git rev-parse HEAD; git add app.ts',
+  'git rev-parse HEAD && git commit -m changed', 'git rev-parse HEAD | sh',
   'git rev-parse HEAD > out.md', 'git rev-parse HEAD 2>/tmp/leak', 'git rev-parse HEAD < in.md',
   'git rev-parse HEAD\ngit status', 'git rev-parse HEAD &', 'git rev-parse HEAD\\^{tree}',
   'git rev-parse "HEAD^{tree}', "git rev-parse 'HEAD^{tree}", 'git rev-parse HEAD*',
@@ -122,7 +122,7 @@ test('harmless read wrappers do not fail a docs run', () => {
     'ls 2>&1', 'git status 2>&1']) {
     expect(docsToolFailures(nativeResult(command, 'successful tool acknowledgment', 'docs-dispatch'), fixture, [], true)).toEqual([]);
   }
-  for (const command of ['git status 2>&1 > out.txt', 'ls 2>&1 | head', `bun ${path.join(fixture.home, 'publish.ts')} 2>&1`, 'ls 2>out.txt']) {
+  for (const command of ['git status 2>&1 > out.txt', 'ls 2>&1 | sh', `bun ${path.join(fixture.home, 'publish.ts')} 2>&1`, 'ls 2>out.txt']) {
     expect(docsCommandAllowed(command, fixture, [path.join(fixture.home, 'publish.ts')])).toBe(false);
   }
 });
@@ -148,6 +148,14 @@ test('parent and child receive resolved local platform and base without new prob
     report: path.join(fixture.home, 'report.md'), publish: path.join(fixture.home, 'publish.ts'),
     scenario: 'current', testName: 'docsync-command-grammar', runId: 'free-control', timeout: 10000 });
   expect(options.prompt).toContain('Platform: local/git-native. Base: main.');
+  // A1: the parent points children at the saved interface instead of retyping it into their prompts.
+  const interfaceFile = path.join(fixture.home, 'fixture-interface.md');
+  expect(options.prompt).toContain(`saved at ${interfaceFile}: each child prompt tells the child to Read that file first`);
+  expect(options.prompt).not.toContain('include this interface in child prompts');
+  const saved = fs.readFileSync(interfaceFile, 'utf8');
+  expect(saved.startsWith('Fixture observation interface')).toBe(true);
+  expect(options.prompt.endsWith(saved.trimEnd())).toBe(true);
+  expect(fs.statSync(interfaceFile).mode & 0o777).toBe(0o600);
 });
 
 // The observer polices bash commands from the POSIX-only paid ship evals and refuses backslashes
@@ -200,13 +208,14 @@ test('only the native ship parent interface declares the section insert', () => 
   for (const transport of [false, true]) expect(docsNativeInterface(fixture, [], transport)).not.toContain('>> TARGET.md');
 });
 
-test('the installed docs-candidate helper is admitted only with a private .json record', () => {
+test('the installed docs-candidate helper is admitted only with a private .json record, or for its own --help', () => {
   const helper = path.join(fixture.skills, 'bin/gstack-docs-candidate');
   const record = path.join(fixture.home, 'audit-1-candidate.json');
   for (const command of [
     `${helper} snapshot --out ${record} --audit-id audit-1 --mode edit --base main --docs handbook`,
     `${helper} snapshot --out ${record} --audit-id audit-1 --mode read-only --base main --select app.ts --docs handbook`,
     `${helper} compare ${record}`,
+    `${helper} --help`,
   ]) expect(docsCommandAllowed(command, fixture), command).toBe(true);
   for (const command of [
     `${helper} snapshot --out ${path.join(fixture.repo, 'candidate.json')} --audit-id a --mode edit --base main`,
@@ -217,7 +226,266 @@ test('the installed docs-candidate helper is admitted only with a private .json 
     `${helper} compare ${path.join(fixture.skills, 'bin/x.json')}`,
     `${helper} compare ${record} extra`,
     `${helper} install`,
+    `${helper} --help snapshot`,
+    `${helper} --version`,
     `~/.claude/skills/gstack/bin/gstack-docs-candidate compare ${record}`,
   ]) expect(docsCommandAllowed(command, fixture), command).toBe(false);
   expect(docsNativeInterface(fixture)).toContain(`${fixture.skills.split(path.sep).join('/')}/bin/gstack-docs-candidate snapshot`);
+  expect(docsNativeInterface(fixture)).toContain('compare <that .json> and --help commands');
+});
+
+test('the installed lifecycle helpers are admitted for their own --help, which starts nothing', () => {
+  const skills = fixture.skills.split(path.sep).join('/');
+  for (const helper of ['gstack-skill-start', 'gstack-skill-end']) {
+    expect(docsCommandAllowed(`${skills}/bin/${helper} --help`, fixture)).toBe(true);
+    for (const command of [
+      `${skills}/bin/${helper} --help --skill review`,
+      `${skills}/bin/${helper} --skill review`,
+      `${skills}/bin/${helper} -h`,
+      `${skills}/bin/${helper} --help; ${skills}/bin/${helper} --skill document-release`,
+      `~/.claude/skills/gstack/bin/${helper} --help`,
+    ]) expect(docsCommandAllowed(command, fixture), command).toBe(false);
+  }
+  expect(docsNativeInterface(fixture)).toContain('or their own --help');
+});
+
+// PR gate run 38969924945 (ship-docsync-store) went red only on `gstack-skill-start --help`.
+test('every Bash command of the captured ship-docsync-store run is inside the interface', () => {
+  const capture = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-store-38969924945-bash.json'), 'utf8'));
+  const commands: string[] = capture.commands.map((command: string) => command.replaceAll('<HOME>', fixture.home));
+  for (const file of ['docs-audit-20261016T2140Z-1-documentation.md', 'ship-report.md']) fs.writeFileSync(path.join(fixture.home, file), '');
+  const publish = path.join(fixture.home, 'fixture-publish.ts');
+  expect(commands).toHaveLength(54);
+  expect(commands.filter(command => !docsCommandAllowed(command, fixture, [publish]))).toEqual([]);
+});
+
+// PR gate run 38990111230 (ship-docsync-stale-after, head 6c07d85c82d17bda81860cd0d78616de3dc14cc2) went red only on
+// `gstack-docs-candidate snapshot --help` (bash#8), which the helper rejected as an unknown argument. Every Bash
+// command of the parent, in order; <HOME> is the fixture home and <ACTOR> the fault actor.
+const STALE_AFTER_38990111230 = [
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate compare <HOME>/candidate-ship-docs-a1.json',
+  'bun <ACTOR> inspect <HOME>/actor-state.json',
+  'sha256sum <HOME>/.claude/skills/gstack/document-release/SKILL.md <HOME>/.claude/skills/gstack/document-release/sections/audit-scope.md <HOME>/.claude/skills/gstack/document-release/sections/release-body.md',
+  'bun <ACTOR> prepare <HOME>/actor-state.json audit_id=ship-docs-a2',
+  'bun <ACTOR> dispatch <HOME>/actor-state.json audit_id=ship-docs-a2 candidate=<HOME>/candidate-ship-docs-a2.json prompt=<HOME>/prompt-ship-docs-a2.md run_in_background=false',
+  'bun <ACTOR> inspect <HOME>/actor-state.json',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate compare <HOME>/candidate-ship-docs-a2.json',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate snapshot --help',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate snapshot --out <HOME>/ship-docs-a2-post.json --audit-id ship-docs-a2 --mode edit --base 21cebf26714abdfc6b80267507b88a4df6e933a8 --docs handbook --select AGENTS.md --select CHANGELOG.md --select README.md --select TODOS.md --select VERSION --select app.ts --select handbook/reference/commands/widget.md.tmpl --select package.json',
+  'bun <ACTOR> inspect <HOME>/actor-state.json',
+  'bun <ACTOR> publish <HOME>/actor-state.json audit_id=ship-docs-a2 report=<HOME>/ship-report.md',
+];
+
+test('every Bash command of the captured ship-docsync-stale-after run is inside the fault interface', () => {
+  const actor = path.join(import.meta.dir, 'helpers/docsync-fault-actor.ts');
+  const commands = STALE_AFTER_38990111230.map(command => command.replaceAll('<HOME>', fixture.home).replaceAll('<ACTOR>', actor));
+  expect(commands).toHaveLength(11);
+  expect(commands.filter(command => !docsCommandAllowed(command, fixture, [actor]))).toEqual([]);
+});
+
+test('subcommand --help is admitted alone and runs without effect; with any other argument it stays outside the interface', () => {
+  const helper = path.join(fixture.skills, 'bin/gstack-docs-candidate');
+  const record = path.join(fixture.home, 'help-probe.json');
+  const before = repoSnapshot(fixture.repo);
+  for (const sub of ['snapshot', 'compare']) {
+    expect(docsCommandAllowed(`${helper} ${sub} --help`, fixture)).toBe(true);
+    const run = spawnSync(helper, [sub, '--help'], { cwd: fixture.repo, encoding: 'utf8', timeout: 20_000 });
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.stdout).toContain('usage: gstack-docs-candidate snapshot --out <candidate.json>');
+  }
+  for (const command of [
+    `${helper} snapshot --help --out ${record}`,
+    `${helper} compare --help ${record}`,
+    `${helper} snapshot --out ${record} --help`,
+    `${helper} snapshot -h`,
+    `${helper} compare -h`,
+    `${helper} snapshot --help --out ${path.join(fixture.repo, 'inside.json')}`,
+    `${helper} snapshot --out ${path.join(fixture.repo, 'inside.json')} --audit-id a --mode edit --base main`,
+    `${helper} snapshot --help; ${helper} compare ${record}`,
+  ]) expect(docsCommandAllowed(command, fixture), command).toBe(false);
+  expect(fs.existsSync(record)).toBe(false);
+  expect(repoSnapshot(fixture.repo)).toEqual(before);
+});
+
+// PR gate run 39153452209 (ship-docsync-store, head a844821583d664e3dea279fff12b935865e92f52) went red only on the
+// document-release child's `git describe --tags --always` (bash#24). Every Bash command of the parent and its child,
+// in order; <HOME> is the fixture home.
+const STORE_39153452209 = [
+  'git status',
+  'git rev-parse HEAD',
+  'git ls-files',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate --help',
+  'git diff --cached',
+  'git diff',
+  'git branch --show-current',
+  'git log --oneline',
+  'git check-ignore -v .qa-state',
+  'ls -la <HOME>',
+  '<HOME>/.claude/skills/gstack/bin/gstack-skill-start --help',
+  'git ls-files -z --cached --others --exclude-standard',
+  'git show HEAD:handbook/reference/commands/widget.md.tmpl',
+  'ls -la <HOME>/state',
+  'git hash-object README.md handbook/reference/commands/widget.md.tmpl options.ts app.ts personal-note.txt',
+  'git log --oneline --decorate --all',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate snapshot --out <HOME>/ship-docs-20261018-c0048c5-a1.json --audit-id ship-docs-20261018-c0048c5-a1 --mode read-only --base c0048c54c542cf0ba46b7587cf7fea1b519c75e4 --select app.ts --select README.md --select options.ts --docs handbook --docs README.md --docs AGENTS.md --docs CHANGELOG.md --docs TODOS.md',
+  'GSTACK_SESSION_KIND=spawned <HOME>/.claude/skills/gstack/bin/gstack-skill-start --skill document-release --model claude',
+  'git status',
+  'git log --oneline',
+  'git diff c0048c54c542cf0ba46b7587cf7fea1b519c75e4 HEAD --stat',
+  'git diff --cached',
+  'git diff',
+  'git ls-files --cached --others --exclude-standard',
+  'git hash-object README.md options.ts app.ts personal-note.txt',
+  'git describe --tags --always',
+  '<HOME>/.claude/skills/gstack/bin/gstack-skill-end --skill document-release --outcome success --session-id 878-1792348356-d8b277ad --tel-start 1792348356 --used-browse no',
+  '<HOME>/.claude/skills/gstack/bin/gstack-docs-candidate compare <HOME>/ship-docs-20261018-c0048c5-a1.json',
+  'git status',
+  'git rev-parse HEAD',
+  'git hash-object README.md handbook/reference/commands/widget.md.tmpl options.ts app.ts personal-note.txt AGENTS.md CHANGELOG.md TODOS.md VERSION package.json',
+  'ls -la <HOME>',
+  'ls -la <HOME>/repo',
+  'cat <HOME>/ship-docs-20261018-c0048c5-a1-documentation.md >> <HOME>/ship-report.md',
+  'git status',
+  'ls -la <HOME>',
+];
+
+test('every Bash command of the captured run 39153452209 ship-docsync-store is inside the interface', () => {
+  const commands = STORE_39153452209.map(command => command.replaceAll('<HOME>', fixture.home));
+  for (const file of ['ship-docs-20261018-c0048c5-a1-documentation.md', 'ship-report.md']) fs.writeFileSync(path.join(fixture.home, file), '');
+  expect(commands).toHaveLength(36);
+  expect(commands).toContain('git describe --tags --always');
+  expect(commands.filter(command => !docsCommandAllowed(command, fixture))).toEqual([]);
+  expect(docsToolFailures(nativeResult('git describe --tags --always', 'c0048c5', 'docs-dispatch'), fixture, [], true)).toEqual([]);
+});
+
+const DESCRIBE_READS = ['git describe', 'git describe --tags', 'git describe --always', 'git describe --abbrev=7',
+  'git describe --exact-match', 'git describe HEAD', "git describe --tags --always --abbrev=12 'HEAD^{}'",
+  'git describe --exact-match --tags main', 'git describe --always main', 'git describe --tags --always 2>/dev/null'];
+const DESCRIBE_REFUSED = ['git describe --dirty', 'git describe --dirty=-modified', 'git describe --always --dirty',
+  'git describe --broken', 'git describe --broken=-broken', 'git describe --contains HEAD', 'git describe --all',
+  'git describe --abbrev', 'git describe --abbrev=x', 'git describe HEAD main', 'git describe -- HEAD',
+  'git describe --tags > tag.md', 'git describe --tags; git tag v9', 'git describe --tags && git tag v9'];
+
+test('read-only git describe forms are declared and leave the index and repository unchanged', () => {
+  expect(docsNativeInterface(fixture)).toContain('describe with only --tags, --always, --abbrev=<n> or --exact-match and at most one revision');
+  const own = fixtureDocs('store');
+  try {
+    gitAt(own.repo, 'tag', '-a', 'v0.1.0', '-m', 'fixture release', 'HEAD');
+    const stale = new Date(Date.now() - 3600_000);
+    fs.utimesSync(path.join(own.repo, 'AGENTS.md'), stale, stale);
+    const index = () => fs.readFileSync(path.join(own.repo, '.git/index')).toString('base64');
+    const before = { repo: repoSnapshot(own.repo), index: index() };
+    for (const command of DESCRIBE_READS) {
+      expect(docsCommandAllowed(command, own), command).toBe(true);
+      expect(docsToolFailures(nativeResult(command), own, [], true), command).toEqual([]);
+      const run = spawnSync('bash', ['-c', command], { cwd: own.repo, encoding: 'utf8', timeout: 10000 });
+      expect(run.status, `${command}: ${run.stderr}`).toBe(0);
+      expect({ repo: repoSnapshot(own.repo), index: index() }, command).toEqual(before);
+    }
+  } finally {
+    own.clean();
+  }
+});
+
+test('describe forms that refresh the index or fall outside the declared set, and Git writes, stay outside the interface', () => {
+  for (const command of [...DESCRIBE_REFUSED, 'git tag v9 HEAD', 'git update-index --refresh', 'git notes add -m x HEAD']) {
+    expect(docsCommandAllowed(command, fixture), command).toBe(false);
+    expect(docsToolFailures(nativeResult(command, 'successful tool acknowledgment', 'docs-dispatch'), fixture, [], true), command)
+      .toEqual(['command outside declared docs observation interface']);
+  }
+  const own = fixtureDocs('store');
+  try {
+    const stale = new Date(Date.now() - 3600_000);
+    fs.utimesSync(path.join(own.repo, 'AGENTS.md'), stale, stale);
+    const index = () => fs.readFileSync(path.join(own.repo, '.git/index')).toString('base64');
+    const before = index();
+    const run = spawnSync('git', ['describe', '--always', '--dirty'], { cwd: own.repo, encoding: 'utf8', timeout: 10000 });
+    expect(run.status, run.stderr).toBe(0);
+    expect(index()).not.toBe(before);
+  } finally {
+    own.clean();
+  }
+});
+
+
+// ship-docsync-current on Opus 5.5: run 39347827595 (PR #3300 @ ca215b0) went red only on the parent's joined Git read,
+// and run 39344306426 (PR #3312 @ c895ab9) only on the child's loop that printed each selected file under a header.
+// Both are pure reads; each still runs as declared and leaves the repository unchanged.
+const CURRENT_COMPOSED_READS = [
+  'cat personal-note.txt; echo ---; git diff main HEAD',
+  'for f in AGENTS.md README.md CHANGELOG.md TODOS.md VERSION app.ts package.json handbook/reference/commands/widget.md.tmpl personal-note.txt; do echo "=== $f"; cat $f; done',
+  'git status --porcelain && git diff --cached | head -5',
+  'for doc in README.md AGENTS.md; do git log --oneline -- $doc; done',
+  'for f in app.ts; do echo "== ${f}"; cat "$f" 2>/dev/null; done',
+  // Focused Opus trial after the first repair (2026-10-20): a loop joined to a find.
+  'for f in AGENTS.md README.md CHANGELOG.md TODOS.md VERSION app.ts package.json handbook/reference/commands/widget.md.tmpl; do echo "== $f"; cat $f; done; find <HOME>/repo -name .gstack -not -path "*/.git/*"',
+  'git status; for f in README.md AGENTS.md; do cat $f; done && git rev-parse HEAD',
+  // Round-1 focused trial and the round-2 ship-docsync-completion trial: NUL-separated paths shown one per line.
+  "git ls-files -z --cached --others --exclude-standard | tr '\\0' '\\n'",
+  "git status --porcelain=v1 --ignored; git rev-parse HEAD; git merge-base main HEAD; git branch --show-current; git ls-files -z --cached --others --exclude-standard | tr '\\0' '\\n'",
+];
+
+test('captured composed reads of ship-docsync-current are declared and leave the repository unchanged (39347827595, 39344306426)', () => {
+  const own = fixtureDocs('current');
+  try {
+    expect(docsNativeInterface(own)).toContain('The Git reads above may join such a line too');
+    expect(docsNativeInterface(own)).toContain('A for loop over literal words');
+    const before = repoSnapshot(own.repo);
+    for (const command of CURRENT_COMPOSED_READS.map(line => line.replaceAll('<HOME>', own.home))) {
+      expect(docsCommandAllowed(command, own), command).toBe(true);
+      expect(docsToolFailures(nativeResult(command, 'output', 'docs-dispatch'), own, [], true), command).toEqual([]);
+      const run = spawnSync('bash', ['-c', command], { cwd: own.repo, encoding: 'utf8', timeout: 10000 });
+      expect(run.status, `${command}: ${run.stderr}`).toBe(0);
+    }
+    expect(repoSnapshot(own.repo)).toEqual(before);
+    const doc = path.join(own.repo, DOC_PATH);
+    const source = fs.readFileSync(doc, 'utf8');
+    const credited = (command: string) => docsCompletedRead(nativeResult(command, source), doc, own);
+    expect(credited(`cat ${DOC_PATH}; git status`)).toBe(true);
+    expect(credited(`git status; cat ${DOC_PATH} | head`)).toBe(false);
+    // The focused trial's child read the document only inside its loop.
+    const loop = `for f in personal-note.txt README.md ${DOC_PATH} app.ts; do echo "=== $f"; cat $f; done`;
+    const looped = spawnSync('bash', ['-c', loop], { cwd: own.repo, encoding: 'utf8', timeout: 10000 }).stdout;
+    expect(docsCompletedRead(nativeResult(loop, looped), doc, own)).toBe(true);
+    expect(docsCompletedRead(nativeResult(`for f in ${DOC_PATH}; do cat $f | head -1; done`, source), doc, own)).toBe(false);
+    expect(docsCompletedRead(nativeResult(`for f in ${DOC_PATH}; do cat $f; cat $HOME; done`, source), doc, own)).toBe(false);
+  } finally {
+    own.clean();
+  }
+});
+
+// Run 39338691964 (PR #3308 @ 8da34e2) keeps failing on purpose: the child's stray assignment, and the parent's reads
+// of agents' session transcripts in the Claude config dir (now named off-limits in the interface). Joined Git reads
+// and loops grant no write, bypass option, pipe sink, cd, glob, variable or denied path.
+test.each([
+  'for_none=1; cat AGENTS.md README.md',
+  'find <HOME>/cc/projects -type f',
+  'grep -o SESSION_KIND <HOME>/cc/projects/session/subagents/agent-a.jsonl',
+  'cat README.md; git add app.ts', 'git diff; git commit -m changed', 'ls && git -c core.pager=less show HEAD',
+  'ls; git -C /tmp status', 'cat app.ts | git hash-object -w --stdin', 'cat app.ts | git hash-object --stdin',
+  'cd .. && git status; ls', 'cd handbook; git status', 'git diff > out.md; ls', 'ls; git diff --output=out.md',
+  'git status & ls', 'git status; rm app.ts', 'git log | sh', 'git log | tee log.md', 'git status; cat <HOME>/cc/.claude.json',
+  'git status; git remote get-url origin', "ls; git show 'HEAD", 'git status; ls $HOME',
+  'for f in README.md; do cat $f > out.md; done', 'for f in app.ts; do rm $f; done', 'for f in $(ls); do cat $f; done',
+  'for f in *; do cat $f; done', 'for f in c*/.claude.json; do cat "$f"; done', 'for PATH in /tmp; do cat README.md; done',
+  'for f in README.md; do cat $f; cat $HOME; done', 'for f in README.md; do cat $f; done; rm app.ts',
+  'for f in README.md; do cat $f; done > out.md', 'for f in "README.md"; do cat $f; done', 'for f in ../../outside; do cat $f; done',
+  'for f in ../cc/.claude.json; do cat $f; done', 'for f in app.ts; do git add $f; done', 'for f in a b; do for g in c; do cat $g; done; done',
+  'for f in README.md; do cat $f; done &', 'for f in {README,AGENTS}.md; do cat $f; done', 'for f in ~/x; do cat $f; done',
+  'ls; for f in README.md; do cat $f; done > out.md', 'for f in README.md; do cat $f; done; for g in app.ts; do rm $g; done',
+  'ls; for f in README.md; do cat $f; done | sh', 'cd ..; for f in README.md; do git status; done', 'for f in README.md; do cat $f && done',
+  "git ls-files -z | tr '\\0' '\\n' | sh", "git ls-files -z | tr '\\0' '\\n' > files.md", 'tr a b', "git ls-files | tr '$x' y",
+])('composed reads stay closed to writes and bypasses: %s', command => {
+  const line = command.replaceAll('<HOME>', fixture.home);
+  expect(docsCommandAllowed(line, fixture), line).toBe(false);
+  expect(docsToolFailures(nativeResult(line, 'successful tool acknowledgment', 'docs-dispatch'), fixture, [], true))
+    .toEqual(['command outside declared docs observation interface']);
+});
+
+test('the docs interface names the Claude config dir and private actor state as unreadable', () => {
+  const guidance = docsNativeInterface(fixture);
+  expect(guidance).toContain(`off ${fixture.env.CLAUDE_CONFIG_DIR} except its settings.json`);
+  expect(guidance).toContain("every agent's session transcript");
+  expect(guidance).toContain('judge a child only by the output it returns');
+  expect(guidance).toContain('Every read stays off actor-state.json');
 });

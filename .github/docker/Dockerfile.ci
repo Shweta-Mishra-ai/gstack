@@ -33,9 +33,11 @@ RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https:
 #   bash bins shell out to it (macOS ships python3; the base image doesn't).
 # file: skill-validation's no-compiled-binaries-in-git check runs `file --mime-type`.
 # poppler-utils: make-pdf's e2e gates hard-require pdftotext/pdffonts/pdfinfo in CI.
+# zsh: the sourced-helper guard sources every skill helper under bash and zsh
+#   (macOS's default shell) and fails under CI=true when zsh is missing.
 RUN for i in 1 2 3; do \
       apt-get update && apt-get install -y --no-install-recommends \
-        git curl unzip xz-utils ca-certificates jq bc gpg python3 python3-venv file poppler-utils gcc libc6-dev && break || \
+        git curl unzip xz-utils ca-certificates jq bc gpg python3 python3-venv file poppler-utils gcc libc6-dev zsh && break || \
       (echo "apt retry $i/3 after failure"; sleep 10); \
     done \
     && rm -rf /var/lib/apt/lists/*
@@ -103,11 +105,11 @@ RUN curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL "https://nodejs.org
 # Hashes come from the release's SHASUMS256.txt. The image builds linux/amd64
 # only (the Node.js tarball above is linux-x64); an architecture without a
 # verified archive fails here. test/ci-image-cli-pin.test.ts pins this shape.
-ARG BUN_VERSION=1.4.0
+ARG BUN_VERSION=1.4.2
 ARG TARGETARCH
 ENV BUN_INSTALL="/usr/local"
 RUN case "${TARGETARCH:-amd64}" in \
-      amd64) bun_target=linux-x64; bun_sha256=2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452 ;; \
+      amd64) bun_target=linux-x64; bun_sha256=36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913 ;; \
       *) echo "Dockerfile.ci: no verified Bun ${BUN_VERSION} archive for ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL \
@@ -126,14 +128,15 @@ RUN case "${TARGETARCH:-amd64}" in \
 # skillify HOME discovery on 2.1.237, guard/freeze hooks on 2.1.162).
 # Bump deliberately, via a PR that runs the PTY gate against the new TUI.
 # test/ci-image-cli-pin.test.ts fails the free suite if this pin is removed.
-# 2.1.284 is the first pin that recognizes the eval model claude-fable-5-1.
-# 2.1.251 already sent it effort "high", but ran it as an unknown model with
-# a generic system prompt. Users on stable (2.1.280) and latest (2.1.285) get
-# the fable-5-1 profile: its own system prompt, 64k max_tokens and per-turn
-# effort, which only moves the same effort value into the conversation.
-# Census 36626737820 on 2.1.284 looked slower mostly because the API was:
-# its SDK-only judge evals, which never start this CLI, were 25% slower too.
-RUN npm i -g @anthropic-ai/claude-code@2.1.284
+# 2.1.292 is the npm latest users run (October 2026). On it the fork-subagent
+# gate is on by default in interactive sessions: the Agent schema drops
+# run_in_background and reviewers run in the background, which broke the
+# /autoplan publication guard while CI still ran 2.1.284 and never saw it.
+# Pinning the version users run is the point; the daily
+# autoplan-schema-canary case watches the latest release ahead of the pin.
+# (2.1.284 was the first pin to recognize the eval model claude-fable-5-1;
+# 2.1.292 keeps that profile.)
+RUN npm i -g @anthropic-ai/claude-code@2.1.292
 
 # Codex CLI — exact pin, same discipline as the claude pin above, so the
 # Codex eval files execute in CI instead of self-skipping. Installed OFF PATH:

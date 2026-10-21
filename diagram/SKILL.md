@@ -19,14 +19,6 @@ triggers:
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
-
-## When to invoke this skill
-
-The SVG/PNG use clean mermaid style; the
-.excalidraw carries the hand-drawn aesthetic. Fully offline.
-Use when asked to "make a diagram", "draw the architecture", "create a
-flowchart", "diagram this", or "visualize this flow".
-
 ## Preamble (run first)
 
 ```bash
@@ -66,14 +58,15 @@ If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay
 
 ## Artifacts Sync (skill start)
 
-The skill-start output above already ran artifacts sync. Act on its lines:
-GBrain hint text (if present) tells you when to prefer `gbrain` over Grep;
-`ARTIFACTS_SYNC:` reports sync health (`off`, `mode=... | queue=N`,
-`remote-mode`, or a restore hint naming `gstack-brain-restore`).
+Skill-start already ran artifacts sync. GBrain hint text (if any) says
+when to prefer `gbrain` over Grep. `ARTIFACTS_SYNC:` reports sync health
+(`off`, `mode=... | queue=N`, `remote-mode`, or a `gstack-brain-restore`
+hint). On an `attention:` line, tell the user in one sentence what
+it says and the command it names, then continue.
 
-The one-time privacy stop-gate (artifacts-sync consent) arrives as a
-`GSTACK_INSTRUCTION` block from skill-start when consent is actually pending
-— fire it via AskUserQuestion exactly as the block instructs.
+The one-time privacy stop-gate arrives as a `GSTACK_INSTRUCTION` block
+from skill-start when consent is pending; fire it via AskUserQuestion
+exactly as instructed.
 
 ## Model-Specific Behavioral Patch (claude)
 
@@ -98,14 +91,16 @@ find, grep). The dedicated tools are cheaper and clearer.
 
 Direct, concrete, builder-to-builder. Name the file, function, command, and user-visible impact. No filler.
 
-No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted. Never corporate or academic. Short paragraphs. End with what to do.
+No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted, load-bearing. Never corporate or academic. Short paragraphs. End with what to do.
+
+Reply in the language of the user's latest message unless asked otherwise. Code, commands, paths, identifiers and quoted output stay verbatim.
 
 The user has context you do not. Cross-model agreement is a recommendation, not a decision. The user decides.
 
 ## Completion Status Protocol
 
 When completing a skill workflow, report status using one of:
-- **DONE** — completed with evidence.
+- **DONE** — completed with evidence valid for the final consumed inputs; name reuse and anything not independently verified.
 - **DONE_WITH_CONCERNS** — completed, but list concerns.
 - **BLOCKED** — cannot proceed; state blocker and what was tried.
 - **NEEDS_CONTEXT** — missing info; state exactly what is needed.
@@ -230,7 +225,7 @@ corrupt it):
 
 ```bash
 SRC=$(base64 < <outdir>/<slug>.mmd | tr -d '\n')
-bun run ~/.claude/skills/gstack/bin/gstack-render.ts "<staged>" --wait-selector '#done' \
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-render.ts "<staged>" --wait-selector '#done' \
   --eval "window.__renderMermaid('diagram-1', atob('$SRC')).then(s => (window.__svg = s))" --out <outdir>/<slug>.svg \
   --eval "window.__rasterize(window.__svg, 1950)" --out <outdir>/<slug>.png \
   --eval "window.__mermaidToExcalidraw(atob('$SRC')).then(j => (window.__scene = j))" --out <outdir>/<slug>.excalidraw
@@ -276,7 +271,7 @@ JSON is full of quotes and backslashes:
 
 ```bash
 SCENE=$(base64 < <outdir>/<slug>.excalidraw | tr -d '\n')
-bun run ~/.claude/skills/gstack/bin/gstack-render.ts "<staged>" --wait-selector '#done' \
+bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-render.ts "<staged>" --wait-selector '#done' \
   --eval "window.__excalidrawToSvg(atob('$SCENE')).then(s => (window.__svg = s))" --out <outdir>/<slug>.svg \
   --eval "window.__rasterize(window.__svg, 1950)" --out <outdir>/<slug>.png
 ```

@@ -379,7 +379,8 @@ describe('hermetic skill runtime', () => {
       const version = read(path.join(ROOT, 'VERSION')).trim();
       write(path.join(state, 'config.yaml'), 'update_check: true\n');
       write(path.join(state, '.codex-desc-healed'), '');
-      write(path.join(state, 'last-update-check'), `UP_TO_DATE ${version}\n`);
+      const runtimeHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: runtime, encoding: 'utf8', timeout: 5000 }).trim();
+      write(path.join(state, 'last-update-check'), `UP_TO_DATE ${version}\nIDENTITY head=${runtimeHead} remote=none upstream=https://github.com/garrytan/gstack.git\n`);
       write(path.join(state, 'just-upgraded-from'), 'TEST_OLD\n');
       expect(execFileSync(path.join(runtime, 'bin', 'gstack-update-check'), [], { cwd: home, env: { ...env, GSTACK_STATE_DIR: state }, encoding: 'utf8', timeout: 10_000 }))
         .toBe(`JUST_UPGRADED TEST_OLD ${version}\n`);

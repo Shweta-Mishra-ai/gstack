@@ -41,6 +41,7 @@ import {
   substituteSlots,
 } from "./diagram-prepass";
 import { applyImagePolicy } from "./image-policy";
+import { guardDocxImages } from "./docx-images";
 
 /** Default output location (`$P generate letter.md` → /tmp/letter.pdf). */
 export const OUTPUT_TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -174,6 +175,7 @@ export async function generate(opts: GenerateOptions): Promise<string> {
       progress.end("Rasterizing diagrams for DOCX");
     }
     finalHtml = convertDiagnosticsForDocx(finalHtml);
+    finalHtml = guardDocxImages(finalHtml, warn);
   }
 
   // ─── --to html: write the self-contained document, no print round-trip ──

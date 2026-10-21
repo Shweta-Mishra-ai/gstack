@@ -2,6 +2,34 @@
 <!-- Regenerate: bun run gen:skill-docs -->
 ## Step 10: Address Greptile review comments (if PR exists)
 
+Check for a PR first. Greptile reviews a PR, so with no PR, no `gh`, no `gh` login or
+a non-GitHub remote there is nothing to triage yet:
+
+```bash
+if ! command -v gh >/dev/null 2>&1; then echo "PR: skip (gh not installed)"
+elif ! gh auth status >/dev/null 2>&1; then echo "PR: skip (gh not logged in)"
+elif ! _GH_ERR=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>&1 >/dev/null); then echo "PR: skip (not a GitHub remote: $(printf '%s' "$_GH_ERR" | head -1))"
+elif _PR_ERR=$(gh pr view --json number -q .number 2>&1 >/dev/null); then echo "PR: exists"
+else case "$_PR_ERR" in *"no pull requests found"*) echo "PR: skip (no PR yet)" ;; *) echo "PR: skip (PR lookup failed: $(printf '%s' "$_PR_ERR" | head -1))" ;; esac
+fi
+```
+
+Only `PR: exists` dispatches. `PR: skip (<reason>)` → do not dispatch; record
+"Greptile: not run (<reason>); runs on the PR once it exists" and continue to Step 11.
+
+**Early PR (Step 6.5):** when the record holds `EARLY_PR` and `EARLY_PR_OPENED_AT`, first
+wait for Greptile's review of that PR, substituting both values:
+
+```bash
+~/.claude/skills/gstack/bin/gstack-greptile-early wait <pr-number> --since <opened-at>
+```
+
+Each call returns within about 90 seconds; relay its progress line. Rerun on
+`GREPTILE_REVIEW: pending`. `complete` dispatches below. `timeout` or `unavailable` takes
+the Unavailable triage route with that line as the reason, never a claim of zero
+comments. Comments on the early head are triaged against the current diff
+(`already_fixed` when the code has moved on).
+
 Dispatch a subagent through Agent with `subagent_type: "general-purpose"` and
 `run_in_background: false`, using Step 7's shared foreground-dispatch rule.
 It fetches and classifies all Greptile comments,

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 //
 // gen-accessors (TS port). Mirrors the SwiftPM tool's logic for the cases
 // where a user doesn't want to wait 2-5min for swift-syntax to build the

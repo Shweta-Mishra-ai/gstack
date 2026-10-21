@@ -13,7 +13,7 @@
 # reaches the .ts, which kills the vendor's process group on its way out.
 # `<&0` keeps stdin: bash hands background jobs /dev/null otherwise.
 HERE="$(cd "$(dirname "$0")" && pwd)" || exit 0
-bun "$HERE/memorable-user-prompt-hook.ts" <&0 &
+bun --no-env-file --config=/dev/null "$HERE/memorable-user-prompt-hook.ts" <&0 &
 _child=$!
 trap 'kill -TERM "$_child" 2>/dev/null' TERM INT HUP
 wait "$_child" 2>/dev/null || wait "$_child" 2>/dev/null || true

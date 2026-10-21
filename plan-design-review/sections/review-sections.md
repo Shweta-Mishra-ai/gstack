@@ -217,7 +217,7 @@ FIX TO 10: Rewrite vague UI descriptions with specific alternatives:
 - "Hero section" → what makes this hero feel like THIS product?
 - "Clean, modern UI" → meaningless. Replace with actual design decisions.
 - "Dashboard with widgets" → what makes this NOT every other dashboard?
-If visual mockups were generated in Step 0.5, evaluate them against the AI slop blacklist above. Read each mockup image using the Read tool. Does the mockup fall into generic patterns (3-column grid, centered hero, stock-photo feel)? If so, flag it and offer to regenerate with more specific direction via `$D iterate --feedback "..."`; use its printed `outputPath` for any later view, check or board.
+If visual mockups were generated in Step 0.5, evaluate them against the AI slop blacklist above. Read each mockup image using the Read tool. Does the mockup fall into generic patterns (3-column grid, centered hero, stock-photo feel)? If so, flag it and offer to regenerate with more specific direction via `$D iterate --feedback "$(cat "$FEEDBACK_FILE")"` (the feedback in a private file, never inline); use its printed `outputPath` for any later view, check or board.
 **STOP.** AskUserQuestion once per issue. Do NOT batch. Recommend + WHY.
 
 ### Pass 5: Design System Alignment
@@ -258,7 +258,7 @@ If mockups were generated in Step 0.5 and review passes changed significant desi
 
 AskUserQuestion: "The review passes changed [list major design changes]. Want me to regenerate mockups to reflect the updated plan? This ensures the visual reference matches what we're actually building."
 
-If yes, use `$D iterate` with feedback summarizing the changes, or `$D variants` with an updated brief. Save to the same `$_DESIGN_DIR` directory; nothing is overwritten, so do round accounting and carry the printed paths into any new board (rebuild it with the board block, which rewrites `board-images.json`) or check.
+If yes, use `$D iterate` with feedback summarizing the changes, or `$D variants` with an updated brief; either text goes in a brief or feedback file, never inline. Save to the same `$_DESIGN_DIR` directory; nothing is overwritten, so do round accounting and carry the printed paths into any new board (rebuild it with the board block, which rewrites `board-images.json`) or check.
 
 ## How to ask questions
 Follow the AskUserQuestion format from the Preamble above. Additional rules for plan design reviews:
@@ -335,13 +335,13 @@ backslashes serialize cleanly — never use hand-rolled `echo` / `printf`.
 
 ```bash
 GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
-BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
 SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
 TASKS_DIR="$GSTACK_STATE_ROOT/projects/${SLUG:-unknown}"
 mkdir -p "$TASKS_DIR"
 TASKS_FILE="$TASKS_DIR/tasks-design-review-$(date +%Y%m%d-%H%M%S).jsonl"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
+# The task record keeps the raw git branch; artifact filenames keep gstack-slug's sanitized BRANCH.
+GIT_BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 # Repeat ONE jq invocation per task identified during this review.
@@ -352,7 +352,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 jq -nc \
   --arg phase 'design-review' \
   --arg run_id "$RUN_ID" \
-  --arg branch "$BRANCH" \
+  --arg branch "$GIT_BRANCH" \
   --arg commit "$COMMIT" \
   --arg id "$TASK_ID" \
   --arg priority "$PRIORITY" \
@@ -376,6 +376,10 @@ this run (an empty file means "ran, no findings" — distinct from "didn't run")
 
 ### Completion Summary
 Prepare this for the saved review; announce completion after the Read-back gate below.
+In the plan file, write it as its own `## Design Review Completion Summary` section
+(the box, the deferred list and the Unresolved Decisions below) above the terminal
+`## GSTACK REVIEW REPORT`, replacing this review's earlier one. Never write it inside
+the report: the next plan review deletes and regenerates everything under that heading.
 
 **Overall design score:** use the lowest of the six rated pass scores (1-6),
 separately before and after approved fixes. Pass 7 is unscored. Keep Step 0's
@@ -568,9 +572,8 @@ Historical source "claude" is a native subagent; "claude-code" is the external C
 Do not infer old providers or unknown models from today's harness. A native result
 does not fill missing, disabled or skipped outside coverage.
 
-**Source attribution:** Append a recorded `via` to the suffix, for example
-"CLEAR (PLAN via /autoplan)" or "CLEAR (DIFF via /ship)". Without `via`, keep
-"CLEAR (PLAN)" or "CLEAR (DIFF)". Below the dashboard, group `autoplan-voices`
+**Source attribution:** Append a recorded `via` to the suffix ("CLEAR (PLAN via
+/autoplan)"); without one, keep "CLEAR (PLAN)" or "CLEAR (DIFF)". Below the dashboard, group `autoplan-voices`
 and `design-outside-voices` by workflow run and phase. Show each phase's provider
 and outside_status; retain partial coverage. These details do not clear Eng Review.
 
@@ -579,8 +582,7 @@ and outside_status; retain partial coverage. These details do not clear Eng Revi
 - **Content-first rule:** For `review`, `adversarial-review`, `codex-review`,
   ship-stage reviews and `design-review-lite`, use `review_freshness.status`
   and show its `reason`. CURRENT means a completed clean review whose start and
-  end content fingerprints equal the current `---WTREE---` fingerprint. This
-  fingerprint covers working-tree content, not just the commit.
+  end content fingerprints equal the current `---WTREE---` fingerprint.
   STALE or UNVERIFIED cannot clear Eng Review. Missing `review_freshness`,
   including legacy log-only records, means UNVERIFIED. Never fall back to HEAD
   equality or commit distance for diff evidence, even at zero commits.
@@ -589,12 +591,11 @@ and outside_status; retain partial coverage. These details do not clear Eng Revi
 - **Plan records** (plan-ceo-review, plan-eng-review, plan-design-review and
   codex-plan-review) use the 7-day window, not the working-tree fingerprint.
   If `plan_sha256` is present, you may compare the plan file and report a mismatch.
-  For plan records only, compare the recorded commit with `---HEAD---`.
-  If different, run `git rev-list --count STORED_COMMIT..HEAD` and report
+  Compare the recorded commit with `---HEAD---`; if different, run
+  `git rev-list --count STORED_COMMIT..HEAD` and report
   "Note: {skill} review from {date} may be stale — {N} commits since review".
-  A failed command means UNKNOWN, treated as stale. Without commit tracking,
-  retain the note to consider re-running. Omit staleness notes when all reviews
-  are current.
+  A failed command means UNKNOWN, treated as stale; without commit tracking,
+  suggest a re-run. Omit notes when all reviews are current.
 
 **3. Choose the historical verdict.** CLEARED requires the selected Eng Review
 to be `clean`, within 7 days and fresh under step 2. Otherwise report NOT CLEARED

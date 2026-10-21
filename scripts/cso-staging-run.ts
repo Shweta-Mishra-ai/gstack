@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Bind a qualification dispatch to the one successful protected-main staging run that signed its images. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';

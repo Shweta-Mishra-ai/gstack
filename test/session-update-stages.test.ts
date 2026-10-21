@@ -48,6 +48,8 @@ function makeFixture() {
   fs.writeFileSync(path.join(seed, 'bin', 'gstack-config'),
     '#!/usr/bin/env bash\nif [ "$1" = "get" ]; then case "$2" in auto_upgrade) echo true;; skill_prefix) echo false;; *) echo "";; esac; fi\nexit 0\n', { mode: 0o755 });
   fs.writeFileSync(path.join(seed, 'bin', 'gstack-patch-names'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+  // Installed beside the Bun floor helper, which sources it for held reasons.
+  fs.copyFileSync(path.join(ROOT, 'bin', 'gstack-sanitize-echo.sh'), path.join(seed, 'bin', 'gstack-sanitize-echo.sh'));
   // Stub setup: records each run; $SETUP_CONTROL selects the outcome.
   fs.writeFileSync(path.join(seed, 'setup'), [
     '#!/usr/bin/env bash',
@@ -78,8 +80,27 @@ function upstreamRelease(fx: Fx, version: string) {
   git(fx.seed, 'push', '-q', 'origin', 'main');
 }
 
-function runHook(fx: Fx, opts: { noBun?: boolean } = {}) {
-  const PATH = opts.noBun ? pathWithoutBun(fx.base) : `${path.dirname(process.execPath)}:${process.env.PATH}`;
+/** Upstream release that ships the Bun floor file (E1). */
+function upstreamReleaseWithFloor(fx: Fx, version: string, floor: string) {
+  fs.copyFileSync(path.join(ROOT, 'bin', 'gstack-bun-version.sh'), path.join(fx.seed, 'bin', 'gstack-bun-version.sh'));
+  const file = path.join(fx.seed, 'bin', 'gstack-bun-version.sh');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^GSTACK_BUN_FLOOR="[^"]*"/m, `GSTACK_BUN_FLOOR="${floor}"`));
+  git(fx.seed, 'add', '-A');
+  upstreamRelease(fx, version);
+}
+
+/** A `bun` first on PATH that reports `version` (the binary setup would run). */
+function bunStub(fx: Fx, version: string): string {
+  const dir = path.join(fx.base, 'bun-stub');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'bun'), `#!/usr/bin/env bash\nprintf '%s\\n' '${version}'\n`, { mode: 0o755 });
+  return dir;
+}
+
+function runHook(fx: Fx, opts: { noBun?: boolean; bun?: string } = {}) {
+  const PATH = opts.noBun ? pathWithoutBun(fx.base)
+    : opts.bun ? `${bunStub(fx, opts.bun)}:${pathWithoutBun(fx.base)}`
+    : `${path.dirname(process.execPath)}:${process.env.PATH}`;
   return spawnSync('bash', [SCRIPT], {
     encoding: 'utf8',
     env: { PATH, HOME: fx.home, GSTACK_DIR: fx.install, GSTACK_STATE_ROOT: fx.state, SETUP_CONTROL: fx.control, SETUP_CALLS: fx.calls, TMPDIR: fx.base },
@@ -127,7 +148,7 @@ describe.skipIf(process.platform === 'win32')('gstack-session-update stages (B11
     expireThrottle(fx);
     const second = runHook(fx);
     expect(second.stdout.trim().split('\n')).toEqual([
-      `gstack auto-update: setup did not finish (./setup exited 1: error: could not build browse); installed skills may be out of date. gstack retries automatically. Fix now: cd ${fx.install} && ./setup`,
+      `gstack auto-update: setup did not finish (./setup exited 1: error: could not build browse); installed skills may be out of date. gstack retries automatically. Fix now: cd '${fx.install}' && ./setup`,
     ]);
     await waitFor(fx, /PENDING_BACKOFF stages=setup/);
     expect(setupRuns(fx)).toBe(1);
@@ -173,7 +194,7 @@ describe.skipIf(process.platform === 'win32')('gstack-session-update stages (B11
     expect(fs.existsSync(marker(fx))).toBe(false);
     expect(setupRuns(fx)).toBe(0);
     expireThrottle(fx);
-    expect(runHook(fx, { noBun: true }).stdout).toContain(`(bun not found on PATH); installed skills may be out of date. gstack retries automatically. Fix now: install Bun (https://bun.sh), then cd ${fx.install} && ./setup`);
+    expect(runHook(fx, { noBun: true }).stdout).toContain(`(bun not found on PATH); installed skills may be out of date. gstack retries automatically. Fix now: install Bun (https://bun.sh), then cd '${fx.install}' && ./setup`);
   });
 
   test('a failed migration is its own stage', async () => {
@@ -196,5 +217,73 @@ describe.skipIf(process.platform === 'win32')('gstack-session-update stages (B11
     expect(fs.readFileSync(marker(fx), 'utf8').trim()).toBe('1.0.0');
     expect(fs.existsSync(pending(fx))).toBe(false);
     expect(setupRuns(fx)).toBe(1);
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('gstack-session-update Bun floor (E1)', () => {
+  const head = (fx: Fx) => git(fx.install, 'rev-parse', 'HEAD');
+
+  test('below the incoming floor: the live checkout and installs stay untouched, with a stable bun-too-old reason', async () => {
+    const fx = makeFixture();
+    const before = head(fx);
+    upstreamReleaseWithFloor(fx, '1.1.0', '1.3.3');
+    const incoming = git(fx.seed, 'rev-parse', 'HEAD');
+
+    expect(runHook(fx, { bun: '1.3.2' }).stdout).toBe('');
+    const stub = path.join(fx.base, 'bun-stub', 'bun');
+    const log = await waitFor(fx, /HELD bun-too-old/);
+    expect(log).toContain(`HELD bun-too-old: found Bun 1.3.2 at ${stub}; gstack 1.1.0 needs 1.3.3 or newer incoming=${incoming}`);
+    expect(head(fx)).toBe(before);
+    expect(fs.readFileSync(path.join(fx.install, 'VERSION'), 'utf8')).toBe('1.0.0\n');
+    expect(git(fx.install, 'status', '--porcelain')).toBe('');
+    expect(setupRuns(fx)).toBe(0);
+    expect(fs.existsSync(marker(fx))).toBe(false);
+    expect(fs.readFileSync(pending(fx), 'utf8')).toContain(`pull=bun-too-old: found Bun 1.3.2 at ${stub}; gstack 1.1.0 needs 1.3.3 or newer\n`);
+
+    expireThrottle(fx);
+    expect(runHook(fx, { bun: '1.3.2' }).stdout.trim()).toBe(
+      `gstack auto-update: update held (bun-too-old: found Bun 1.3.2 at ${stub}; gstack 1.1.0 needs 1.3.3 or newer); nothing was installed or changed. Fix now (in a terminal; Git Bash on Windows): bun upgrade && cd '${fx.install}' && git fetch origin && bash bin/gstack-ff-update . '@{upstream}' && ./setup`,
+    );
+    await waitFor(fx, /HELD bun-too-old/, 2);
+    expect(head(fx)).toBe(before);
+
+    // After `bun upgrade` the next session start resumes the update on its own.
+    expireThrottle(fx);
+    runHook(fx, { bun: '1.4.0' });
+    await waitFor(fx, /UPDATED from=1\.0\.0 to=1\.1\.0/);
+    expect(head(fx)).toBe(incoming);
+    expect(setupRuns(fx)).toBe(1);
+    expect(fs.existsSync(pending(fx))).toBe(false);
+  });
+
+  test('supported Bun (1.3.14) proceeds: setup decides', async () => {
+    const fx = makeFixture();
+    upstreamReleaseWithFloor(fx, '1.1.0', '1.3.3');
+    runHook(fx, { bun: '1.3.14' });
+    const log = await waitFor(fx, /UPDATED from=1\.0\.0 to=1\.1\.0/);
+    expect(log).not.toContain('HELD');
+    expect(head(fx)).toBe(git(fx.seed, 'rev-parse', 'HEAD'));
+  });
+
+  test('unparseable Bun (bun-dev (local build)) holds with BUN_VERSION_UNREADABLE and names the reinstall fix (#3195)', async () => {
+    const fx = makeFixture();
+    const before = head(fx);
+    upstreamReleaseWithFloor(fx, '1.1.0', '1.3.3');
+    const stub = path.join(fx.base, 'bun-stub', 'bun');
+    const reason = `bun-version-unreadable: could not read the version of Bun at ${stub} (bun --version printed 'bun-dev (local build)'); gstack 1.1.0 needs 1.3.3 or newer (BUN_VERSION_UNREADABLE)`;
+    expect(runHook(fx, { bun: 'bun-dev (local build)' }).stdout).toBe('');
+    const log = await waitFor(fx, /HELD bun-version-unreadable/);
+    expect(log).toContain(`HELD ${reason}`);
+    expect(log).not.toContain('UPDATED');
+    expect(head(fx)).toBe(before);
+    expect(setupRuns(fx)).toBe(0);
+    expect(fs.readFileSync(pending(fx), 'utf8')).toContain(`pull=${reason}\n`);
+
+    expireThrottle(fx);
+    const banner = runHook(fx, { bun: 'bun-dev (local build)' }).stdout.trim();
+    expect(banner).toBe(
+      `gstack auto-update: update held (${reason}); nothing was installed or changed. Fix now: reinstall Bun (curl -fsSL https://bun.sh/install | bash), check that bun --version prints a version, then cd ${fx.install} && git pull --ff-only && ./setup. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#bun-version-unreadable`,
+    );
+    expect(banner).not.toContain('git pull did not finish');
   });
 });

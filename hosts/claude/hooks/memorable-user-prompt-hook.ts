@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * memorable-user-prompt-hook — gstack-mediated bridge from Claude Code's
  * UserPromptSubmit event to the third-party `memorable` CLI (memorable.sh).

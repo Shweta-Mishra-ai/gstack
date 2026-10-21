@@ -15,11 +15,21 @@ name: Periodic Evals
 # diff-billed, so without it the full gate census might never execute
 # anywhere); the hollow-shard guard (exit 0 + zero executed tests under
 # EVALS_ALL fails) makes both lanes census-health checks, not just test runs.
+# The gate census is a matrix of arms (scripts/census-arms.ts): each arm is a
+# host and model with its own plan. Monday runs claude-opus (the capture
+# model) and codex-sol (gpt-6.1-sol on the Codex host, adapter cases only);
+# the monthly cron runs only the census, with claude-fable and codex-astra.
 # eval-bg (scripts/eval-bg.ts) finds its dispatch by the nonce in the run name.
 run-name: ${{ inputs.nonce && format('Periodic Evals [eval-bg {0}]', inputs.nonce) || 'Periodic Evals' }}
 on:
   schedule:
     - cron: '0 6 * * 1'  # Monday 6 AM UTC; build-image below builds or reuses the CI image
+    # Daily, for autoplan-schema-canary alone (latest Claude Code vs the /autoplan
+    # guard's payload assumptions); every census job below skips this schedule.
+    - cron: '30 7 * * *'
+    # Monthly, the census jobs alone with the claude-fable and codex-astra arms
+    # (the 1st; never combined with a day of week, which cron would OR).
+    - cron: '0 6 1 * *'
   workflow_dispatch:
     inputs:
       redispatch_of:
@@ -27,9 +37,13 @@ on:
         type: string
         default: ''
       include_gate_census:
-        description: 'Branch dispatch only: also run the weekly gate census (default: periodic lane only; gate cases validate through an evals.yml dispatch with evals_all)'
+        description: 'Branch dispatch only: also run the weekly gate census arms (default: periodic lane only; gate cases validate through an evals.yml dispatch with evals_all)'
         type: boolean
         default: false
+      census_arms:
+        description: 'Run only the gate census, with these arms (comma-separated: claude-opus, codex-sol, claude-fable, codex-astra; scripts/census-arms.ts). Empty keeps the periodic lane.'
+        type: string
+        default: ''
       expected_sha:
         description: 'eval-bg: the revision the dispatcher tested; the run fails fast when the ref has moved'
         type: string
@@ -38,13 +52,17 @@ on:
         description: 'eval-bg: dispatch nonce carried in the run name'
         type: string
         default: ''
+      schema_canary_only:
+        description: 'Run only autoplan-schema-canary (the daily latest-Claude-Code canary), not the census'
+        type: boolean
+        default: false
 
 # One group per ref AND event: a branch dispatch never cancels main's census,
 # and a manual main dispatch never cancels the scheduled one. A re-dispatch
 # runs in its own group so it never cancels the run that dispatched it; both
 # runs are reported.
 concurrency:
-  group: evals-periodic-${{ github.ref }}-${{ github.event_name }}${{ inputs.redispatch_of && format('-redispatch-{0}', inputs.redispatch_of) || '' }}
+  group: evals-periodic-${{ github.ref }}-${{ github.event_name }}${{ inputs.redispatch_of && format('-redispatch-{0}', inputs.redispatch_of) || '' }}${{ (github.event.schedule == '30 7 * * *' || inputs.schema_canary_only) && '-schema-canary' || '' }}${{ github.event.schedule == '0 6 1 * *' && '-monthly' || '' }}
   cancel-in-progress: true
 
 env:
@@ -92,10 +110,10 @@ jobs:
       # Registry cache export needs a docker-container builder — the default
       # `docker` driver hard-errors on cache-to.
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
@@ -110,14 +128,18 @@ jobs:
   plan-slices:
     runs-on: ubicloud-standard-8
     timeout-minutes: 10
+    # The daily schedule and a canary-only dispatch run schema-canary alone;
+    # every census job needs this one, so they all skip with it.
+    if: ${{ github.event.schedule != '30 7 * * *' && !inputs.schema_canary_only }}
     permissions:
       contents: read
     outputs:
       periodic_slices: ${{ steps.periodic-matrix.outputs.slices }}
       periodic_codex_slices: ${{ steps.periodic-matrix.outputs.codex_slices }}
       periodic_slice_timeouts: ${{ steps.periodic-matrix.outputs.slice_timeouts }}
-      gate_slices: ${{ steps.gate-matrix.outputs.slices }}
-      gate_slice_timeouts: ${{ steps.gate-matrix.outputs.slice_timeouts }}
+      periodic_lane: ${{ steps.census.outputs.periodic_lane }}
+      census_arms: ${{ steps.census.outputs.arms }}
+      gate_matrix: ${{ steps.gate-matrix.outputs.gate_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -135,17 +157,29 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
+
+      # Census arms (scripts/census-arms.ts): which host/model arms run the
+      # gate census, and whether the periodic lane runs beside them.
+      - name: Select the census arms
+        id: census
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          CENSUS_ARMS: ${{ inputs.census_arms }}
+          INCLUDE_GATE_CENSUS: ${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}
+        run: bun --no-install run scripts/census-arms.ts --select >> "$GITHUB_OUTPUT"
 
       - name: Emit run manifest (ALL periodic tests minus reasoned excludes)
+        if: steps.census.outputs.periodic_lane == 'true'
         env:
           EVALS_ALL: "1"
-        run: EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slice-budget 420 --jobs 2 --max-parallel 36
+        run: EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slice-budget 420 --jobs 2 --max-parallel 38
 
       # Codex-only slices run on the host-run eval-codex-slices job; the
       # container executor runs every other slice.
       - name: Derive the periodic executor matrix from the plan
         id: periodic-matrix
+        if: steps.census.outputs.periodic_lane == 'true'
         run: |
           {
             echo "slices=$(jq -c '[range(1; .sliceCount + 1)] - .plan.codexSlices' /tmp/paid-plan/manifest.json)"
@@ -153,32 +187,93 @@ jobs:
             echo "slice_timeouts=$(jq -ec '[0] + .plan.sliceCiTimeoutMinutes' /tmp/paid-plan/manifest.json)"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.census.outputs.periodic_lane == 'true'
         with:
           name: paid-plan
           path: /tmp/paid-plan/manifest.json
           retention-days: 30
 
-      - name: Emit gate census manifest (ALL gate tests)
+      # One plan per arm: the Codex host plans only its adapter cases and
+      # records every Claude-only case as excluded with its reason.
+      - name: Emit gate census manifests (ALL gate tests, one plan per arm)
+        if: steps.census.outputs.arms != '[]'
         env:
           EVALS_ALL: "1"
-        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/gate-census-plan/manifest.json --slice-budget 420 --jobs 2 --skip-judges --max-parallel 20
-
-      - name: Derive the gate census executor matrix from the plan
-        id: gate-matrix
+          ARMS: ${{ steps.census.outputs.arms }}
         run: |
-          echo "slices=$(jq -c '[range(1; .sliceCount + 1)]' /tmp/gate-census-plan/manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "slice_timeouts=$(jq -ec '[0] + .plan.sliceCiTimeoutMinutes' /tmp/gate-census-plan/manifest.json)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          for arm in $(jq -r '.[]' <<<"$ARMS"); do
+            mapfile -t arm_env < <(bun --no-install run scripts/census-arms.ts --env "$arm")
+            env "${arm_env[@]}" EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --emit-plan "/tmp/gate-census-plan/$arm/manifest.json" --slice-budget 420 --jobs 2 --skip-judges --max-parallel 20
+          done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      # One executor per arm and planned slice, each with its slice's ceiling.
+      - name: Derive the gate census executor matrix from the plans
+        id: gate-matrix
+        env:
+          ARMS: ${{ steps.census.outputs.arms }}
+        run: bun --no-install run scripts/census-arms.ts --matrix /tmp/gate-census-plan "$ARMS" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.census.outputs.arms != '[]'
         with:
           name: gate-census-plan
-          path: /tmp/gate-census-plan/manifest.json
+          path: /tmp/gate-census-plan
           retention-days: 30
+
+  # autoplan-schema-canary: installs the latest published Claude Code with
+  # install scripts off, audits registry signatures, and checks the Agent and
+  # Read hook payloads against the journal with the /autoplan guard's own
+  # comparison. Daily, so a schema strip reds within a day of a release; the
+  # weekly census also runs it. Read-only token; the key's spend is capped by
+  # the case (one haiku session, about $0.02).
+  schema-canary:
+    runs-on: ubicloud-standard-2
+    needs: build-image
+    if: ${{ github.event.schedule == '30 7 * * *' || inputs.schema_canary_only }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.build-image.outputs.image-tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user runner
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-schema-canary
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Fix bun temp
+        uses: ./.github/actions/fix-bun-temp
+
+      - name: Restore deps
+        uses: ./.github/actions/restore-deps
+
+      - name: Run autoplan-schema-canary on the latest Claude Code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GSTACK_EVAL_DIR: /tmp/schema-canary-results
+        run: EVALS_TIER=periodic bun run scripts/test-paid-shards.ts --tier periodic --case autoplan-schema-canary --trials 1
+
+      - name: Upload canary results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: schema-canary-a${{ github.run_attempt }}
+          path: /tmp/schema-canary-results
+          if-no-files-found: ignore
+          retention-days: 90
 
   eval-slices:
     runs-on: ubicloud-standard-8
     needs: [build-image, plan-slices]
+    if: ${{ needs.plan-slices.outputs.periodic_lane == 'true' }}
     env:
       EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-slices-${{ matrix.slice }}
     # The planner packs ~7 minutes of recorded work per slice; each slice's job
@@ -200,7 +295,7 @@ jobs:
       fail-fast: false
       # Every planned slice starts at once; test/evals-workflow-wiring.test.ts
       # fails when the live plan outgrows this cap.
-      max-parallel: 36
+      max-parallel: 38
       matrix:
         slice: ${{ fromJSON(needs.plan-slices.outputs.periodic_slices) }}
     steps:
@@ -238,7 +333,7 @@ jobs:
       - name: Register gstack skills for PTY tests
         uses: ./.github/actions/register-gstack-skills
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: paid-plan
           path: /tmp/paid-plan
@@ -280,7 +375,7 @@ jobs:
 
       - name: Upload slice results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           path: /tmp/paid-slice-results
@@ -288,7 +383,7 @@ jobs:
 
       - name: Upload native capture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-captures-${{ env.EVALS_RUN_ID }}
           include-hidden-files: true
@@ -304,7 +399,7 @@ jobs:
       # longer reds its runner, but its full log is the diagnosis evidence.
       - name: Upload shard logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-logs-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           include-hidden-files: true
@@ -330,7 +425,7 @@ jobs:
   eval-codex-slices:
     runs-on: ubicloud-standard-8
     needs: [build-image, plan-slices]
-    if: ${{ needs.plan-slices.outputs.periodic_codex_slices != '[]' }}
+    if: ${{ needs.plan-slices.outputs.periodic_lane == 'true' && needs.plan-slices.outputs.periodic_codex_slices != '[]' }}
     env:
       EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-slices-${{ matrix.slice }}
     timeout-minutes: ${{ fromJSON(needs.plan-slices.outputs.periodic_slice_timeouts)[matrix.slice] }}
@@ -339,7 +434,7 @@ jobs:
       packages: read
     strategy:
       fail-fast: false
-      max-parallel: 36
+      max-parallel: 38
       matrix:
         slice: ${{ fromJSON(needs.plan-slices.outputs.periodic_codex_slices) }}
     steps:
@@ -351,7 +446,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: paid-plan
           path: ${{ runner.temp }}/paid-plan
@@ -419,7 +514,7 @@ jobs:
 
       - name: Upload slice results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/paid-slice-results
@@ -427,7 +522,7 @@ jobs:
 
       - name: Upload native capture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-captures-${{ env.EVALS_RUN_ID }}
           include-hidden-files: true
@@ -441,7 +536,7 @@ jobs:
 
       - name: Upload shard logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: paid-logs-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           include-hidden-files: true
@@ -454,16 +549,18 @@ jobs:
   # blind spots rot invisibly. Census health, not selector correctness —
   # selector logic has free synthetic-diff contract tests.
   gate-census:
+    name: gate-census-${{ matrix.arm }} (${{ matrix.slice }})
     runs-on: ubicloud-standard-8
     needs: [build-image, plan-slices]
-    # A branch dispatch validates the periodic lane only; gate cases on a
-    # branch go through an evals.yml dispatch with evals_all. Main (schedule
-    # or dispatch) always runs the census; a branch opts in explicitly.
-    if: ${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}
+    # The planner picks the arms (scripts/census-arms.ts). A branch dispatch
+    # validates the periodic lane only unless it sets include_gate_census or
+    # census_arms; gate cases on a branch also go through an evals.yml
+    # dispatch with evals_all. Main (schedule or dispatch) always runs it.
+    if: ${{ needs.plan-slices.outputs.gate_matrix != '[]' }}
     env:
-      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-gate-census-${{ matrix.slice }}
-    # Per-slice job ceiling from the packed plan (W2c/ENG-2), as for eval-slices.
-    timeout-minutes: ${{ fromJSON(needs.plan-slices.outputs.gate_slice_timeouts)[matrix.slice] }}
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-gate-census-${{ matrix.arm }}-${{ matrix.slice }}
+    # Per-slice job ceiling from the arm's packed plan (W2c/ENG-2), as for eval-slices.
+    timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
       packages: read
@@ -478,7 +575,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        slice: ${{ fromJSON(needs.plan-slices.outputs.gate_slices) }}
+        include: ${{ fromJSON(needs.plan-slices.outputs.gate_matrix) }}
     steps:
       - name: Record the job start for the slice deadline
         run: echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
@@ -501,7 +598,7 @@ jobs:
 
       - run: bun run build
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: gate-census-plan
           path: /tmp/gate-census-plan
@@ -530,7 +627,15 @@ jobs:
           printenv OPENAI_API_KEY | "$codex" login --with-api-key
           "$codex" login status >/dev/null 2>&1
 
-      - name: Run gate census slice ${{ matrix.slice }}
+      # The arm's host and model (EVALS_HOST, plus EVALS_MODEL or
+      # GSTACK_CODEX_MODEL). The Codex host runs codex exec with
+      # danger-full-access, so it needs no bubblewrap and runs in this container.
+      - name: Select the census arm's host and model
+        env:
+          ARM: ${{ matrix.arm }}
+        run: bun --no-install run scripts/census-arms.ts --env "$ARM" >> "$GITHUB_ENV"
+
+      - name: Run gate census slice ${{ matrix.slice }} (${{ matrix.arm }})
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -539,19 +644,19 @@ jobs:
           EVALS_JOBS: "2"
           EVALS_CONCURRENCY: "2"
           GSTACK_EVAL_DIR: /tmp/gate-census-results
-        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/gate-census-plan/manifest.json --slice ${{ matrix.slice }}
+        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/gate-census-plan/${{ matrix.arm }}/manifest.json --slice ${{ matrix.slice }}
 
       - name: Upload census results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: gate-census-${{ matrix.slice }}-a${{ github.run_attempt }}
+          name: gate-census-${{ matrix.slice }}-a${{ github.run_attempt }}-${{ matrix.arm }}
           path: /tmp/gate-census-results
           retention-days: 90
 
       - name: Upload native capture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-captures-${{ env.EVALS_RUN_ID }}
           include-hidden-files: true
@@ -580,6 +685,9 @@ jobs:
       actions: read
     outputs:
       redispatch: ${{ steps.verdict.outputs.redispatch }}
+      # A census-only run (monthly cron or census_arms dispatch) re-dispatches
+      # with the same arms; empty keeps the weekly selection.
+      redispatch_census_arms: ${{ needs.plan-slices.outputs.periodic_lane != 'true' && join(fromJSON(needs.plan-slices.outputs.census_arms), ',') || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -587,35 +695,46 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.plan-slices.outputs.periodic_lane == 'true'
         with:
           name: paid-plan
           path: /tmp/paid-report
 
       # One directory per attempt-scoped slice artifact (no merge): shard
       # records never overwrite each other and the first attempt decides.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.plan-slices.outputs.periodic_lane == 'true'
         with:
           pattern: paid-slice-*
           path: /tmp/paid-report
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.plan-slices.outputs.gate_matrix != '[]'
         with:
           name: gate-census-plan
-          path: /tmp/gate-census-report
+          path: /tmp/gate-census-plan
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.plan-slices.outputs.gate_matrix != '[]'
         with:
           pattern: gate-census-[0-9]*
-          path: /tmp/gate-census-report
+          path: /tmp/gate-census-slices
 
       - name: Reconcile slices against the manifest (fail-closed)
         id: reconcile
         if: always()
+        env:
+          PERIODIC_LANE: ${{ needs.plan-slices.outputs.periodic_lane }}
         run: |
           set +e
+          if [ "$PERIODIC_LANE" != "true" ]; then
+            echo "periodic lane skipped: census-only run (monthly cron or census_arms dispatch)" | tee /tmp/report.txt
+            echo "exit=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --report /tmp/paid-report | tee /tmp/report.txt
           # PIPESTATUS[0], NOT $?: GitHub's default run-step shell is
           # `bash -e {0}` with NO pipefail, so $? after the pipe is tee's
@@ -628,26 +747,40 @@ jobs:
         if: always()
         env:
           GATE_CENSUS: ${{ needs.gate-census.result }}
+          ARMS: ${{ needs.plan-slices.outputs.census_arms }}
+        # One report per arm: its plan plus its own slice artifacts
+        # (gate-census-<slice>-a<attempt>-<arm>) in /tmp/gate-census-report/<arm>.
         run: |
           set +e
           if [ "$GATE_CENSUS" = "skipped" ]; then
-            echo "gate census skipped: branch dispatch without include_gate_census (periodic lane only)" | tee /tmp/gate-report.txt
+            echo "gate census skipped: no census arm selected (branch dispatch without include_gate_census or census_arms)" | tee /tmp/gate-report.txt
             echo "exit=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report /tmp/gate-census-report | tee /tmp/gate-report.txt
-          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          status=0
+          : > /tmp/gate-report.txt
+          for arm in $(jq -r '.[]' <<<"$ARMS"); do
+            dir="/tmp/gate-census-report/$arm"
+            mkdir -p "$dir"
+            cp "/tmp/gate-census-plan/$arm/manifest.json" "$dir/manifest.json" || status=1
+            for slice in /tmp/gate-census-slices/gate-census-*-"$arm"; do if [ -d "$slice" ]; then mv "$slice" "$dir/"; fi; done
+            echo "=== gate census arm: $arm ===" | tee -a /tmp/gate-report.txt
+            EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report "$dir" | tee -a /tmp/gate-report.txt
+            code=${PIPESTATUS[0]}
+            if [ "$code" -ne 0 ]; then status=$code; fi
+          done
+          echo "exit=$status" >> "$GITHUB_OUTPUT"
 
       - name: Stamp trial history series
         if: always()
         run: |
-          for file in /tmp/paid-report/trial-outcomes.jsonl /tmp/gate-census-report/trial-outcomes.jsonl; do
+          for file in /tmp/paid-report/trial-outcomes.jsonl /tmp/gate-census-report/*/trial-outcomes.jsonl; do
             if [ -f "$file" ]; then bun --no-install run scripts/eval-trial-series.ts "$file"; fi
           done
 
       - name: Upload trial outcomes for pass-rate history
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: trial-outcomes-periodic-a${{ github.run_attempt }}
           path: |
@@ -657,11 +790,39 @@ jobs:
 
       - name: Upload gate census trial outcomes for pass-rate history
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: trial-outcomes-gate-census-a${{ github.run_attempt }}
           path: |
-            /tmp/gate-census-report/trial-outcomes.jsonl
+            /tmp/gate-census-report/*/trial-outcomes.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Exercised-path map (shadow, non-blocking; docs/TESTING_INTERNALS.md#exercised-path-map):
+      # union this census's own recorded commands into the map, report MAP_GAP lines and
+      # cases that recorded no commands, and print the refresh command. Never fails the run.
+      - name: Refresh the exercised-path map from this census
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/exercised-map
+          dirs=()
+          for dir in /tmp/gate-census-report/* /tmp/paid-report; do [ -d "$dir" ] && dirs+=(--from-dir "$dir"); done
+          status=0
+          bun --no-install run scripts/exercised-map.ts "${dirs[@]}" \
+            --run-id "$GITHUB_RUN_ID" --out /tmp/exercised-map/exercised-commands.json --report /tmp/exercised-map/report.md || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "exercised-path map refresh failed with exit $status (non-blocking; no map uploaded)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f /tmp/exercised-map/report.md ]; then cat /tmp/exercised-map/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the refreshed exercised-path map
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: exercised-map-a${{ github.run_attempt }}
+          path: /tmp/exercised-map
           if-no-files-found: ignore
           retention-days: 90
 
@@ -675,7 +836,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          bun run eval:pass-rates --gate --runs 10 > /tmp/pass-rates.txt 2>&1
+          bun run eval:pass-rates --gate --runs 10 --branch "$GITHUB_REF_NAME" > /tmp/pass-rates.txt 2>&1
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           cat /tmp/pass-rates.txt
 
@@ -693,60 +854,110 @@ jobs:
             [ "$1" = "0" ] && return 0
             jq -e '.version == 2 and .verdict.redispatchEligible == true' "$2/collector-outcomes.json" >/dev/null 2>&1
           }
+          eligible_arms() { # $1 exit, then one report dir per census arm: each must be green or INFRA/INCOMPLETE-only
+            [ "$1" = "0" ] && return 0
+            shift
+            local dir
+            for dir in "$@"; do
+              jq -e '.version == 2 and (.verdict.verdict == "GREEN" or .verdict.redispatchEligible == true)' "$dir/collector-outcomes.json" >/dev/null 2>&1 || return 1
+            done
+          }
           if [ -z "$REDISPATCH_OF" ] && { [ "$PERIODIC_EXIT" != "0" ] || [ "$GATE_EXIT" != "0" ]; } \
-            && eligible "$PERIODIC_EXIT" /tmp/paid-report && eligible "$GATE_EXIT" /tmp/gate-census-report; then
+            && eligible "$PERIODIC_EXIT" /tmp/paid-report && eligible_arms "$GATE_EXIT" /tmp/gate-census-report/*/; then
             echo "redispatch=true" >> "$GITHUB_OUTPUT"
           else
             echo "redispatch=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # A red weekly lane nobody must action is waste — upsert ONE tracking
-      # issue (never a new issue per week) with the headline and failure block
-      # of both lanes, and close it on the next green run.
-      - name: Upsert tracking issue on failure
-        if: always() && github.ref == 'refs/heads/main' && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || needs.eval-slices.result != 'success' || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || needs.gate-census.result != 'success')
+      # A red census writes one report on every ref: the step summary and the
+      # census-report artifact. Only main (scheduled weekly, or dispatched on
+      # main) upserts ONE tracking issue (never a new issue per week) and
+      # closes it on the next green run; a branch-dispatched census never
+      # comments on or closes main's issue. Every report-derived line goes
+      # through the one published-text sanitizer (scripts/lib/published-text.ts).
+      - name: Write the census report
+        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || (needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result != 'success') || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || needs.gate-census.result != 'success')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REDISPATCH: ${{ steps.verdict.outputs.redispatch }}
           REDISPATCH_OF: ${{ inputs.redispatch_of }}
         run: |
           set -euo pipefail
-          TITLE="Weekly periodic evals: red lane needs triage"
-          BODY_FILE=/tmp/issue-body.md
+          published() { # $1 fence|line: stdin lines through the published-text sanitizer
+            bun --no-install -e 'import { publishedFence, sanitizePublishedText } from "./scripts/lib/published-text";
+              const lines = (await Bun.stdin.text()).split("\n").filter(Boolean);
+              console.log(process.argv[1] === "line" ? sanitizePublishedText(lines.join(" ")) : publishedFence(lines.length ? lines : ["(none)"]).join("\n"));' "$1"
+          }
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          GUIDE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/evals/census-red.md"
+          bun run eval:pass-rates --reds --runs 10 --branch "$GITHUB_REF_NAME" > /tmp/pass-rates-reds.txt 2>&1 \
+            || echo "history unavailable: eval:pass-rates --reds exited $?" >> /tmp/pass-rates-reds.txt
+          bun run eval:pass-rates --headroom --runs 10 --branch "$GITHUB_REF_NAME" > /tmp/pass-rates-headroom.txt 2>&1 \
+            || echo "history unavailable: eval:pass-rates --headroom exited $?" >> /tmp/pass-rates-headroom.txt
           {
-            echo "Automated weekly report — run: ${RUN_URL}"
+            echo "Periodic census report: branch ${GITHUB_REF_NAME} @ ${GITHUB_SHA}, event ${GITHUB_EVENT_NAME}, run ${RUN_URL}"
+            echo
+            echo "A census went red: triage with ${GUIDE_URL}"
             if [ -n "$REDISPATCH_OF" ]; then echo; echo "This run is the one INFRA/INCOMPLETE re-dispatch of run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${REDISPATCH_OF}; both runs are reported."; fi
             if [ "$REDISPATCH" = "true" ]; then echo; echo "Every red verdict is machine-classified INFRA/INCOMPLETE: re-dispatching once as a new run (EVAL_POLICY.infraRedispatch). This run stays red and reported."; fi
             echo
             echo "- periodic reconciliation exit: ${{ steps.reconcile.outputs.exit }} (slices job: ${{ needs.eval-slices.result }}, Codex slices job: ${{ needs.eval-codex-slices.result }})"
             echo "- gate census reconciliation exit: ${{ steps.gate-reconcile.outputs.exit }} (census job: ${{ needs.gate-census.result }})"
             echo "- pass-rate history gate exit: ${{ steps.pass-rates.outputs.exit }}"
+            echo "- $({ grep -E '^all-green probability' /tmp/pass-rates-reds.txt || echo 'all-green probability: unavailable (see the red ledger)'; } | published line)"
             echo
             echo "### Periodic lane"
             cat /tmp/paid-report/report-summary.md 2>/dev/null || echo "(no periodic report summary)"
             echo
             echo "### Gate census"
-            cat /tmp/gate-census-report/report-summary.md 2>/dev/null || echo "(no gate census report summary)"
+            found=0
+            for summary in /tmp/gate-census-report/*/report-summary.md; do
+              [ -f "$summary" ] || continue
+              found=1
+              echo "#### Arm $(basename "$(dirname "$summary")")"
+              cat "$summary"
+            done
+            [ "$found" = 1 ] || echo "(no gate census report summary)"
             echo
             echo "### Pass-rate history (ACTION REQUIRED)"
-            echo '```'
-            { grep -E 'ACTION REQUIRED|history unavailable' /tmp/pass-rates.txt || echo "(no pass-rate alarms)"; } | sed 's/@/@\xe2\x80\x8b/g' | head -c 6000
-            echo '```'
+            { awk '/^ACTION REQUIRED/ { on = 1; print; next } on && /^  \[/ { print; next } { on = 0 } /history unavailable/ { print }' /tmp/pass-rates.txt 2>/dev/null \
+              | grep . || echo "(no pass-rate alarms)"; } | head -c 6000 | published fence
+            echo
+            echo "### Red ledger: bun run eval:pass-rates --reds --runs 10 --branch ${GITHUB_REF_NAME}"
+            { head -n 1 /tmp/pass-rates-reds.txt; tail -n +2 /tmp/pass-rates-reds.txt | tail -n 60; } | cut -c1-400 | published fence
+            echo
+            echo "### Session headroom: bun run eval:pass-rates --headroom --runs 10 --branch ${GITHUB_REF_NAME}"
+            head -n 40 /tmp/pass-rates-headroom.txt | cut -c1-400 | published fence
             echo
             echo "<details><summary>Full reconciliation output</summary>"
             echo
-            echo '```'
-            tail -c 6000 /tmp/report.txt 2>/dev/null | sed 's/@/@\xe2\x80\x8b/g' || echo "(no reconciliation output)"
-            echo '```'
+            { tail -c 6000 /tmp/report.txt 2>/dev/null || echo "(no reconciliation output)"; } | published fence
             echo
-            echo '```'
-            tail -c 6000 /tmp/gate-report.txt 2>/dev/null | sed 's/@/@\xe2\x80\x8b/g' || echo "(no gate census reconciliation output)"
-            echo '```'
+            { tail -c 6000 /tmp/gate-report.txt 2>/dev/null || echo "(no gate census reconciliation output)"; } | published fence
             echo "</details>"
             echo
             echo "Policy: EVAL_POLICY and CASE_QUARANTINE in test/helpers/periodic-exclude-data.ts; history: \`bun run eval:pass-rates\`."
-          } > "$BODY_FILE"
+          } > /tmp/census-report.md
+          cat /tmp/census-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the census report
+        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || (needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result != 'success') || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || needs.gate-census.result != 'success')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: census-report-a${{ github.run_attempt }}
+          path: /tmp/census-report.md
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upsert tracking issue on failure
+        if: always() && github.ref == 'refs/heads/main' && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || (needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result != 'success') || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || needs.gate-census.result != 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Weekly periodic evals: red lane needs triage"
+          BODY_FILE=/tmp/census-report.md
+          [ -s "$BODY_FILE" ] || echo "Periodic census report missing; run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > "$BODY_FILE"
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
@@ -756,7 +967,7 @@ jobs:
           fi
 
       - name: Close the tracking issue on a green run
-        if: always() && github.ref == 'refs/heads/main' && steps.reconcile.outputs.exit == '0' && steps.gate-reconcile.outputs.exit == '0' && steps.pass-rates.outputs.exit == '0' && needs.eval-slices.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) && needs.gate-census.result == 'success'
+        if: always() && github.ref == 'refs/heads/main' && steps.reconcile.outputs.exit == '0' && steps.gate-reconcile.outputs.exit == '0' && steps.pass-rates.outputs.exit == '0' && needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) && needs.gate-census.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REDISPATCH_OF: ${{ inputs.redispatch_of }}
@@ -771,7 +982,7 @@ jobs:
           fi
 
       - name: Fail the workflow when reconciliation failed
-        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || needs.eval-slices.result != 'success' || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || !contains(fromJSON('["success","skipped"]'), needs.gate-census.result))
+        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || steps.pass-rates.outputs.exit != '0' || (needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result != 'success') || !contains(fromJSON('["success","skipped"]'), needs.eval-codex-slices.result) || !contains(fromJSON('["success","skipped"]'), needs.gate-census.result))
         run: exit 1
 
   # The one INFRA/INCOMPLETE re-dispatch (UC-E1). Its own job so the report
@@ -788,4 +999,5 @@ jobs:
       - name: Re-dispatch the weekly census once
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run evals-periodic.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f redispatch_of="$GITHUB_RUN_ID"
+          CENSUS_ARMS: ${{ needs.report.outputs.redispatch_census_arms }}
+        run: gh workflow run evals-periodic.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f redispatch_of="$GITHUB_RUN_ID" ${CENSUS_ARMS:+-f census_arms="$CENSUS_ARMS"}

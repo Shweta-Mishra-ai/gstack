@@ -13,6 +13,13 @@
  *   FAKE_LIST_UNSCOPED=1   `list` ignores --source-id (pre-0.46.25)
  *   FAKE_BUSY=1            list/get answer {"error":"pglite_busy"} with exit 1
  *   FAKE_NO_SOURCES=1      `sources add` is unsupported
+ *   FAKE_MANAGED=1         gbrain 0.60 managed persistence: `sources writer status`
+ *                          reports bindings; `sources add --path` binds (and binds a
+ *                          path-less source of the same id); an import into a source
+ *                          with no active binding owned by FAKE_HOST_ID (default
+ *                          host-local) is refused per file, and a bound import writes
+ *                          each page through to the checkout
+ *   FAKE_COPY_STAGE=<dir>  import copies the staged directory to <dir> first
  * Every call is appended to $HOME/gbrain-calls.log.
  */
 import { chmodSync, mkdirSync, writeFileSync } from "fs";
@@ -35,11 +42,17 @@ const save = () => fs.writeFileSync(brainFile, JSON.stringify(brain, null, 2));
 const flag = (name) => { const i = args.indexOf(name); return i === -1 ? undefined : args[i + 1]; };
 const busy = () => { if (env.FAKE_BUSY === "1") { console.log(JSON.stringify({ error: "pglite_busy" })); process.exit(1); } };
 const cmd = args[0];
+const managed = env.FAKE_MANAGED === "1";
+const hostId = env.FAKE_HOST_ID || "host-local";
+const ownBinding = (id) => { const b = brain.sources[id]?.binding; return b && b.owner_host_id === hostId && b.state === "active" ? b : null; };
 if (cmd === "--help") { console.log("Commands:\\n  import <dir>   Import"); process.exit(0); }
 if (cmd === "import") {
   const dir = args[1];
   const source = flag("--source-id") ?? "default";
   if (!brain.sources[source]) { console.error("Source not found: " + source); process.exit(1); }
+  if (env.FAKE_COPY_STAGE) fs.cpSync(dir, env.FAKE_COPY_STAGE, { recursive: true });
+  const binding = managed && source !== "default" ? ownBinding(source) : null;
+  const refused = managed && source !== "default" && !binding;
   const files = [];
   (function walk(d) {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -63,6 +76,11 @@ if (cmd === "import") {
       console.error("  Skipped " + rel + ": Invalid YAML frontmatter");
       continue;
     }
+    if (refused) {
+      skipped++; errors++;
+      failures.push({ path: rel, error: "Managed import must run on the active canonical owner for the selected source." });
+      continue;
+    }
     if (env.FAKE_PENDING && rel.includes(env.FAKE_PENDING)) {
       skipped++;
       console.error("  Pending: " + rel + " was accepted and is still publishing; rerun to confirm it.");
@@ -74,6 +92,11 @@ if (cmd === "import") {
     brain.pages[source] ??= {};
     if (brain.pages[source][slug]?.sha === sha) skipped++; else imported++;
     brain.pages[source][slug] = { sha };
+    if (binding) {
+      const target = path.join(binding.local_path, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, body);
+    }
   }
   save();
   const report = env.FAKE_OLD_JSON === "1"
@@ -99,14 +122,33 @@ if (cmd === "get") {
   process.exit(0);
 }
 if (cmd === "sources" && args[1] === "list") {
-  console.log(JSON.stringify({ sources: Object.entries(brain.sources).map(([id, s]) => ({ id, federated: s.federated, page_count: Object.keys(brain.pages[id] ?? {}).length })) }));
+  console.log(JSON.stringify({ sources: Object.entries(brain.sources).map(([id, s]) => ({ id, federated: s.federated, local_path: s.local_path ?? null, page_count: Object.keys(brain.pages[id] ?? {}).length })) }));
+  process.exit(0);
+}
+if (cmd === "sources" && args[1] === "writer" && args[2] === "status" && managed) {
+  const bindings = Object.entries(brain.sources).filter(([, s]) => s.binding).map(([id, s]) => ({
+    source_id: id, relative_path: "", owner_host_id: s.binding.owner_host_id, state: s.binding.state,
+    local_path: s.binding.owner_host_id === hostId ? s.binding.local_path : null,
+  }));
+  console.log(JSON.stringify({ enabled: true, mode: "managed", local_host_id: hostId, bindings }));
   process.exit(0);
 }
 if (cmd === "sources" && args[1] === "add") {
   if (env.FAKE_NO_SOURCES === "1") { console.error("Unknown command: sources add"); process.exit(2); }
-  brain.sources[args[2]] = { federated: args.includes("--federated") };
+  const id = args[2];
+  const localPath = flag("--path");
+  const existing = brain.sources[id];
+  if (existing && (!managed || !localPath || existing.local_path || existing.binding)) {
+    console.error("Error [source_id_taken]: Source ID is already registered."); process.exit(1);
+  }
+  if (managed && localPath && !args.includes("--force") && !fs.existsSync(path.join(localPath, ".git"))) {
+    console.error("Error [not_a_git_repo]: The source path must contain committed Git content."); process.exit(1);
+  }
+  brain.sources[id] = { ...existing, federated: existing ? existing.federated : args.includes("--federated"),
+    ...(localPath ? { local_path: localPath } : {}),
+    ...(managed && localPath ? { binding: { owner_host_id: hostId, local_path: localPath, state: "active" } } : {}) };
   save();
-  console.log("Source added: " + args[2]);
+  console.log("Source added: " + id);
   process.exit(0);
 }
 console.error("Unknown command: " + cmd);

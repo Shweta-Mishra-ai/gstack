@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -53,8 +54,11 @@ new Function('describe', 'test', 'expect', 'beforeAll', 'afterAll',
 );
 afterAll(() => console.log('CONSENSUS_LIFECYCLE=' + JSON.stringify({ attempts, records, registrations, captureOptions, runIds })));
 `);
-    const child = Bun.spawnSync([process.execPath, 'test', '--retry', '1', script], {
-      cwd: dir, stdout: 'pipe', stderr: 'pipe', timeout: 8_000,
+    // windows-free-tests 39053431430: the real describe's git-heavy beforeAll outlived Bun's 5 s default hook
+    // timeout on windows-latest. --timeout raises only the nested default; the registrations under test keep
+    // their explicit timeouts.
+    const child = Bun.spawnSync([process.execPath, 'test', '--retry', '1', '--timeout', '30000', script], {
+      cwd: dir, stdout: 'pipe', stderr: 'pipe', timeout: 40_000,
     });
     const output = child.stdout.toString() + child.stderr.toString();
     expect(child.exitCode, output).toBe(0);
@@ -72,7 +76,7 @@ afterAll(() => console.log('CONSENSUS_LIFECYCLE=' + JSON.stringify({ attempts, r
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
-});
+}, 45_000);
 
 for (const validReport of [true, false]) {
   test(`red-team retries only after cancellation and recording, and preserves report validation (${validReport})`, () => {
@@ -133,8 +137,8 @@ afterAll(async () => {
     fixturesRemoved: fixturePaths.every(p => !fs.existsSync(p)) }));
 });
 `);
-      const child = Bun.spawnSync([process.execPath, 'test', '--retry', '1', script], {
-        cwd: dir, stdout: 'pipe', stderr: 'pipe', timeout: 8_000,
+      const child = Bun.spawnSync([process.execPath, 'test', '--retry', '1', '--timeout', '30000', script], {
+        cwd: dir, stdout: 'pipe', stderr: 'pipe', timeout: 40_000,
         env: { ...process.env, EVALS: '', EVALS_MODEL: 'fixture-model' },
       });
       const output = child.stdout.toString() + child.stderr.toString();
@@ -156,5 +160,64 @@ afterAll(async () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, 45_000);
 }
+
+// review-army-simplification headroom (#3153): the session's premise matches its staged
+// diff and the fixture stages only the Review Army section and its one checklist.
+test.each(['structure-finding', 'no-structure-finding', 'disavowed-frame'])
+  ('review-army-simplification registered session contract: %s', scenario => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'simplification-contract-'));
+    const facts = path.join(dir, 'facts.json');
+    const script = path.join(dir, 'callback.test.ts');
+    fs.writeFileSync(script, `
+import {describe,mock,test} from 'bun:test';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import {spawnSync} from 'node:child_process';
+const root=${JSON.stringify(ROOT)},scenario=${JSON.stringify(scenario)},facts=${JSON.stringify(facts)};
+const actual=await import(path.join(root,'test/helpers/session-runner.ts'));
+let capturedRun={};
+mock.module(path.join(root,'test/helpers/e2e-helpers.ts'),()=>({
+  ROOT:root,runId:'simplification-contract',
+  describeIfSelected:(name,ids,body)=>{if(ids.includes('review-army-simplification'))describe(name,body);},
+  testConcurrentIfSelected:(id,body,timeout)=>{if(id==='review-army-simplification')test(id,body,timeout);},
+  logCost(){},createEvalCollector:()=>null,finalizeEvalCollector:async()=>{},
+  recordE2E:(_collector,_name,_suite,result)=>fs.writeFileSync(facts,JSON.stringify({...capturedRun,exitReason:result.exitReason})),
+}));
+mock.module(path.join(root,'test/helpers/session-runner.ts'),()=>({...actual,runSkillTest:async options=>{
+  const cwd=options.workingDirectory;
+  const shortstat=spawnSync('git',['diff','--shortstat','main...HEAD'],{cwd,encoding:'utf8',timeout:5000}).stdout;
+  const staged=spawnSync('git',['ls-files','--others','--exclude-standard'],{cwd,encoding:'utf8',timeout:5000}).stdout.split('\\n').filter(Boolean).sort();
+  capturedRun={prompt:options.prompt,timeout:options.timeout,maxTurns:options.maxTurns,staged,
+    diffLines:[...shortstat.matchAll(/(\\d+) (?:insertion|deletion)/g)].reduce((sum,m)=>sum+Number(m[1]),0)};
+  fs.writeFileSync(path.join(cwd,'review-output.md'),{
+    'structure-finding':'{"category":"native","path":"date_utils.js","line":7} DateFormatter re-implements Intl.DateTimeFormat.',
+    'no-structure-finding':'Simplification: nothing to report.',
+    'disavowed-frame':'{"category":"native"} Lean already. Ship.',
+  }[scenario]);
+  return {exitReason:'success',browseErrors:[],toolCalls:[],transcript:[],output:'Saved.'};
+}}));
+await import(path.join(root,'test/skill-e2e-review-army.test.ts'));
+`);
+    try {
+      const child = spawnSync(process.execPath, ['test', script], {
+        cwd: dir, encoding: 'utf8', timeout: 20_000,
+        env: {PATH: process.env.PATH ?? '', HOME: dir, TMPDIR: dir, NO_COLOR: '1'},
+      });
+      expect(child.status, child.stdout + child.stderr).toBe(scenario === 'structure-finding' ? 0 : 1);
+      expect(fs.existsSync(facts), child.stdout + child.stderr).toBe(true);
+      const observed = JSON.parse(fs.readFileSync(facts, 'utf8'));
+      expect(observed.timeout).toBe(180_000);
+      expect(observed.maxTurns).toBe(20);
+      expect(observed.diffLines).toBe(68);
+      expect(observed.prompt).toContain(`DIFF_LINES: ${observed.diffLines}`);
+      expect(observed.prompt).not.toMatch(/over 100 lines/i);
+      expect(observed.prompt).toContain('/review --simplification');
+      expect(observed.staged).toEqual(['review-army.md', 'review-specialists/simplification.md']);
+      expect(observed.prompt).toContain('at most 30 lines');
+      expect(observed.prompt).toContain('brief acknowledgement');
+    } finally {
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
+  });

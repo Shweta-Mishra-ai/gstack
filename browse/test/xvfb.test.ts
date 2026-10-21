@@ -157,12 +157,11 @@ describe('pickFreeDisplay (Xvfb installed)', () => {
 describe('xvfb spawn → cleanup round trip (Linux + Xvfb only)', () => {
   test.skipIf(!HAS_XVFB)('spawn, validate ownership, cleanup', async () => {
     const { spawnXvfb } = await import('../src/xvfb');
-    const display = pickFreeDisplay(99, 110);
-    if (display == null) {
-      // No free display in range — skip.
-      return;
-    }
-    const handle = await spawnXvfb(display);
+    // A range no other allocator in the suite uses: headed daemons in parallel
+    // shards take displays from the default :99-:120 between this pick and the spawn.
+    const display = pickFreeDisplay(25000, 25100);
+    expect(display).not.toBeNull();
+    const handle = await spawnXvfb(display!);
     try {
       expect(handle.pid).toBeGreaterThan(0);
       expect(handle.display).toBe(`:${display}`);
@@ -173,7 +172,7 @@ describe('xvfb spawn → cleanup round trip (Linux + Xvfb only)', () => {
       const lock = fs.readFileSync(lockPath, 'utf8');
       cleanupXvfb({ ...handle, startTime: 'stale-start-time' });
       expect(isOurXvfb(handle.pid, handle.startTime)).toBe(true);
-      await expect(spawnXvfb(display)).rejects.toThrow('already reserved');
+      await expect(spawnXvfb(display!)).rejects.toThrow('already reserved');
       expect(fs.readFileSync(lockPath, 'utf8')).toBe(lock);
       expect(isOurXvfb(handle.pid, handle.startTime)).toBe(true);
     } finally {

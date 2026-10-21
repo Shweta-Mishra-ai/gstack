@@ -4,7 +4,7 @@ Before dispatch, Read `methodologyPath` from `bun "<SNAPSHOT_TOOL>" methodology 
 
 Execute in this order: Step 0 (including its completed Spec Review Loop) → Claude
 CEO voice → Codex CEO voice → consensus → Review Sections → saved summary → phase
-announcement. Dispatching a reviewer does not complete its step.
+announcement. Dispatching a reviewer never completes its step.
 
 **Override rules:**
 - Mode selection: SELECTIVE EXPANSION
@@ -50,11 +50,11 @@ Supply the complete CEO scope summary and `<CEO_SPEC_INPUT>` to the loaded Spec
 Review Loop. The checkpoint is immutable prior state; never supply it as the current
 working plan. A failed preparation is an input failure, not a completed spec review.
 Keep the loop's existing stop conditions and three-launch cap. After the loop,
-create a fresh snapshot below for both voices; it does not replace the amendment checkpoint.
+create a fresh snapshot below for both voices; the amendment checkpoint stays.
 
 Step 0.5 (Dual Voices): After Step 0's Spec Review Loop, consume the native CEO
 review, then the available outside voice (P6). Present both completed results
-before consensus; always run the native pass.
+before consensus; the native pass always runs.
 
   **Bind phase input:** Run; use `snapshotPath` as `<CEO_INPUT>` for both voices:
 ```bash
@@ -64,6 +64,7 @@ bun "<SNAPSHOT_TOOL>" create ceo "<ACTIVE_PLAN>" "<RESTORE_PATH>" "<methodologyP
 
   **Claude CEO subagent** (via Agent tool):
   Claude Code: set Agent `run_in_background: false` if its schema exposes it.
+  A launch receipt means it went background: await its completion notice.
   Other hosts: foreground; await completion when supported.
 
   Read `snapshot.json` beside `<CEO_INPUT>`. Send its `nativeDispatchPrompt`
@@ -91,7 +92,7 @@ IMPORTANT: Do NOT read or execute any SKILL.md files or paths containing skills/
   No compliments. Just the strategic blind spots.
   File: <CEO_INPUT>
 
-Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -111,19 +112,21 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
-_gstack_codex_sandbox_preflight >/dev/null || exit 1
-_gstack_codex_first_use_notice
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+export _CODEX_DEADLINE=$(($(date +%s)+540)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" show-first-use-notice
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 540 codex exec - -C "$_REPO_ROOT" -s "${_GSTACK_CODEX_SANDBOX:?}" -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="high"' -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+"$_CODEX_PROBE" run-with-timeout --effort high 540 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 if [ "$_OUTSIDE_EXIT" -eq 124 ]; then
-  _gstack_codex_log_event "codex_timeout" "540" || true
-  _gstack_codex_log_hang "autoplan" "0" || true
+  "$_CODEX_PROBE" log-event codex_timeout "540" || true
+  "$_CODEX_PROBE" log-hang autoplan 0 || true
 fi
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 _OUTSIDE_RC=0
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
 case "$_OUTSIDE_RC" in
   0|3) ;;
   4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
@@ -134,19 +137,19 @@ echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 
 Use Bash `timeout: 600000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
-Failed/incomplete outside review → unavailable; disabled → skip outside. Both retain the native pass.
+Failed/incomplete outside review → unavailable; disabled → skip outside. Both keep the native pass.
 
 Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"ceo"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown. Under `GSTACK_CODEX_NO_SANDBOX=1` add `"codex_sandbox":"danger-full-access"`.
 
-  **Error handling:** Codex auth/timeout/empty → proceed with
-  Claude subagent only, tagged `[single-model]`. If Claude subagent also fails →
+  **Error handling:** Codex auth/timeout/empty → proceed with the
+  Claude subagent only, tagged `[single-model]`. If it also fails →
   "Outside voices unavailable — continuing with primary review."
 
   **Degradation matrix:** Both fail → "single-reviewer mode". Codex only →
   tag `[codex-only]`. Subagent only → tag `[subagent-only]`.
 
-- Strategy choices: if the outside reviewer disagrees with a premise or scope decision with valid
-  strategic reason → TASTE DECISION. If both models agree the user's stated structure
+- Strategy choices: the outside reviewer disagrees with a premise or scope decision for a valid
+  strategic reason → TASTE DECISION. Both models agree the user's stated structure
   should change (merge, split, add, remove) → USER CHALLENGE (never auto-decided).
 
 Produce the CEO consensus table from the completed results:
@@ -168,16 +171,19 @@ Native findings stay separate; disagreements → taste; flag single-voice critic
 Sections 1-11 — for EACH section, run the evaluation criteria from the loaded skill file:
 - Sections WITH findings: full analysis, auto-decide each issue, log to audit trail
 - Sections with NO findings: 1-2 sentences stating what was examined and why nothing
-  was flagged. NEVER compress a section to just its name in a table row.
+  was flagged. NEVER compress a section to its name in a table row.
 - Section 11 (Design): run only if UI scope was detected in Phase 0
 
 **Mandatory outputs from Phase 1:**
+- Reality rows: the loaded skill's `REALITY:` lines, one per applicable row;
+   `~/.claude/skills/gstack/bin/gstack-plan-reality check --phase ceo --plan <reviewed snapshot> <review-file|->` prints `PLAN_REALITY: … verdict=complete` before the phase closes
+   (unattended: `incomplete` keeps it open).
 - "NOT in scope" section with deferred items and rationale
 - "What already exists" section mapping sub-problems to existing code
 - Error & Rescue Registry table (from Section 2)
 - Failure Modes Registry table (from review sections)
-- Dream state delta (where this plan leaves us vs 12-month ideal)
-- Completion Summary (the full summary table from the CEO skill)
+- Dream state delta (where this plan leaves us vs the 12-month ideal)
+- Completion Summary (the CEO skill's full summary table)
 
 **Close this phase:**
 

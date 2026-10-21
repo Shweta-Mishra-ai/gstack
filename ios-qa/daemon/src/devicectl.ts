@@ -8,6 +8,7 @@ import { spawnSync, type SpawnSyncReturns } from 'child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { resultLine } from '../../../lib/result-codes';
 
 export interface DeviceEntry {
   identifier: string;
@@ -267,17 +268,53 @@ export function isAppRunning(
   }
 }
 
+/** The debug bridge's own variable namespace; a launch environment may not set it. */
+const BRIDGE_ENV_PREFIX = 'GSTACK_';
+
+/**
+ * Parse GSTACK_IOS_LAUNCH_ENV: a JSON object of string to string (for
+ * example `{"DEBUG_BRIDGE":"1"}`), or unset. A refusal names keys and types,
+ * never values, which may be credentials.
+ */
+export function parseLaunchEnv(raw: string | undefined): { ok: true; env: Record<string, string> | null } | { ok: false; detail: string } {
+  if (raw === undefined || raw.trim() === '') return { ok: true, env: null };
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return { ok: false, detail: 'GSTACK_IOS_LAUNCH_ENV is not valid JSON' }; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, detail: 'GSTACK_IOS_LAUNCH_ENV must be a JSON object of string to string' };
+  for (const [key, v] of Object.entries(value)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return { ok: false, detail: `${JSON.stringify(key)} is not an environment variable name` };
+    if (typeof v !== 'string') return { ok: false, detail: `${key} is a ${v === null ? 'null' : typeof v}, not a string` };
+    if (key.startsWith(BRIDGE_ENV_PREFIX)) return { ok: false, detail: `${key} collides with the debug bridge's reserved ${BRIDGE_ENV_PREFIX} variables` };
+  }
+  return { ok: true, env: Object.keys(value).length ? value as Record<string, string> : null };
+}
+
+/**
+ * The `--environment-variables` argv for a devicectl launch, from
+ * GSTACK_IOS_LAUNCH_ENV (empty when unset), or the IOS_LAUNCH_ENV_INVALID
+ * line that must stop the launch. Every launch path uses it, so the app is
+ * never started without the variables its debug bridge may be gated on.
+ */
+export function launchEnvArgs(raw = process.env.GSTACK_IOS_LAUNCH_ENV): { ok: true; args: string[] } | { ok: false; error: string } {
+  const launchEnv = parseLaunchEnv(raw);
+  if (!launchEnv.ok) return { ok: false, error: resultLine('ios-qa launch', 'IOS_LAUNCH_ENV_INVALID', launchEnv.detail) };
+  return { ok: true, args: launchEnv.env ? ['--environment-variables', JSON.stringify(launchEnv.env)] : [] };
+}
+
 /**
  * Launch an app on the device. Returns true on success, false otherwise.
  * Locked-device errors (the iPhone needs to be unlocked first) are surfaced
- * through the error string.
+ * through the error string. GSTACK_IOS_LAUNCH_ENV is forwarded (see
+ * launchEnvArgs); an invalid value refuses before any launch.
  */
 export function launchApp(
   udid: string,
   bundleId: string,
   spawn: SpawnImpl = defaultSpawn,
 ): { ok: boolean; error?: string } {
-  const r = spawn('xcrun', ['devicectl', 'device', 'process', 'launch', '--device', udid, bundleId]);
+  const env = launchEnvArgs();
+  if (!env.ok) return { ok: false, error: env.error };
+  const r = spawn('xcrun', ['devicectl', 'device', 'process', 'launch', '--device', udid, ...env.args, bundleId]);
   if (r.status === 0) return { ok: true };
   const err = (r.stderr?.toString() ?? '') + (r.stdout?.toString() ?? '');
   if (err.includes('was not, or could not be, unlocked')) {

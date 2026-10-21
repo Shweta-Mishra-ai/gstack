@@ -92,6 +92,10 @@ DX TREND (prior reviews):
   ...
 ```
 
+Error Messages, API/CLI/SDK and Overall DX are scored under the `dx_rubric` the row records.
+When a prior row's `dx_rubric` is absent or differs from `agent-ready-v1`, print
+"rubric changed, not comparable" for those three dimensions instead of a score or trend.
+
 ### Pass 1: Getting Started Experience (Zero Friction)
 
 Rate 0-10: Can a developer go from zero to hello world in under 5 minutes?
@@ -140,33 +144,44 @@ Evaluate:
 - **Reliability/trust**: Latency, retries, rate limits, idempotency, offline behavior?
 - **Progressive disclosure**: Simple case is production-ready, complexity revealed gradually?
 - **Persona fit**: Does the interface match how [persona] thinks about the problem?
+- **Agent ergonomics** (observational, recorded with evidence, not separately scored): non-interactive by default, structured output, layered `--help`.
 
 Good API design test: Can a [persona] use this API correctly after seeing one example?
 
 **STOP.** Run the Decision gate; ask only for a new or justified reopened decision. Recommend + WHY.
 
-### Pass 3: Error Messages & Debugging (Fight Uncertainty)
+### Pass 3: Error Messages & Debugging (agent-ready)
 
-Rate 0-10: When something goes wrong, does the developer know what happened, why,
-and how to fix it?
+Rate 0-10: When something goes wrong, can the reader, often an AI agent running unattended,
+tell what happened, recover safely, and debug it without reading the source?
 
 **Evidence recall:** Reference any error-related friction points from 0F and confusion
-points from 0G.
+points from 0G. Pass 3 always evaluates the agent reader as a second lens beside the
+persona from 0A.
 
-Load reference: Read the "## Pass 3" section from `~/.claude/skills/gstack/plan-devex-review/dx-hall-of-fame.md`.
+Load reference: Read the "## Pass 3" section from `~/.claude/skills/gstack/plan-devex-review/dx-hall-of-fame.md`
+before scoring: the full contract, calibration examples and the standards mapping.
 
-**Trace 3 specific error paths** from the plan or codebase. For each, evaluate against
-the three-tier system from the Hall of Fame:
-- **Tier 1 (Elm):** Conversational, first person, exact location, suggested fix
-- **Tier 2 (Rust):** Error code links to tutorial, primary + secondary labels, help section
-- **Tier 3 (Stripe API):** Structured JSON with type, code, message, param, doc_url
+Score every error path against the agent-ready error contract (https://github.com/garrytan/gstack/blob/main/docs/agent-ready-errors.md): what (operation and actual values), fix (a safe, authorized command or edit on the first or last line, or the precise thing a human must provide), recovery (retry, fix and retry, do X first, or ask a human; side effects none/partial/complete/unknown, reconcile before retrying an unknown outcome, a retry bound), code (stable, with a doc anchor), context (versions, config, env var names, the underlying cause; caller-safe only for remote services), trace (unexpected failures only: a compact trace or its file path locally, a correlation id remotely), redaction (no secret values anywhere), channel (the surface's native failure signal: non-zero exit and stderr for a CLI, status plus RFC 9457 body for an API, a typed error for an SDK, isError for an MCP tool). Usage and validation errors rejected before any work need only what, fix, code, redaction and channel; items apply per surface, N/A needs a reason, an item the plan never specifies for a path it introduces is a gap, and unknown is reserved for existing behavior you could not inspect. Report a leaked secret, a failure signalled as success, an unsafe fix, or a block on a terminal (a hang, or a no-terminal failure that names no non-interactive alternative such as --yes) as a Critical finding titled "CAP4:<path>:<item>" (caps the Error Messages score at 4/10); report a missing applicable fix, recovery, context or trace as a High finding titled "CAP6:<path>:<item>" (caps it at 6/10).
 
-For each error path, show what the developer currently sees vs. what they should see.
+The "## Pass 3" Hall of Fame section loaded above holds the full contract: the item table,
+the per-surface channel rules and the evidence states.
 
-Also evaluate:
-- **Permission/sandbox/safety model**: What can go wrong? How clear is the blast radius?
-- **Debug mode**: Verbose output available?
-- **Stack traces**: Useful or internal framework noise?
+**Trace 3 specific error paths plus one unexpected-failure path** (crash, dependency failure)
+from the plan or codebase. When the plan names no unexpected-failure handling, record that
+absence as the trace gap. Output one matrix, prose only for failures:
+
+```
+ERROR PATH MATRIX (agent-ready-v1)
+Path                  | Class      | what | fix | recovery | code | context | trace | redaction | channel | Cap
+[path]                | usage      | pass | fail| N/A      | pass | N/A     | N/A   | pass      | pass    | CAP6:fix
+```
+
+For each capped path, show what an agent sees today and the corrected error line. Also note
+the permission and safety model (what can go wrong, how clear the blast radius is) and whether
+a verbose or debug mode exists.
+
+**DX TRIAGE:** report the cap-triggering gaps only, and always every CAP4 finding.
 
 **STOP.** Run the Decision gate; ask only for a new or justified reopened decision. Recommend + WHY.
 
@@ -296,47 +311,26 @@ review. The user turns this off only by asking explicitly
 
 ```bash
 
-# Codex preflight: one block (functions sourced here don't persist to later blocks).
-_TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
-_CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get codex_reviews 2>/dev/null || echo enabled)
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null || true
-if [ "$_CODEX_CFG" = "disabled" ]; then
-  _CODEX_MODE="disabled"
-elif { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
-  _CODEX_MODE="under_codex"
-elif ! command -v codex >/dev/null 2>&1; then
-  _CODEX_MODE="not_installed"; _gstack_codex_log_event "codex_cli_missing" 2>/dev/null || true
-elif ! _gstack_codex_auth_probe >/dev/null 2>&1; then
-  _CODEX_MODE="not_authed"; _gstack_codex_log_event "codex_auth_failed" 2>/dev/null || true
-else
-  # The free sandbox check runs before the paid model probe. Probe code 2 means
-  # the CLI cannot execute at all, a different fix from an unusable model.
-  _CODEX_MP=0; _gstack_codex_sandbox_preflight || _CODEX_MP=3
-  [ "$_CODEX_MP" -ne 0 ] || { _gstack_codex_model_probe; _CODEX_MP=$?; }
-  if [ "$_CODEX_MP" -eq 3 ]; then
-    _CODEX_MODE="sandbox_unavailable"
-  elif [ "$_CODEX_MP" -eq 2 ]; then
-    _CODEX_MODE="broken_install"
-  elif [ "$_CODEX_MP" -ne 0 ]; then
-    _CODEX_MODE="model_unusable"
-  elif [ "${_GSTACK_CODEX_PROBE_STATE:-}" = inconclusive ]; then
-    _CODEX_MODE="unverified"
+if ! _OUTSIDE_CFG=$("$HOME/.claude/skills/gstack/bin/gstack-config" get --stored codex_reviews) || [ "$_OUTSIDE_CFG" = disabled ]; then
+  echo 'CODEX_MODE: disabled'
+elif ( # GSTACK_ACTIVE_HOST names the harness, never the model.
+if { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
+  echo 'Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage.' >&2
+  if { [ -n "${CLAUDECODE:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = claude ]; } && { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
+    echo 'Inherited harness markers conflict. Run setup --host <actual-harness> (claude or codex); do not guess a replacement provider.' >&2
   else
-    _CODEX_MODE="ready"; _gstack_codex_version_check 2>/dev/null || true
+    echo 'Repair installed skills: run setup --host codex from your gstack checkout.' >&2
   fi
+  exit 78
 fi
-echo "CODEX_MODE: $_CODEX_MODE"
+); then
+  if command -v codex >/dev/null 2>&1; then echo 'CODEX_MODE: ready'; else echo 'CODEX_MODE: not_installed'; fi
+else
+  echo 'CODEX_MODE: under_current_harness'
+fi
 ```
 
-Branch on the echoed `CODEX_MODE`:
-- **`disabled`** — the user turned Codex reviews off (`codex_reviews=disabled`). Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
-- **`not_installed`** — Codex CLI absent. Print: "Codex not installed; outside coverage unavailable. Install: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
-- **`under_codex`** — stale artifact selected its own harness. Print: "Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage. Repair: setup --host codex." Skip the outside invocation and follow the workflow's native-review instructions below. Conflicting inherited harness markers are not grounds to guess another provider.
-- **`not_authed`** — installed but no credentials. Print: "Codex not authenticated; outside coverage unavailable. Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
-- **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines. Fall back to the Claude subagent path.
-- **`model_unusable`** — the selected model (see `CODEX_MODEL:`) is invalid or unavailable to the account (HTTP 400 on every call). Relay the probe's HINT lines and the fix (`GSTACK_CODEX_MODEL=<supported-model>` or config.toml `model`); never substitute a model. Fall back to the Claude subagent path. The ~10s round trip is cached for 1h.
-- **`sandbox_unavailable`** — Codex's sandbox cannot start here (containers without user namespaces); the probe printed the reason and fix. No paid call ran; outside coverage is unavailable. Fall back to the Claude subagent path.
-- **`ready`** or **`unverified`** — run the Codex pass below. `unverified` means the model check timed out; say so, and let the pass's own verdict decide.
+The historical `CODEX_MODE` variable describes **Codex** availability here. The invocation checks auth and the [policy](https://github.com/garrytan/gstack/blob/main/docs/model-policy.md) plan-review model. Missing/broken CLI: install or repair Codex; authentication failure: run `codex login`. Disabled ends this entire extra review step (so does a send's `consent_missing` line), including the native fallback; record outside_status: disabled and continue after the section. Disabled is not an unavailable provider and never triggers a replacement reviewer. Provider failure is missing outside coverage; follow the caller’s existing fallback only when reviews are enabled. Never substitute another external provider.
 
 **Disabled is a terminal branch for this section.** If the preflight prints
 `CODEX_MODE: disabled`, persist `outside_status: disabled` with the guarded
@@ -410,7 +404,7 @@ Run the selected backend in the one foreground Bash invocation described below.
 Finish a failed attempt's termination before fallback; consume only its completed
 output. No background jobs or shared temporary paths.
 
-Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -430,16 +424,18 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
-_gstack_codex_sandbox_preflight >/dev/null || exit 1
-_gstack_codex_first_use_notice
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+export _CODEX_DEADLINE=$(($(date +%s)+300)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" show-first-use-notice
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 300 codex exec - -C "$_REPO_ROOT" -s "${_GSTACK_CODEX_SANDBOX:?}" -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="high"' -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+"$_CODEX_PROBE" run-with-timeout --effort high 300 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 _OUTSIDE_RC=0
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
 case "$_OUTSIDE_RC" in
   0|3) ;;
   4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
@@ -474,52 +470,52 @@ Immediately before dispatching, check the preflight result again. On
 do not dispatch. Otherwise, use this fallback for missing/broken CLI, failed
 authentication/model selection, a failed preflight, or a failed outside invocation.
 The disabled branch never reaches this fallback.
-On `CODEX_MODE: under_codex`, report the setup repair and
+On `CODEX_MODE: under_current_harness`, report the setup repair and
 `outside_status: unavailable`, run no outside CLI, and use the native subagent below.
 A native result never supplies outside coverage.
 
-**Bounded outside-voice wait — one five-minute wait plus dispatch/cancellation overhead:**
+**Bounded outside-voice wait — one five-minute host timer:**
 
-Before dispatch, verify the host offers the built-in Plan agent type, TaskOutput and
-TaskStop. If any is unavailable, take the unavailable path below without launching.
+Before dispatch, check this session's tools for TaskStop, Bash's `run_in_background`
+and Plan among Agent's subagent types. Do not launch a task to test availability;
+if any is missing, take the unavailable path without launching.
 Use Plan, which denies native Edit, Write and NotebookEdit tools. Do not set a model
 override; keep the inherited model. This is not a filesystem sandbox: the review-only
-prompt also forbids mutations through other tools. The subagent has fresh context
-but is the same harness; model identity stays unknown unless the runtime reports it.
-A native result never supplies outside coverage.
+prompt also forbids mutations through other tools. A native result never supplies
+outside coverage. This is the one exception to foreground dispatch here.
+Execute the four steps once:
 
-This is the single bounded-wait exception to foreground dispatch for this outside
-voice. Execute the four steps once:
-
-1. Dispatch via the Agent tool with `subagent_type: "Plan"` and
-   `run_in_background: true`. Subagent prompt: same plan review prompt as above.
-   Keep the returned `agentId`; do not guess an ID or launch a second task.
-   If dispatch fails without an ID, take the unavailable path without guessing one.
-2. Immediately call TaskOutput with that exact ID as `task_id`, `block: true`,
-   and `timeout: 300000`. Make one wait only; do not poll or renew the budget.
-3. Check TaskOutput's outer fields: `<retrieval_status>` must be `success`,
-   `<task_id>` must match, `<task_type>` must be `local_agent`, `<status>`
-   must be `completed`, `<output>` must be nonempty, and there must be no outer
-   `<error>`. Accept findings only if that output is an identifiable complete
+1. Start the timer: Bash `command: "sleep 300"`, `run_in_background: true`,
+   `timeout: 300000`. Dispatch via the Agent tool with `subagent_type: "Plan"`
+   and `run_in_background: true` where offered, with the same plan review prompt.
+   Keep the returned agent ID; do not guess an ID or launch a second task.
+2. End your turn and wait for task notifications. Make one wait only: do not poll,
+   sleep, Read either output file or renew the timer.
+3. Only the agent's `<task-notification>` arriving before the timer's counts:
+   `<task-id>` must match the agent ID, `<status>` must be `completed`, `<summary>`
+   must say it finished ("is waiting on its own background work": keep waiting; a
+   turn limit: partial) and `<result>` must be nonempty; a "[Subagent hand-back]"
+   header only frames it. Accept findings only if it is an identifiable complete
    final reviewer report. Reject raw or in-progress transcripts; do not extract
    finding fragments from them. Terminal status or warning markers alone do not
-   establish report completeness. If any check fails or the report cannot be identified, follow step 4. Otherwise present it under an `OUTSIDE VOICE (Claude subagent):`
+   establish report completeness. If any check fails or the report cannot be identified, follow step 4. Otherwise call TaskStop with the timer's ID, present it under an `OUTSIDE VOICE (Claude subagent):`
    header, then continue to Cross-model tension.
-4. On any noncompletion (timeout, error, missing/mismatched result, failed/killed
-   status, raw transcript or empty report), call TaskStop with the same ID as
-   `task_id`. TaskOutput timeout does not stop the agent. Record the stop result;
-   if cancellation fails, say cancellation is unconfirmed. If TaskStop reports the
-   task already completed after the timeout, still give no late-result credit.
+4. Otherwise (timer first, no ID, failed or stopped status, partial or empty result,
+   or Agent returns a report directly: no enforced deadline, so no credit), call
+   TaskStop with the same ID as the agent, and call TaskStop with the timer's ID if it runs.
+   Record each stop result; if one fails, cancellation is unconfirmed.
+   For a completion after the timer or TaskStop, still give no late-result credit.
 
-**Unavailable path:** "Outside voice unavailable. Continuing to outputs."
+**Unavailable path:** "Outside voice unavailable: <cause>. Fix: <fix>. Continuing to outputs. (OUTSIDE_VOICE_UNAVAILABLE)"
+The cause adds to the provider's diagnosis: Plan agent type not offered, TaskStop not offered,
+background tasks unavailable (fix: Claude Code 2.1.277+, background tasks on), no complete report within five minutes, or a failed status.
 Do not retry with a general-purpose agent. Report missing outside-voice coverage.
 Ignore partial or late results for critique, agreement, clean status or coverage.
 Skip Cross-model tension. Persist an unavailable result using the command below
-with STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable";
-then continue directly to outputs. The storage policy still applies.
-Do not record a clean review when no reviewer completed within the accepted wait.
+with STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable", adding `"unavailable_reason":"<cause>"`;
+then continue directly to outputs.
+Do not record a clean review when no reviewer completed.
 
-(On `CODEX_MODE: disabled` you already skipped this section per the preflight — do not reach here.)
 
 **Cross-model tension:**
 
@@ -614,6 +610,11 @@ Options: **A)** Add to TODOS.md **B)** Skip **C)** Build it now
 
 ### DX Scorecard
 
+In the plan file, write it as its own `## DX Review Scorecard` section
+(the scorecard, its verdict lines and the Unresolved Decisions below) above the terminal
+`## GSTACK REVIEW REPORT`, replacing this review's earlier one. Never write it inside
+the report: the next plan review deletes and regenerates everything under that heading.
+
 ```
 +====================================================================+
 |              DX PLAN REVIEW — SCORECARD                             |
@@ -643,6 +644,7 @@ Options: **A)** Add to TODOS.md **B)** Skip **C)** Build it now
 | Opinionated + Escape Hatches | [covered/gap]                       |
 | Code in Context    | [covered/gap]                                  |
 | Magical Moments    | [covered/gap]                                  |
+| Agents Are Users   | [covered/gap]                                  |
 +====================================================================+
 ```
 
@@ -659,7 +661,7 @@ DX IMPLEMENTATION CHECKLIST
 [ ] Installation is one command
 [ ] First run produces meaningful output
 [ ] Magical moment delivered via [vehicle from 0D]
-[ ] Every error message has: problem + cause + fix + docs link
+[ ] Every error message meets the agent-ready error contract (Pass 3)
 [ ] API/CLI naming is guessable without docs
 [ ] Every parameter has a sensible default
 [ ] Docs have copy-paste examples that actually work
@@ -709,13 +711,13 @@ backslashes serialize cleanly — never use hand-rolled `echo` / `printf`.
 
 ```bash
 GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
-BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
 SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
 TASKS_DIR="$GSTACK_STATE_ROOT/projects/${SLUG:-unknown}"
 mkdir -p "$TASKS_DIR"
 TASKS_FILE="$TASKS_DIR/tasks-devex-review-$(date +%Y%m%d-%H%M%S).jsonl"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
+# The task record keeps the raw git branch; artifact filenames keep gstack-slug's sanitized BRANCH.
+GIT_BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 # Repeat ONE jq invocation per task identified during this review.
@@ -726,7 +728,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 jq -nc \
   --arg phase 'devex-review' \
   --arg run_id "$RUN_ID" \
-  --arg branch "$BRANCH" \
+  --arg branch "$GIT_BRANCH" \
   --arg commit "$COMMIT" \
   --arg id "$TASK_ID" \
   --arg priority "$PRIORITY" \
@@ -856,7 +858,7 @@ above. On failure, report the error and stop; do not log completion or an accept
 metadata to `~/.gstack/`; the following dashboard reads the saved result.
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-devex-review","timestamp":"TIMESTAMP","status":"STATUS","initial_score":N,"overall_score":N,"product_type":"PRODUCT_TYPE","tthw_current":"TTHW_CURRENT","tthw_target":"TTHW_TARGET","mode":"MODE","persona":"PERSONA","competitive_tier":"COMPETITIVE_TIER","unresolved":N,"commit":"COMMIT"}'
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-devex-review","timestamp":"TIMESTAMP","status":"STATUS","initial_score":N,"overall_score":N,"product_type":"PRODUCT_TYPE","tthw_current":"TTHW_CURRENT","tthw_target":"TTHW_TARGET","mode":"MODE","persona":"PERSONA","competitive_tier":"COMPETITIVE_TIER","unresolved":N,"dx_rubric":"agent-ready-v1","dimension_scores":{"getting_started":N,"api_cli_sdk":N,"error_messages":N,"documentation":N,"upgrade_path":N,"dev_environment":N,"community":N,"dx_measurement":N},"commit":"COMMIT"}'
 ```
 
 TIMESTAMP = current ISO 8601 datetime; STATUS = "clean" if score 8+ AND 0 unresolved, else "issues_open"; other fields from the DX Scorecard + Step 0; COMMIT = `git rev-parse --short HEAD`.
@@ -886,9 +888,8 @@ Historical source "claude" is a native subagent; "claude-code" is the external C
 Do not infer old providers or unknown models from today's harness. A native result
 does not fill missing, disabled or skipped outside coverage.
 
-**Source attribution:** Append a recorded `via` to the suffix, for example
-"CLEAR (PLAN via /autoplan)" or "CLEAR (DIFF via /ship)". Without `via`, keep
-"CLEAR (PLAN)" or "CLEAR (DIFF)". Below the dashboard, group `autoplan-voices`
+**Source attribution:** Append a recorded `via` to the suffix ("CLEAR (PLAN via
+/autoplan)"); without one, keep "CLEAR (PLAN)" or "CLEAR (DIFF)". Below the dashboard, group `autoplan-voices`
 and `design-outside-voices` by workflow run and phase. Show each phase's provider
 and outside_status; retain partial coverage. These details do not clear Eng Review.
 
@@ -897,8 +898,7 @@ and outside_status; retain partial coverage. These details do not clear Eng Revi
 - **Content-first rule:** For `review`, `adversarial-review`, `codex-review`,
   ship-stage reviews and `design-review-lite`, use `review_freshness.status`
   and show its `reason`. CURRENT means a completed clean review whose start and
-  end content fingerprints equal the current `---WTREE---` fingerprint. This
-  fingerprint covers working-tree content, not just the commit.
+  end content fingerprints equal the current `---WTREE---` fingerprint.
   STALE or UNVERIFIED cannot clear Eng Review. Missing `review_freshness`,
   including legacy log-only records, means UNVERIFIED. Never fall back to HEAD
   equality or commit distance for diff evidence, even at zero commits.
@@ -907,12 +907,11 @@ and outside_status; retain partial coverage. These details do not clear Eng Revi
 - **Plan records** (plan-ceo-review, plan-eng-review, plan-design-review and
   codex-plan-review) use the 7-day window, not the working-tree fingerprint.
   If `plan_sha256` is present, you may compare the plan file and report a mismatch.
-  For plan records only, compare the recorded commit with `---HEAD---`.
-  If different, run `git rev-list --count STORED_COMMIT..HEAD` and report
+  Compare the recorded commit with `---HEAD---`; if different, run
+  `git rev-list --count STORED_COMMIT..HEAD` and report
   "Note: {skill} review from {date} may be stale — {N} commits since review".
-  A failed command means UNKNOWN, treated as stale. Without commit tracking,
-  retain the note to consider re-running. Omit staleness notes when all reviews
-  are current.
+  A failed command means UNKNOWN, treated as stale; without commit tracking,
+  suggest a re-run. Omit notes when all reviews are current.
 
 **3. Choose the historical verdict.** CLEARED requires the selected Eng Review
 to be `clean`, within 7 days and fresh under step 2. Otherwise report NOT CLEARED

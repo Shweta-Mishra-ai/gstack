@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { readQaCapture } from '../../lib/qa-evidence';
 
 export const QA_EVIDENCE_RUNTIME = [
-  'bin/gstack-qa-evidence', 'bin/gstack-qa-deadline', 'lib/qa-evidence.ts', 'lib/qa-deadline.ts',
+  'bin/gstack-qa-evidence', 'bin/gstack-qa-deadline', 'lib/qa-evidence.ts', 'lib/qa-deadline.ts', 'lib/bun-isolation.ts',
   'lib/claude-code-windows-job.ts', 'lib/fs-atomic.ts', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',
 ];
 

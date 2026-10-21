@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 const root = ${JSON.stringify(ROOT)};
 const factsPath = ${JSON.stringify(facts)};
-const { CLAUDE_FRONTIER_EVAL_MODEL } = await import(path.join(root, 'lib/eval-model.ts'));
+const { CLAUDE_CAPTURE_EVAL_MODEL } = await import(path.join(root, 'lib/eval-model.ts'));
 const readFile = fs.readFileSync.bind(fs);
 const recoveryResponses = JSON.parse(readFile(path.join(root, 'test/fixtures/third-party-actions-recovery-public.json'), 'utf8')).responses;
 const writeFile = fs.writeFileSync.bind(fs);
@@ -128,7 +128,7 @@ test('actual paid assertion boundaries and all failure stages retain one accurat
       expect(observed.created).toEqual([]);
       if (kind === 'runner' || kind === 'fixture') {
         expect(observed.error).toBe(kind === 'runner' ? runnerError : fixtureError);
-        expect(observed.entry).toMatchObject({ exit_reason: 'harness_error', cost_usd: 0, model: CLAUDE_FRONTIER_EVAL_MODEL });
+        expect(observed.entry).toMatchObject({ exit_reason: 'harness_error', cost_usd: 0, model: CLAUDE_CAPTURE_EVAL_MODEL });
         expect(observed.entry.error).toContain('cost and usage unavailable');
         expect(observed.entry.transcript).toBeUndefined();
         expect(observed.runnerCalls).toBe(kind === 'runner' ? 1 : 0);
@@ -168,7 +168,7 @@ test('actual paid assertion boundaries and all failure stages retain one accurat
   // A runner/setup exception has no returned model. Mirror the same capture
   // resolution that the real session runner would have used, including overrides.
   for (const [overrides, expected] of [
-    [{}, CLAUDE_FRONTIER_EVAL_MODEL],
+    [{}, CLAUDE_CAPTURE_EVAL_MODEL],
     [{ GSTACK_EVAL_MODEL: 'global-model' }, 'global-model'],
     [{ GSTACK_EVAL_MODEL: 'global-model', GSTACK_EVAL_MODEL_CAPTURE: 'capture-model' }, 'capture-model'],
     [{ GSTACK_EVAL_MODEL: 'global-model', GSTACK_EVAL_MODEL_CAPTURE: 'capture-model', EVALS_MODEL: 'evals-model' }, 'evals-model'],

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Keep HARNESS_VERSION honest (CEO-27/ENG-3/DX-6). scripts/harness-version.json
  * pins the blob of every shared-harness file (GLOBAL_TOUCHFILES plus its

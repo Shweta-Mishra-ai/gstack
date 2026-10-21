@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { JUDGE_MS, CAPTURE_MS, CAPTURE_LONG_MS, PTY_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
+import { resolveEvalModel } from '../lib/eval-model';
 import { EvalCollector } from './helpers/eval-store';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 import {
@@ -90,7 +91,7 @@ Focus on reviewing the plan content: architecture, error handling, security, and
       timeout: 540_000,
       testName: 'plan-ceo-review',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/plan-ceo-review', result);
@@ -177,7 +178,7 @@ Focus on reviewing the plan content: architecture, error handling, security, and
       timeout: CAPTURE_LONG_MS,
       testName: 'plan-ceo-review-selective',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/plan-ceo-review (SELECTIVE)', result);
@@ -245,7 +246,7 @@ Write your expansion proposals to ${planDir}/proposals.md with ONLY the proposal
       timeout: CAPTURE_LONG_MS,
       testName: 'plan-ceo-review-expansion-energy',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/plan-ceo-review (EXPANSION ENERGY)', result);
@@ -354,7 +355,7 @@ Focus on architecture, code quality, tests, and performance sections.`,
       timeout: CAPTURE_LONG_MS,
       testName: 'plan-eng-review',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/plan-eng-review', result);
@@ -382,7 +383,7 @@ describeIfSelected('Plan Review Report E2E', ['plan-review-report'], () => {
     try {
       await runRecordedOfficeHoursAttempt({
         collector: evalCollector, name: '/plan-review-report', suite: 'Plan Review Report E2E',
-        model: 'claude-opus-4-7', budgetMs: CAPTURE_LONG_MS,
+        model: resolveEvalModel('capture'), budgetMs: CAPTURE_LONG_MS,
         run: async signal => {
           planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-review-report-'));
           const run = (cmd: string, args: string[]) => {
@@ -445,7 +446,7 @@ plan.md is the plan file for this review session; save your review there.`,
             timeout: CAPTURE_LONG_MS,
             testName: 'plan-review-report',
             runId, signal,
-            model: 'claude-opus-4-7',
+            model: resolveEvalModel('capture'),
           });
         },
         validate: result => {

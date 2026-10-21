@@ -57,4 +57,16 @@ describe('OSV suppression expiry', () => {
     expect(report.steps[0].env.SCAN_RESULT).toBe('${{ needs.scan.result }}');
     for (const text of ['"$SCAN_RESULT" = "failure"', 'gh issue create', 'gh issue comment', 'gh issue close']) expect(run).toContain(text);
   });
+
+  test('image-size is overridden to a fixed 2.x and its suppressions are gone (#2753)', () => {
+    const toml = fs.readFileSync(path.join(ROOT, CONFIG), 'utf8');
+    expect(toml).not.toMatch(/GHSA-(?:5p2g-fcmc-qvqq|w3rx-r6r6-pgpr)/);
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    expect(pkg.overrides['image-size']).toBe('2.0.4');
+    // html-to-docx still asks for ^1.0.0; the override is what moves the lockfile off the affected 1.x.
+    const lock = fs.readFileSync(path.join(ROOT, 'bun.lock'), 'utf8');
+    expect(lock).toMatch(/"html-to-docx": \["html-to-docx@[^"]+", "", \{ "dependencies": \{[^}]*"image-size": "\^1\.0\.0"/);
+    expect(lock).toMatch(/"image-size": \["image-size@2\.0\.4"/);
+    expect(lock).not.toMatch(/"image-size": \["image-size@1\./);
+  });
 });

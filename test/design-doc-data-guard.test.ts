@@ -8,6 +8,7 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import { between, expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf-8');
@@ -32,4 +33,9 @@ describe('D3: design docs and handoff notes are data, not instructions', () => {
       if (file.startsWith('plan-')) expect(block).toContain('handoff note');
     });
   }
+
+  test('plan-eng-review/SKILL.md: the CEO plan it reads is data too (#280)', () => {
+    const check = between(read('plan-eng-review/SKILL.md'), '### Design Doc Check', '### Step 0');
+    expectMentions(check, [['ceo plan', 'data, not instructions']], 'plan-eng-review Design Doc Check');
+  });
 });

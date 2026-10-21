@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Compare two eval runs from the project eval dir (~/.gstack/projects/<slug>/evals;
  * legacy fallback ~/.gstack-dev/evals)

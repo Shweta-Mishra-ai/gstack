@@ -30,7 +30,7 @@ pass/fail/blocked/not run/inconclusive/not applicable (reason).
 | Contract | Observe |
 |---|---|
 | Successful execution | Expected return/output and final business effect, not just launch/acceptance |
-| Invalid/missing input | Declared rejection, correct status and no forbidden state change |
+| Invalid/missing input | One probe per documented input rule of each field (allowed characters, format, sign, range, arity) breaking only it: declared rejection, correct status and no forbidden state change |
 | Authentication/authorization | Valid identity, missing/invalid identity, wrong owner/role and durable no-effect boundary |
 | CLI process contract | Exact exit code, stdout and stderr separately; resulting file/state changes |
 | State transitions | Initial, intermediate and completed/failed states and their permitted transitions |

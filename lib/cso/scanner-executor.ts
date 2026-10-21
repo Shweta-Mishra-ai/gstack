@@ -42,6 +42,7 @@ import {
 } from './scanner-catalog';
 import {
   ScannerExecution,
+  ScannerFormat,
   ScannerGap,
   ScannerId,
   ScannerOutcome,
@@ -378,6 +379,7 @@ function failure(plan: ScannerPlan, error: unknown, version?: string): ScannerOu
     PREREQUISITE: 'PREREQUISITE',
     INCOMPATIBLE_INPUT: 'PREREQUISITE',
     ASSERTION_FAILED: 'TOOL_FAILED',
+    PREPARED_EXPORT_REJECTED: 'TOOL_FAILED',
   };
   const code = codes[e.code];
   return {
@@ -688,6 +690,16 @@ export async function prepareDockerScannerApplication(
   }
 }
 
+/** How each declared report format reaches the parser: every scanner format today is a JSON document. */
+const REPORT_STDOUT: Record<ScannerFormat, 'json'> = {
+  'gitleaks-json': 'json',
+  'osv-json': 'json',
+  'semgrep-json': 'json',
+  sarif: 'json',
+  'trivy-json': 'json',
+  'schemathesis-json': 'json',
+};
+
 /** No arbitrary runner configuration crosses this boundary; images and paths came from the catalog. */
 export async function createDockerScannerRunner(context: ScannerRunnerContext): Promise<ScannerRunner> {
   const { input, plan, profile, runtime, application, deadline } = context;
@@ -726,12 +738,13 @@ export async function createDockerScannerRunner(context: ScannerRunnerContext): 
       });
     let scanner = await createScanner();
     await group.start(scanner);
-    const capture = async (command: string[]): Promise<ScannerExecution> => {
+    const capture = async (command: string[], report?: ScannerFormat): Promise<ScannerExecution> => {
       if (!scanner) throw new CsoError('ISOLATION_FAILED', 'Scanner container is unavailable');
       const result = await group!.execCapture(scanner, command, {
         workdir: '/work',
         env: plan.env,
         redaction: 'splice',
+        stdoutFormat: report && REPORT_STDOUT[report],
       });
       return { stdout: result.stdout, stderr: result.stderr, exitCode: result.code };
     };
@@ -798,7 +811,7 @@ export async function createDockerScannerRunner(context: ScannerRunnerContext): 
               ? ['/opt/cso/run-app', '/bin/sleep', '2147483647']
               : ['/opt/cso/run-app', api.start.executable, ...api.start.args],
           });
-          await group!.start(app);
+          await (rails ? group!.startHeldApplication(app) : group!.start(app));
           if (rails) {
             const clean = [
               '/usr/bin/env',
@@ -849,9 +862,12 @@ export async function createDockerScannerRunner(context: ScannerRunnerContext): 
             await group!.start(scanner);
           }
         }
-        const execution = await capture([profile.executable, ...plan.args]);
+        const execution = await capture(
+          [profile.executable, ...plan.args],
+          plan.outputPath ? undefined : plan.format,
+        );
         if (plan.outputPath) {
-          const report = await capture(['/bin/cat', plan.outputPath]);
+          const report = await capture(['/bin/cat', plan.outputPath], plan.format);
           if (report.exitCode !== 0)
             throw new CsoError('PREREQUISITE', 'Scanner did not produce its required bounded report file');
           return {

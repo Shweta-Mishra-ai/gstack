@@ -353,7 +353,8 @@ function findBindsFile(calls: ReturnType<typeof commands>, file: string, cwd: st
   });
 }
 
-function inspectsFile(source: string, file: string, returnedPath: boolean, expected: StartContext): boolean {
+function inspectsFile(source: string, file: string, text: string, expected: StartContext): boolean {
+  const returnedPath = containsPath(text, file);
   const paths = sourcePaths(file);
   const environment = new Map([['GSTACK_HOME', expected.state], ['SLUG', expected.slug]]);
   const calls = withDirectories(commands(source), paths.normalize(expected.repo), paths, environment);
@@ -377,6 +378,20 @@ function inspectsFile(source: string, file: string, returnedPath: boolean, expec
       const quoted = /^\$\(([\s\S]*)\)$/.exec(operand);
       if (quoted && findOutput(commands(quoted[1]))
         && (returnedPath || findBindsFile(commands(quoted[1]), file, call.cwd, call.variables))) return true;
+    }
+  }
+  for (let i = 0; i < calls.length; i++) {
+    const call = calls[i];
+    // A loop over literal paths counts only when its output names this file.
+    const listed = call.words[0] === 'for' && /^[A-Za-z_]\w*$/.test(call.words[1]) && call.words[2] === 'in'
+      && call.words.length > 3 && call.words.slice(3).every(word => /^[\w./-]+$/.test(word))
+      ? call.words.slice(3).find(word => literalPath(word, call.cwd, paths) === file) : undefined;
+    if (!listed || !containsPath(text, listed)) continue;
+    for (const next of calls.slice(i + 1)) {
+      if (next.words[0] === 'done') break;
+      const words = next.words[0] === 'do' ? next.words.slice(1) : next.words;
+      if (rebinds(words, call.words[1])) break;
+      if (reader(words, `$${call.words[1]}`) || reader(words, `\${${call.words[1]}}`)) return true;
     }
   }
   if (!returnedPath) return false;
@@ -534,7 +549,7 @@ export function hasTrustedSharedLibsCheck(events: unknown[], expected: CheckerCo
         return reads.some(read => read.tool === 'Read' && typeof read.input?.file_path === 'string'
           && literalPath(read.input.file_path, expected.repo, paths) === file
           || read.tool === 'Bash' && typeof read.input?.command === 'string'
-          && inspectsFile(read.input.command, file, containsPath(read.text, file), expected));
+          && inspectsFile(read.input.command, file, read.text, expected));
       })) continue;
       if (bash.some(finish => finish.at > check.returnedAt && invocations(finish.input.command).some(call =>
         call.words.length === 4 && call.words[2] === '--finish' && call.words[3] === token))) return true;
@@ -573,7 +588,7 @@ export function hasTrustedReviewStartRead(events: unknown[], expected: StartCont
         // Discovery may return the path only in stdout; bind its cat invocation
         // to that discovery instead of accepting unrelated reader/find words.
         const shellRead = read.tool === 'Bash' && (sameCall ? sameCallStartRead(command, file, expected, token)
-          : inspectsFile(command, file, containsPath(read.text, file), expected));
+          : inspectsFile(command, file, read.text, expected));
         if (!directRead && !shellRead) continue;
         for (const line of read.text.split('\n')) {
           // Native Read can prefix the single-line JSON file with a line number.

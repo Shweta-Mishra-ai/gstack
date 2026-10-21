@@ -121,7 +121,7 @@ If vercel.json or .vercel detected:
 
 1. Check for `vercel` CLI: `which vercel 2>/dev/null`
 2. If installed: `vercel ls --prod 2>/dev/null | head -3`
-3. Vercel deploys automatically on push — preview on PR, production on merge to the default branch
+3. Vercel deploys automatically on push — preview on PR, production on merge to the default branch — only when the Vercel project is connected to this Git repository. For a CLI-only project, ask how production deploys run and record that command as the deploy trigger
 4. Set health check: the production URL from vercel project settings
 Ask for the production URL if not available from the CLI, then confirm it before writing.
 
@@ -151,6 +151,8 @@ If deploy workflows detected but no platform config:
 
 If nothing detected:
 
+A project deployed only with the Vercel CLI has no `vercel.json` or `.vercel/`; `vercel link` creates `.vercel/`, so a re-run detects it.
+
 Use AskUserQuestion to gather the information:
 
 1. **How are deploys triggered?**
@@ -158,7 +160,10 @@ Use AskUserQuestion to gather the information:
    - B) Via GitHub Actions workflow
    - C) Via a deploy script or CLI command (describe it)
    - D) Manually (SSH, dashboard, etc.)
-   - E) This project doesn't deploy (library, CLI, tool)
+   - E) Nothing is deployed yet (the first production deploy is still to come)
+   - F) This project never deploys (library, CLI, tool)
+
+   On E, stop here and write nothing: there is no production URL and no deploy trigger to record yet. Tell the user that this skill configures how `/land-and-deploy` verifies a deploy, and the first bring-up is its own step, done with the platform's own CLI or whatever bring-up tool they choose. Bring the project up first, then re-run `/setup-deploy` after the first production deploy exists. On F, Step 4 writes the `none` configuration.
 
 2. **What's the production URL?** (Free text — the URL where the app runs)
 

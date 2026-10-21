@@ -1,22 +1,29 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { collectProducerReceipts, createEvalBaseline, createEvalMatrix, createPortableSkillPayload, loadPortableSkillPayload, prepareEvalJobs, REQUIRED_CONTAINMENT, scoreCollectedEval, scoreEval, validateMatrix, validatePortableSkillPayload, type EvalBaseline, type EvalCell, type EvalMatrix, type EvalResult, type PreparedEvalSchedule } from '../scripts/cso-eval';
-import { PRODUCER_PROVIDER_POLICY, producerFailureMessage, producerInstallationIdentity, resolveProducerHelperBinding, runProducerCell, validateProductionProducerInstallation } from '../scripts/cso-eval-producer';
+import { collectProducerReceipts, createEvalBaseline, createEvalMatrix, createPortableSkillPayload, loadPortableSkillPayload, prepareEvalJobs, REQUIRED_CONTAINMENT, scoreCollectedEval, scoreEval, validateMatrix, validatePortableSkillPayload, type EvalBaseline, type EvalCell, type EvalFinding, type EvalMatrix, type EvalResult, type PreparedEvalSchedule } from '../scripts/cso-eval';
+import { assertProducerArtifactPath, PRODUCER_PROVIDER_POLICY, producerFailureMessage, producerProviderTimeoutMs, producerInstallationIdentity, resolveProducerHelperBinding, runProducerCell, sanitizeProducerRun, validateProductionProducerInstallation } from '../scripts/cso-eval-producer';
 import { producerArtifactInventoryHash, producerHostPlatform, producerInstallationIdentityHash, producerProviderIdentityHash, producerReceiptHash, sha256, type ProducerArtifactInventory, type ProducerInstallationIdentity, type ProducerProviderIdentity, type ProducerReceipt } from '../scripts/cso-eval-protocol';
 import type { Family, ProviderAdapter, RunOpts, RunResult } from './helpers/providers/types';
 import { CORPUS_VERSION, FAMILIES, STACKS, defineEvalCorpus, loadCorpusManifest, materializeCase, sourceFiles, sourceHash, validateCorpusManifest, type CorpusManifest, type EvalVariant } from './fixtures/cso-eval/materialize';
 import { judgeRepair, oracleFor, type PrivateEvidence } from './helpers/cso-eval-oracles';
 import { inspectPreparation } from '../lib/cso/preparation';
-import { assertRuntimeCompatible, RUNTIME_CATALOG } from '../lib/cso/runtime-catalog';
+import { assertRuntimeCompatible, CSO_HELPER_ABI, RUNTIME_CATALOG, type RuntimeCatalog } from '../lib/cso/runtime-catalog';
 import { canonicalStartPlan, canonicalTestPlan } from '../lib/cso/verification';
-import { CsoError } from '../lib/cso/contracts';
+import { canonical, CsoError } from '../lib/cso/contracts';
+import committedRuntimeCatalog from '../lib/cso/runtime-catalog.json';
+import buildInputs from '../lib/cso/images/build-inputs.json';
+import { imageBuildMatrix } from '../scripts/cso-image-matrix';
+import { evaluationCandidateCatalog } from '../scripts/cso-runtime-promotion';
+import { scan } from '../lib/redact-engine';
+import { redactProducerText, sourceCredentialValues } from '../scripts/cso-eval-output-redaction';
 import { geminiProducerPaths, geminiProducerSystemSettings } from './helpers/providers/gemini';
 
 const temporary: string[] = [];
+const randomHex = (bytes: number) => createHash('sha256').update(`${Math.random()}:${process.hrtime.bigint()}`).digest('hex').slice(0, bytes * 2);
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'cso-eval-')); temporary.push(path); return path; };
 function unlockTemporary(path: string): void {
   if (!existsSync(path)) return;
@@ -47,7 +54,7 @@ function syntheticResultFor(cell: EvalCell, manifest: CorpusManifest<string>): E
   const positive = cell.variant === 'vulnerable';
   const repairEvidenceHash = 'c'.repeat(64), recheckEvidenceHash = 'd'.repeat(64);
   return { cellId: cell.id, sourceHash: cell.sourceHash, skillHash: cell.skillHash, model: cell.model, host: cell.host, budgetSeconds: cell.budgetSeconds,
-    reportPresent: true, reportComplete: true,
+    reportPresent: true, reportFinished: true, reportComplete: true,
     findings: positive ? [{ id: 'finding-1', evidence: cell.version === 'v2' ? 'legacy_review' : 'supported', claimedTested: runtime && cell.version === 'v3', judgment: 'correct', matchedCaseId: cell.caseId,
       ...(runtime && cell.version === 'v3' ? { trustedVerification: { repair: 'passed' as const, repairEvidenceHash, recheck: 'passed' as const, recheckEvidenceHash } } : {}) }] : [],
     setup: runtime ? 'passed' : 'not_attempted', reproduction: runtime && positive ? 'passed' : 'not_attempted', repair: runtime && positive ? 'passed' : 'not_attempted', recheck: runtime && positive ? 'passed' : 'not_attempted',
@@ -199,14 +206,40 @@ describe('CSO matched evaluation accounting', () => {
     expect(group(score, 'v3', 'comprehensive').highCriticalRecall).toEqual({ numerator: 96, denominator: 96, value: 1 });
     expect(score.perStack.rails).toEqual({ correctHeldOutRepairs: 10, denominator: 10 });
   });
-  test('incomplete mandatory reports cannot contribute security evidence or qualify a complete matrix', () => {
+  test('finished partial reports count their findings and outcomes and satisfy the report gates; completeness stays its own measured rate', () => {
     const results = matrix.cells.map(syntheticResult);
     for (const result of results) result.reportComplete = false;
+    const score = scoreEval(matrix, results, qualification), daily = group(score, 'v3', 'daily'), comprehensive = group(score, 'v3', 'comprehensive');
+    expect(daily.reports).toEqual({ numerator: 0, denominator: 240, value: 0 });
+    expect(daily.finishedReports).toEqual({ numerator: 240, denominator: 240, value: 1 });
+    expect(daily.precision).toEqual({ numerator: 120, denominator: 120, value: 1 });
+    expect(comprehensive.highCriticalRecall).toEqual({ numerator: 96, denominator: 96, value: 1 });
+    expect(comprehensive.repair.numerator).toBe(comprehensive.repair.denominator);
+    expect(score.perStack.rails).toEqual({ correctHeldOutRepairs: 10, denominator: 10 });
+    expect(score.gates).toMatchObject({ comprehensiveHighCriticalRecall80: 'pass', dailyPrecision95: 'pass', mandatoryReports: 'pass', matchedCompleteMatrix: 'pass' });
+    expect(score.status).toBe('qualified');
+  });
+  test('one unfinished report fails both report gates even when every other report is finished', () => {
+    const results = matrix.cells.map(syntheticResult);
+    Object.assign(results[0], { reportComplete: false, reportFinished: false });
+    const score = scoreEval(matrix, results, qualification);
+    expect(score.gates).toMatchObject({ mandatoryReports: 'fail', matchedCompleteMatrix: 'fail' });
+    expect(score.status).toBe('partial');
+  });
+  test('running or missing reports contribute no security evidence and cannot qualify a complete matrix', () => {
+    const results = matrix.cells.map(syntheticResult);
+    results.forEach((result, index) => {
+      result.reportComplete = false; result.reportFinished = false;
+      if (index % 2) { result.reportPresent = false; result.findings = []; }
+    });
+    expect(() => scoreEval(matrix, [{ ...syntheticResult(matrix.cells[0]), reportFinished: false }], qualification)).toThrow('MISSING_EVAL_REPORT');
+    expect(() => scoreEval(matrix, [{ ...syntheticResult(matrix.cells[0]), reportPresent: false, reportComplete: false, findings: [] }], qualification)).toThrow('MISSING_EVAL_REPORT');
     const score = scoreEval(matrix, results, qualification), daily = group(score, 'v3', 'daily'), comprehensive = group(score, 'v3', 'comprehensive');
     expect(score.status).toBe('partial');
     expect(score.gates.matchedCompleteMatrix).toBe('fail');
     expect(score.gates.mandatoryReports).toBe('fail');
     expect(daily.reports).toEqual({ numerator: 0, denominator: 240, value: 0 });
+    expect(daily.finishedReports).toEqual({ numerator: 0, denominator: 240, value: 0 });
     expect(daily.precision).toEqual({ numerator: 0, denominator: 0, value: null });
     expect(daily.recall.numerator).toBe(0);
     expect(comprehensive.setup.numerator).toBe(0);
@@ -234,6 +267,11 @@ describe('CSO matched evaluation accounting', () => {
     const artifactTamper = structuredClone(first);
     artifactTamper.artifacts.totalBytes = 1;
     expect(() => collectProducerReceipts(matrix, syntheticSchedule(), [rehashReceipt(artifactTamper)])).toThrow('INVALID_PRODUCER_RECEIPT');
+
+    const timed = rehashReceipt({ ...structuredClone(first), toolTimeline: [{ atMs: 5, endMs: 9, tool: 'Bash', agent: 'main' }, { atMs: 7, tool: 'Agent', agent: 'subagent' }] });
+    expect(collectProducerReceipts(matrix, syntheticSchedule(), [timed]).receipts[0]).not.toHaveProperty('toolTimeline');
+    for (const entry of [{ atMs: 9, endMs: 5, tool: 'Bash', agent: 'main' }, { atMs: 1, tool: 'cat /secret', agent: 'main' }, { atMs: 1, tool: 'Bash', agent: 'main', input: 'x' }])
+      expect(() => collectProducerReceipts(matrix, syntheticSchedule(), [rehashReceipt({ ...structuredClone(first), toolTimeline: [entry] } as ProducerReceipt)])).toThrow('INVALID_PRODUCER_RECEIPT');
 
     const mixedInstallation = syntheticReceipt(cells[1]);
     mixedInstallation.installationIdentity = syntheticInstallationIdentity('different-installation');
@@ -278,6 +316,25 @@ describe('CSO matched evaluation accounting', () => {
     const two = syntheticResult(negative); two.findings.push({ id: 'false-positive', evidence: 'supported', claimedTested: false, judgment: 'incorrect' });
     expect(group(scoreEval(matrix, [one, two]), 'v3', 'daily').precision).toEqual({ numerator: 1, denominator: 3, value: 1 / 3 });
   });
+  test('confirmed incidental issues count once each for precision, declared instrumentation counts in neither term, and recall still needs the seeded issue', () => {
+    const positive = matrix.cells.find(item => item.version === 'v3' && item.mode === 'daily' && item.variant === 'vulnerable')!;
+    const negative = matrix.cells.find(item => item.version === 'v3' && item.mode === 'daily' && item.variant === 'fixed')!;
+    const key = (seed: string) => createHash('sha256').update(seed).digest('hex');
+    const one = syntheticResult(positive);
+    one.findings.push({ id: 'jwt', evidence: 'supported', claimedTested: false, judgment: 'incidental', incidentalKey: key('jwt') }, { id: 'jwt-again', evidence: 'supported', claimedTested: false, judgment: 'incidental', incidentalKey: key('jwt') });
+    one.findings.push({ id: 'canary', evidence: 'supported', claimedTested: false, judgment: 'instrumentation' }, { id: 'guess', evidence: 'hypothesis', claimedTested: false, judgment: 'incidental', incidentalKey: key('guess') });
+    const two = syntheticResult(negative);
+    two.findings.push({ id: 'admin', evidence: 'supported', claimedTested: false, judgment: 'incidental', incidentalKey: key('admin') }, { id: 'probe', evidence: 'supported', claimedTested: false, judgment: 'instrumentation' }, { id: 'noise', evidence: 'supported', claimedTested: false, judgment: 'incorrect' });
+    expect(() => scoreEval(matrix, [one])).toThrow('INVALID_FINDING_JUDGMENT');
+    one.findings.pop();
+    expect(group(scoreEval(matrix, [one, two]), 'v3', 'daily').precision).toEqual({ numerator: 3, denominator: 5, value: 3 / 5 });
+    const missed = syntheticResult(positive); missed.findings = [{ id: 'only-incidental', evidence: 'supported', claimedTested: false, judgment: 'incidental', incidentalKey: key('x') }];
+    expect(group(scoreEval(matrix, [missed]), 'v3', 'daily').recall.numerator).toBe(0);
+    for (const bad of [{ judgment: 'incidental' }, { judgment: 'incidental', incidentalKey: 'short' }, { judgment: 'incorrect', incidentalKey: key('y') }, { judgment: 'instrumentation', matchedCaseId: positive.caseId }, { judgment: 'incidental', incidentalKey: key('z'), matchedCaseId: positive.caseId }]) {
+      const result = syntheticResult(positive); result.findings.push({ id: 'bad', evidence: 'supported', claimedTested: false, ...bad } as EvalFinding);
+      expect(() => scoreEval(matrix, [result])).toThrow('INVALID_FINDING_JUDGMENT');
+    }
+  });
   test('producer tested claims require independent successful held-out repair evidence', () => {
     const cell = matrix.cells.find(item => item.version === 'v3' && item.mode === 'comprehensive' && item.variant === 'vulnerable')!;
     const result = syntheticResult(cell); delete result.oracleEvidenceHash;
@@ -290,6 +347,66 @@ describe('CSO matched evaluation accounting', () => {
     expect(group(score, 'v3', 'comprehensive').falseTested).toBe(1); expect(score.gates.zeroFalselyTestedRepairs).toBe('fail'); expect(score.status).toBe('partial');
     result.findings[1].trustedVerification = structuredClone(result.findings[0].trustedVerification);
     expect(() => scoreEval(matrix, results, qualification)).toThrow('DUPLICATE_TRUSTED_REPAIR_BINDING');
+  });
+  test('tested claims on declared instrumentation count in neither direction; an incidental claim needs a passing replay of its signed bundle', () => {
+    const key = (seed: string) => createHash('sha256').update(seed).digest('hex');
+    const vulnerable = matrix.cells.find(item => item.version === 'v3' && item.mode === 'comprehensive' && item.variant === 'vulnerable')!;
+    const fixed = matrix.cells.find(item => item.version === 'v3' && item.mode === 'comprehensive' && item.variant === 'fixed')!;
+    const daily = matrix.cells.find(item => item.version === 'v3' && item.mode === 'daily' && item.variant === 'fixed')!;
+    const score = (edit: (byId: Map<string, EvalResult>) => void) => {
+      const results = matrix.cells.map(syntheticResult), byId = new Map(results.map(result => [result.cellId, result]));
+      edit(byId);
+      return scoreEval(matrix, results, qualification);
+    };
+    const clean = score(() => {});
+    expect(clean.gates.zeroFalselyTestedRepairs).toBe('pass');
+    const incidental = (id: string, replay?: EvalFinding['trustedReplay']): EvalFinding => ({ id, evidence: 'supported', claimedTested: true, judgment: 'incidental', incidentalKey: key(id), ...(replay ? { trustedReplay: replay } : {}) });
+
+    const instrumented = score(byId => {
+      byId.get(fixed.id)!.findings.push({ id: 'canary-claim', evidence: 'supported', claimedTested: true, judgment: 'instrumentation' });
+      byId.get(daily.id)!.findings.push({ id: 'probe-claim', evidence: 'supported', claimedTested: true, judgment: 'instrumentation' });
+    });
+    expect(group(instrumented, 'v3', 'comprehensive').falseTested).toBe(0); expect(group(instrumented, 'v3', 'daily').falseTested).toBe(0);
+    expect(instrumented.gates.zeroFalselyTestedRepairs).toBe('pass');
+
+    const instrumentationOnly = score(byId => {
+      const result = byId.get(vulnerable.id)!, binding = result.findings[0].trustedVerification!;
+      result.findings = [{ id: 'canary-claim', evidence: 'supported', claimedTested: true, judgment: 'instrumentation', trustedVerification: structuredClone(binding) }];
+    });
+    const empty = score(byId => { byId.get(vulnerable.id)!.findings = []; }), baseline = group(clean, 'v3', 'comprehensive');
+    const sameAsNoFinding = (scored: ReturnType<typeof scoreEval>) => {
+      const actual = group(scored, 'v3', 'comprehensive'), none = group(empty, 'v3', 'comprehensive');
+      expect(actual.falseTested).toBe(0);
+      expect([actual.recall, actual.highCriticalRecall, actual.repair, actual.recheck]).toEqual([none.recall, none.highCriticalRecall, none.repair, none.recheck]);
+      expect(scored.perStack).toEqual(empty.perStack);
+      expect(actual.recall.numerator).toBe(baseline.recall.numerator - 1);
+      expect(actual.repair.numerator).toBe(baseline.repair.numerator - 1);
+    };
+    sameAsNoFinding(instrumentationOnly);
+
+    for (const [replay, expected] of [[undefined, 1], [{ result: 'missing' }, 1], [{ result: 'failed' }, 1], [{ result: 'passed', replayEvidenceHash: key('replay') }, 0]] as const) {
+      const scored = score(byId => byId.get(fixed.id)!.findings.push(incidental('jwt-claim', replay as EvalFinding['trustedReplay'])));
+      expect(group(scored, 'v3', 'comprehensive').falseTested).toBe(expected);
+      expect(scored.gates.zeroFalselyTestedRepairs).toBe(expected ? 'fail' : 'pass');
+    }
+    const replayedOnly = score(byId => { byId.get(vulnerable.id)!.findings = [incidental('admin-claim', { result: 'passed', replayEvidenceHash: key('admin') })]; });
+    sameAsNoFinding(replayedOnly);
+
+    const passed = { result: 'passed', replayEvidenceHash: key('r') } as const;
+    for (const bad of [
+      { id: 'on-correct', evidence: 'supported', claimedTested: true, judgment: 'correct', matchedCaseId: vulnerable.caseId, trustedReplay: passed },
+      { id: 'on-instrumentation', evidence: 'supported', claimedTested: true, judgment: 'instrumentation', trustedReplay: passed },
+      { id: 'on-incorrect', evidence: 'supported', claimedTested: true, judgment: 'incorrect', trustedReplay: { result: 'failed' } },
+      { ...incidental('unclaimed', passed), claimedTested: false },
+      incidental('no-hash', { result: 'passed' } as EvalFinding['trustedReplay']),
+      incidental('failed-hash', { result: 'failed', replayEvidenceHash: key('f') } as EvalFinding['trustedReplay']),
+      incidental('short-hash', { result: 'passed', replayEvidenceHash: 'abc' }),
+      incidental('extra-key', { ...passed, repair: 'passed' } as EvalFinding['trustedReplay']),
+      incidental('bad-result', { result: 'skipped' } as unknown as EvalFinding['trustedReplay']),
+    ] as EvalFinding[]) {
+      expect(() => score(byId => byId.get(vulnerable.id)!.findings.push(bad))).toThrow('INVALID_TRUSTED_REPLAY');
+    }
+    expect(() => score(byId => byId.get(fixed.id)!.findings.push(incidental('one', passed), incidental('two', passed)))).toThrow('DUPLICATE_TRUSTED_REPLAY_BINDING');
   });
   test('per-stack held-out repair requires the matching supported discovery', () => {
     const results = matrix.cells.map(syntheticResult);
@@ -428,6 +545,52 @@ describe('CSO release profile on an injected corpus', () => {
     expect(() => scoreCollectedEval(release, syntheticBatch(), results, qualification, privateManifest)).toThrow('INVALID_PRODUCER_BATCH');
     expect(() => scoreEval(release, [syntheticResult(publicCell)], qualification, privateManifest)).toThrow('UNKNOWN_OR_DUPLICATE_EVAL_RESULT');
   });
+  test('artifact inventories need unique paths in the order their identity hash binds, including 1.91.75 locale order', () => {
+    const release = createEvalMatrix(releaseOptions, privateManifest), schedule = syntheticSchedule(release), cell = release.cells[0];
+    const withEntries = (paths: string[]) => {
+      const receipt = syntheticReceipt(cell), entries = paths.map(path => ({ path: `${'e'.repeat(24)}/1791702612575-${'a'.repeat(16)}/${path}`, sha256: sha256(path), bytes: 1 }));
+      const base = { schemaVersion: 1 as const, root: 'security/cso' as const, entries, totalBytes: entries.length };
+      receipt.artifacts = { ...base, identityHash: producerArtifactInventoryHash(base) };
+      return rehashReceipt(receipt);
+    };
+    for (const order of [['README.md', 'package.json', 'snapshot.json', 'snapshot/x'], ['package.json', 'README.md', 'snapshot.json', 'snapshot/x']]) {
+      expect(collectProducerReceipts(release, schedule, [withEntries(order)], privateManifest).summary.submitted).toBe(1);
+    }
+    expect(() => collectProducerReceipts(release, schedule, [withEntries(['README.md', 'package.json', 'README.md'])], privateManifest)).toThrow('INVALID_PRODUCER_RECEIPT');
+  });
+  test('platforms whose evaluation catalogs differ only in qualification time match when the embedded bodies prove it', () => {
+    const staged = imageBuildMatrix(buildInputs).include.map(row => ({
+      schemaVersion: 1, helperAbi: CSO_HELPER_ABI, state: 'staged', verifiedProvenance: true, buildRevision: row.inputRevision, runtimeId: row.runtimeId, stack: row.stack, platform: row.platform,
+      image: `ghcr.io/garrytan/gstack/cso-staging/${row.stack}-${row.arch}@sha256:${sha256(row.runtimeId)}`, versions: row.versions, sourceCommit: 'a'.repeat(40),
+      workflow: 'https://github.com/garrytan/gstack/actions/runs/123456', sbomDigest: `sha256:${sha256(`sbom:${row.runtimeId}`)}`, provenanceDigest: `sha256:${sha256(`provenance:${row.runtimeId}`)}`,
+      qualification: 'pending native and private release gates; no automatic promotion',
+    }));
+    const [amdCatalog, armCatalog] = ['2026-10-11T07:05:29.256Z', '2026-10-11T07:05:32.067Z'].map(at => evaluationCandidateCatalog(committedRuntimeCatalog, buildInputs, staged, at));
+    const release = createEvalMatrix(releaseOptions, privateManifest), schedule = syntheticSchedule(release);
+    const amd = release.cells.find(cell => cell.platform === 'linux/amd64')!, arm = release.cells.find(cell => cell.platform === 'linux/arm64')!;
+    const embedding = (cell: EvalCell, catalog: RuntimeCatalog) => {
+      const receipt = syntheticReceipt(cell), { identityHash: _hash, ...identity } = receipt.installationIdentity;
+      identity.embeddedCatalogs = { ...identity.embeddedCatalogs, runtimeRevision: catalog.revision, runtimeSha256: sha256(JSON.stringify(catalog)) };
+      receipt.installationIdentity = { ...identity, identityHash: producerInstallationIdentityHash(identity) };
+      return rehashReceipt(receipt);
+    };
+    const receipts = [embedding(amd, amdCatalog), embedding(arm, armCatalog)];
+    expect(() => collectProducerReceipts(release, schedule, receipts, privateManifest)).toThrow('UNMATCHED_PRODUCER_INSTALLATIONS');
+    const batch = collectProducerReceipts(release, schedule, receipts, privateManifest, [armCatalog, amdCatalog]);
+    expect(batch.embeddedCatalogs).toEqual([armCatalog, amdCatalog]);
+    expect(collectProducerReceipts(release, schedule, [embedding(amd, amdCatalog), embedding(arm, amdCatalog)], privateManifest).embeddedCatalogs).toBeUndefined();
+    const complete = collectProducerReceipts(release, schedule, release.cells.map(cell => embedding(cell, cell.platform === 'linux/amd64' ? amdCatalog : armCatalog)), privateManifest, [amdCatalog, armCatalog]);
+    const results = release.cells.map(cell => ({ ...syntheticResultFor(cell, privateManifest), producerReceiptHash: complete.receipts.find(receipt => receipt.cell.id === cell.id)!.receiptHash }));
+    expect(scoreCollectedEval(release, complete, results, qualification, privateManifest).groups.every(item => item.submitted === item.cells)).toBe(true);
+    const { batchHash: _batchHash, embeddedCatalogs: _catalogs, ...stripped } = complete;
+    expect(() => scoreCollectedEval(release, { ...stripped, batchHash: sha256(JSON.stringify(stripped)) }, results, qualification, privateManifest)).toThrow('UNMATCHED_PRODUCER_INSTALLATIONS');
+    const movedImage = structuredClone(armCatalog); movedImage.runtimes[0].image = movedImage.runtimes[0].image.replace(/@sha256:.{8}/, '@sha256:00000000');
+    movedImage.evaluation!.evidenceDigest = `sha256:${sha256(canonical(movedImage.runtimes))}`;
+    for (const bodies of [[amdCatalog], [amdCatalog, amdCatalog], [amdCatalog, movedImage]]) {
+      const tampered = bodies.includes(movedImage) ? [embedding(amd, amdCatalog), embedding(arm, movedImage)] : receipts;
+      expect(() => collectProducerReceipts(release, schedule, tampered, privateManifest, bodies)).toThrow('UNMATCHED_PRODUCER_INSTALLATIONS');
+    }
+  });
   test('identity checks hold per platform and require shared catalogs and provider policy across platforms', () => {
     const release = createEvalMatrix(releaseOptions, privateManifest), schedule = syntheticSchedule(release);
     const amd = release.cells.filter(cell => cell.platform === 'linux/amd64'), arm = release.cells.find(cell => cell.platform === 'linux/arm64')!;
@@ -464,6 +627,17 @@ describe('CSO release profile on an injected corpus', () => {
     }
     const regressed = scoreCollectedEval(release, batch, results, qualification, privateManifest, baseline);
     expect(regressed.gates.noHighCriticalRecallRegression).toBe('fail'); expect(regressed.baseline!.highCriticalRecall.value).toBe(1);
+  });
+  test('a baseline finds a seeded issue in a finished partial report, never in a running or missing one', () => {
+    const vulnerable: string[] = [];
+    const baseline = privateBaseline((results, cells) => {
+      const indexes = cells.flatMap((cell, index) => cell.variant === 'vulnerable' ? [index] : []).slice(0, 3);
+      vulnerable.push(...indexes.map(index => cells[index].caseId));
+      results[indexes[0]].reportComplete = false;
+      Object.assign(results[indexes[1]], { reportComplete: false, reportFinished: false });
+      Object.assign(results[indexes[2]], { reportComplete: false, reportFinished: false, reportPresent: false, findings: [] });
+    });
+    expect(vulnerable.map(caseId => baseline.cases.find(entry => entry.caseId === caseId)!.found)).toEqual([true, false, false]);
   });
   test('baseline records refuse incomplete or unadjudicated runs and baseline matrices never qualify', () => {
     expect(() => privateBaseline(results => { results.pop(); })).toThrow('INCOMPLETE_EVAL_BASELINE');
@@ -526,6 +700,8 @@ describe('CSO matched producer orchestration', () => {
     testProviderCommand: providerCommandFor(launcher),
   });
 
+  // The helper's real layout: `<repoId>/<epoch ms>-<hex>`; the secret redactor reads that epoch as a phone number.
+  const helperRun = `${'e'.repeat(24)}/${Date.now()}-${'0123456789abcdef'}`;
   class FakeAdapter implements ProviderAdapter {
     readonly name = 'fake';
     constructor(
@@ -544,7 +720,7 @@ describe('CSO matched producer orchestration', () => {
 
   test('pins reviewed provider CLI versions and policy identities', () => {
     expect(PRODUCER_PROVIDER_POLICY).toEqual({
-      claude: { family: 'claude', policyRevision: 'claude-2.1.263-cso-v1', version: '2.1.263 (Claude Code)' },
+      claude: { family: 'claude', policyRevision: 'claude-2.1.263-cso-v2', version: '2.1.263 (Claude Code)' },
       codex: { family: 'gpt', policyRevision: 'codex-0.153.4-cso-v3-generation', version: 'codex-cli 0.153.4' },
       gemini: { family: 'gemini', policyRevision: 'gemini-0.59.0-cso-v1', version: '0.59.0' },
     });
@@ -729,7 +905,7 @@ describe('CSO matched producer orchestration', () => {
       expect(existsSync(input)).toBe(false);
       expect(opts).toMatchObject({
         model: cell.model,
-        timeoutMs: cell.budgetSeconds * 1000,
+        timeoutMs: (cell.budgetSeconds + 300) * 1000,
         workdir: join(isolated.job, 'state'),
         csoProducer: {
           stateDirectory: join(isolated.job, 'state'),
@@ -751,7 +927,7 @@ describe('CSO matched producer orchestration', () => {
       expect(opts.prompt).not.toContain(cell.caseId);
       expect(opts.prompt).not.toContain(cell.variant);
       expect(opts.prompt).not.toContain('ORACLE_SQL_MARKER');
-      const artifactRoot = join(process.env.GSTACK_HOME!, 'security', 'cso', 'run-1');
+      const artifactRoot = join(process.env.GSTACK_HOME!, 'security', 'cso', helperRun);
       mkdirSync(artifactRoot, { recursive: true });
       writeFileSync(join(artifactRoot, 'report.json'), '{"status":"complete"}\n');
       writeFileSync(join(artifactRoot, 'repair.patch'), 'diff --git a/app.mjs b/app.mjs\n');
@@ -780,10 +956,10 @@ describe('CSO matched producer orchestration', () => {
     expect(receipt.providerIdentity).toEqual(providerIdentityFor('gpt', launcher));
     expect(receipt.artifacts).toMatchObject({ schemaVersion: 1, root: 'security/cso' });
     expect(receipt.artifacts.totalBytes).toBe(receipt.artifacts.entries.reduce((sum, entry) => sum + entry.bytes, 0));
-    expect(receipt.artifacts.entries.map(entry => entry.path)).toEqual(['run-1/repair.patch', 'run-1/report.json']);
+    expect(receipt.artifacts.entries.map(entry => entry.path)).toEqual([`${helperRun}/repair.patch`, `${helperRun}/report.json`]);
     expect(receipt.artifacts.identityHash).toBe(producerArtifactInventoryHash({ schemaVersion: 1, root: 'security/cso', entries: receipt.artifacts.entries, totalBytes: receipt.artifacts.totalBytes }));
     const retainedHome = join(isolated.job, 'state', 'cso-home');
-    expect(readFileSync(join(retainedHome, 'security', 'cso', 'run-1', 'report.json'), 'utf8')).toContain('complete');
+    expect(readFileSync(join(retainedHome, 'security', 'cso', helperRun, 'report.json'), 'utf8')).toContain('complete');
     expect(receipt.artifacts.entries.every(entry => !/provider|credential|session/i.test(entry.path))).toBe(true);
     expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual(receipt);
     const { receiptHash, ...receiptWithoutHash } = receipt;
@@ -892,25 +1068,124 @@ describe('CSO matched producer orchestration', () => {
       expect(receipt.status).toBe('failed');
       expect(receipt.output).toBe('[sensitive producer output redacted]');
       expect(receipt.outputHash).toBe(sha256(receipt.output));
-      expect(receipt.error).toEqual({ code: 'unknown', reason: 'Sensitive producer output or error withheld' });
+      expect(receipt.error).toEqual({ code: 'unknown', reason: 'Sensitive producer output or error withheld: credential-class rule openai.key×1' });
       const stored = readFileSync(receiptPath, 'utf8');
       expect(stored).not.toContain('sk-proj-');
       expect(stored).not.toContain('b'.repeat(40));
     }
   });
 
-  test('withholds the receipt when the bound provider executable changes during a cell', async () => {
+  test('withholds a source canary quoted without its credential name, whole or split across output and error', () => {
+    const source = join(root(), 'canary-source'), canary = `cso_${randomHex(10)}_${randomHex(10)}`;
+    mkdirSync(join(source, 'test'), { recursive: true });
+    writeFileSync(join(source, '.env'), `API_TOKEN=${canary}\nNODE_ENV=production\n`);
+    writeFileSync(join(source, 'test', 'canary.txt'), `${canary}\n`);
+    const credentials = sourceCredentialValues(source, ['.env', 'test/canary.txt']);
+    expect(credentials).toEqual([canary]);
+    const base = { output: '', modelUsed: 'm', durationMs: 1, toolCalls: 1, tokens: { input: 1, output: 1 } } as RunResult;
+    expect(sanitizeProducerRun({ ...base, output: `The token is ${canary}` }, [])).toMatchObject({ output: `The token is ${canary}` });
+    for (const run of [{ ...base, output: `The token is ${canary}.` }, { ...base, output: canary.slice(0, 12), error: { code: 'unknown', reason: canary.slice(12) } }] as RunResult[]) {
+      const sanitized = sanitizeProducerRun(run, credentials);
+      expect(sanitized).toMatchObject({ output: '[sensitive producer output redacted]', error: { reason: 'Sensitive producer output or error withheld: credential-class rule source.env.kv×1' } });
+      expect(JSON.stringify(sanitized)).not.toContain(canary);
+    }
+  });
+
+  test('keeps a succeeded run that quotes helper identifiers, span-redacts PII shapes, and fails credential-class output by rule', async () => {
+    const runId = `${Date.now()}-${randomHex(8)}`;
+    let walletShaped = '';
+    while (!walletShaped) { const id = randomHex(16); if (redactProducerText(`review ${id}`).text === `review ${id}` && scan(id).findings.some(finding => finding.id === 'pii.wallet')) walletShaped = id; }
+    expect(scan(runId).findings.map(finding => finding.id)).toContain('pii.phone.e164');
+    const report = [
+      `complete — run ${runId}, catalog cso-eval-38078005392-${randomHex(6)}, scanner artifact gitleaks-${randomHex(8)}-${randomHex(8)}.`,
+      `Finding ${randomHex(16)} reviewed by ${walletShaped}; snapshot ${randomHex(32)}.`,
+      'The /health-hooks route connects to 169.254.169.254:80.',
+    ].join('\n');
+    const run = async (name: string, output: string) => {
+      const destination = join(root(), `${name}-prepared`), cell = selected[0];
+      prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+      const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+      return runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output }), paidExecutionAuthorized: true }));
+    };
+    const kept = await run('helper-ids', report);
+    expect(kept.status).toBe('succeeded');
+    expect(kept.error).toBeUndefined();
+    expect(kept.output).toBe(report.replace('169.254.169.254', '<REDACTED-pii.phone.e164>'));
+    const envLine = `API_TOKEN=cso_${randomHex(12)}_${randomHex(12)}`;
+    const key = `sk-ant-api03-${randomHex(40)}`;
+    for (const [name, leak, rule] of [['env-line', envLine, 'env.kv×1'], ['credential', key, 'anthropic.key×1']] as const) {
+      const failed = await run(name, `${report}\n${leak}`);
+      expect(failed).toMatchObject({ status: 'failed', output: '[sensitive producer output redacted]', error: { code: 'unknown', reason: `Sensitive producer output or error withheld: credential-class rule ${rule}` }, usage: { inputTokens: 120 } });
+      expect(JSON.stringify(failed)).not.toContain(leak);
+    }
+  });
+
+  test('collects and scores real receipts of every kind: succeeded, span-redacted, credential-withheld, timeout and post-run check failure', async () => {
+    const platform = producerHostPlatform();
+    if (!platform) return;
+    const launcher = helperBundle(), runId = `${Date.now()}-${randomHex(8)}`, run = `${'e'.repeat(24)}/${runId}`;
+    const helperFiles = ['readable/.env', 'readable/README.md', 'report.json', 'report.md', `scanner-outcomes/gitleaks-${randomHex(8)}-${randomHex(8)}.json`, 'snapshot.json', 'snapshot/README.md', 'snapshot/package.json'];
+    const kinds: Array<[string, Partial<RunResult>, ((source: string) => void)?]> = [
+      ['succeeded', {}],
+      ['span-redacted', { output: `complete — run ${runId}; /health-hooks reaches 169.254.169.254:80` }],
+      ['credential-withheld', { output: `complete — quoted sk-ant-api03-${randomHex(40)}` }],
+      ['timeout', { output: 'last assistant text before the kill', error: { code: 'timeout', reason: 'exceeded 2100000ms' } }],
+      ['post-run-check-failed', {}, source => { const file = join(source, 'src', 'app.txt'); chmodSync(file, 0o644); writeFileSync(file, 'changed by producer\n'); chmodSync(file, 0o444); }],
+    ];
+    const produce = async (target: EvalMatrix, payloads: Partial<Record<'v2' | 'v3', string>>) => {
+      const prepared = join(root(), 'prepared'), schedule = prepareEvalJobs(target, payloads, prepared, undefined, privateCorpus);
+      const receipts: ProducerReceipt[] = [];
+      for (const [index, cell] of target.cells.entries()) {
+        const [, outcome, mutate] = kinds[index % kinds.length], isolated = isolate(prepared, cell);
+        const adapter = new FakeAdapter(opts => {
+          for (const file of helperFiles) { const path = join(process.env.GSTACK_HOME!, 'security', 'cso', run, file); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, `${file}\n`); }
+          mutate?.(opts.csoProducer!.sourceDirectory);
+        }, 'gpt-5.4', 'gpt', outcome);
+        receipts.push(await runProducerCell(isolated.input, join(root(), `${cell.id}.json`), withHelper({ adapter, paidExecutionAuthorized: true }, launcher)));
+      }
+      return { schedule, receipts, results: target.cells.map(cell => ({ ...syntheticResultFor(cell, privateManifest), producerReceiptHash: receipts.find(receipt => receipt.cellRef === cell.id)!.receiptHash })) };
+    };
+    const platforms = Object.fromEntries(privateManifest.cases.map(fixture => [fixture.id, platform]));
+    const baselineMatrix = createEvalMatrix({ profile: 'baseline', model: 'exact-eval-model', host: 'codex', skillHashes: { v2: sha256(skills.v2) }, platforms: { comprehensive: platforms } }, privateManifest);
+    const baseline = await produce(baselineMatrix, { v2: skills.v2 });
+    expect(baseline.receipts.slice(0, kinds.length).map(receipt => [receipt.status, receipt.error?.code ?? null, receipt.artifacts.entries.length])).toEqual([
+      ['succeeded', null, 8], ['succeeded', null, 8], ['failed', 'unknown', 8], ['failed', 'timeout', 8], ['failed', 'INVALID_PRODUCER_SOURCE', 0],
+    ]);
+    expect(baseline.receipts[0].artifacts.entries.map(entry => entry.path)).toEqual(helperFiles.map(file => `${run}/${file}`));
+    expect(baseline.receipts[1].output).toBe(`complete — run ${runId}; /health-hooks reaches <REDACTED-pii.phone.e164>:80`);
+    expect(baseline.receipts[2]).toMatchObject({ output: '[sensitive producer output redacted]', error: { reason: 'Sensitive producer output or error withheld: credential-class rule anthropic.key×1' } });
+    const baselineBatch = collectProducerReceipts(baselineMatrix, baseline.schedule, baseline.receipts, privateManifest);
+    expect(baselineBatch.summary.groups).toMatchObject([{ version: 'v2', mode: 'comprehensive', scheduled: 16, submitted: 16, succeeded: 7, failed: 9 }]);
+    const recorded = createEvalBaseline(baselineMatrix, baselineBatch, baseline.results, privateManifest);
+    expect(recorded.baselineHash).toMatch(/^[a-f0-9]{64}$/);
+    const succeeded = new Set(baseline.receipts.filter(receipt => receipt.status === 'succeeded').map(receipt => receipt.cellRef));
+    const vulnerableCell = (caseId: string) => baselineMatrix.cells.find(cell => cell.caseId === caseId && cell.variant === 'vulnerable')!.id;
+    expect(recorded.cases.map(item => item.found)).toEqual(recorded.cases.map(item => succeeded.has(vulnerableCell(item.caseId))));
+    expect(recorded.cases.some(item => item.found) && recorded.cases.some(item => !item.found)).toBe(true);
+    const releaseMatrix = createEvalMatrix({ profile: 'release', model: 'exact-eval-model', host: 'codex', skillHashes: { v3: sha256(skills.v3) }, platforms: { daily: platform, comprehensive: platforms } }, privateManifest);
+    const release = await produce(releaseMatrix, { v3: skills.v3 });
+    const scored = scoreCollectedEval(releaseMatrix, collectProducerReceipts(releaseMatrix, release.schedule, release.receipts, privateManifest), release.results, { containment: {} }, privateManifest);
+    expect(scored.groups.map(item => [item.version, item.mode, item.submitted])).toEqual([['v3', 'daily', 16], ['v3', 'comprehensive', 16]]);
+  }, 120_000);
+
+  const expectIntegrityReceipt = (receipt: ProducerReceipt, receiptPath: string, error: { code: string; reason: string }) => {
+    expect(receipt).toMatchObject({ status: 'failed', error, output: '', outputHash: sha256(''), durationMs: 1234, toolCalls: 4, usage: { inputTokens: 120, outputTokens: 30, cachedTokens: 10, estimatedCostUSD: 0.0042 } });
+    expect(receipt.artifacts.entries).toEqual([]);
+    expect(JSON.parse(readFileSync(receiptPath, 'utf8'))).toEqual(receipt);
+  };
+
+  test('records a failed receipt with usage when the bound provider executable changes during a cell', async () => {
     const destination = join(root(), 'provider-race-prepared'), cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
     const isolated = isolate(destination, cell), launcher = helperBundle();
     const outputRoot = join(root(), 'provider-race-receipts'); mkdirSync(outputRoot);
     const receiptPath = join(outputRoot, `${cell.id}.json`);
     const adapter = new FakeAdapter(opts => writeFileSync(opts.csoProducer!.providerCommand.executable, '#!/bin/sh\nexit 1\n'));
-    await expect(runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher))).rejects.toThrow('PRODUCER_PROVIDER_INSTALLATION_RACE');
-    expect(existsSync(receiptPath)).toBe(false);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_PROVIDER_INSTALLATION_RACE', reason: 'provider installation check: provider executable changed during the run' });
   });
 
-  test('withholds the receipt when the helper generation changes during a cell', async () => {
+  test('records a failed receipt with usage when the helper generation changes during a cell', async () => {
     const destination = join(root(), 'helper-generation-race-prepared'), cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
     const isolated = isolate(destination, cell), launcher = helperBundle();
@@ -921,8 +1196,91 @@ describe('CSO matched producer orchestration', () => {
       writeFileSync(core, process.platform === 'win32' ? 'new test executable\n' : '#!/bin/sh\nexit 1\n', { mode: 0o755 });
       writeFileSync(opts.csoProducer!.helperGeneration, `${sha256(readFileSync(core))}\n`);
     });
-    await expect(runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher))).rejects.toThrow('PRODUCER_HELPER_GENERATION_CHANGED');
-    expect(existsSync(receiptPath)).toBe(false);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_HELPER_GENERATION_CHANGED', reason: 'helper installation check: installed helper identity changed during the run' });
+  });
+
+  test('records a failed receipt with usage when the provider output exceeds the limit', async () => {
+    const destination = join(root(), 'output-limit-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const output = 'x'.repeat(32 * 1024 * 1024 + 1);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output }), paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_OUTPUT_TOO_LARGE', reason: `output size check: output is ${output.length} bytes; the limit is ${32 * 1024 * 1024}` });
+  });
+
+  test('accepts real helper artifact names the secret redactor misreads, and names the check that rejects the rest', async () => {
+    const { redact } = await import('../lib/cso/process');
+    const runId = `${Date.now()}-${'0123456789abcdef'}`;
+    let walletShaped = '';
+    while (!walletShaped) { const id = randomHex(16); if (redact(id) !== id) walletShaped = id; }
+    expect(redact(runId)).not.toBe(runId);
+    const repo = 'e'.repeat(24);
+    let closure = '';
+    while (!closure) { const name = `${randomHex(32)}-before-${randomHex(8)}.json`; if (redact(name) !== name) closure = name; }
+    let helperFindingClosure = '';
+    while (!helperFindingClosure) { const name = `${randomHex(16)}-after-${randomHex(8)}.json`; if (redact(name) !== name) helperFindingClosure = name; }
+    const accepted = [`${repo}/${runId}/report.json`, `${repo}/${runId}/reviews/${walletShaped}.json`, `${repo}/${runId}/scanner-outcomes/gitleaks-${randomHex(8)}-${randomHex(8)}.json`,
+      `${repo}/${runId}/dependency-closures/${closure}`, `${repo}/${runId}/dependency-closures/${closure.replace('-before-', '-after-')}`,
+      `${repo}/${runId}/dependency-closures/${helperFindingClosure}`, `${repo}/${runId}/dependency-closures/${helperFindingClosure.replace('-after-', '-before-')}`,
+      `${repo}/${runId}/snapshot/test/fixtures/cso-canary-token.txt`, 'public-cache/osv/index.json'];
+    for (const path of accepted) expect(() => assertProducerArtifactPath(path)).not.toThrow();
+    for (const [path, message] of [
+      [`run-1/report.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact lies outside'],
+      [`${repo}/report.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact lies outside'],
+      [`${repo}/${runId}/bad name.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact path has a component outside'],
+    ] as const) expect(() => assertProducerArtifactPath(path)).toThrow(message);
+    expect(() => assertProducerArtifactPath(`${repo}/${runId}/dependency-closures/${closure.replace('-before-', '-during-')}`)).toThrow('looks like a secret');
+    expect(() => assertProducerArtifactPath(`${repo}/${runId}/dependency-closures/${helperFindingClosure.replace('-after-', '-during-')}`)).toThrow('looks like a secret');
+    const planted = `sk-ant-api03-${randomHex(24)}`;
+    expect(redact(planted)).not.toBe(planted);
+    let failure: unknown;
+    try { assertProducerArtifactPath(`${repo}/${runId}/notes/${planted}.txt`); } catch (error) { failure = error; }
+    expect((failure as CsoError).code).toBe('REDACTION_FAILED');
+    expect((failure as Error).message).toBe('artifact path component 4 under "ID/ID/notes" looks like a secret; the component is withheld');
+    const destination = join(root(), 'planted-artifact-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const adapter = new FakeAdapter(() => {
+      const directory = join(process.env.GSTACK_HOME!, 'security', 'cso', repo, runId, 'notes');
+      mkdirSync(directory, { recursive: true }); writeFileSync(join(directory, `${planted}.txt`), 'x');
+    }, 'gpt-5.4', 'gpt', { error: { code: 'timeout', reason: 'exceeded 1ms' } });
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'REDACTION_FAILED', reason: 'artifact inventory check: artifact path component 4 under "ID/ID/notes" looks like a secret; the component is withheld; the provider run also failed (timeout)' });
+    expect(readFileSync(receiptPath, 'utf8')).not.toContain(planted);
+  });
+
+  test('gives the provider the budget plus the reporting grace and keeps a timed-out run\'s usage and last result', async () => {
+    expect(producerProviderTimeoutMs(1800)).toBe(2100 * 1000);
+    const destination = join(root(), 'timeout-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const adapter = new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output: 'last assistant text before the kill', error: { code: 'timeout', reason: 'exceeded 2100000ms' } });
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expect(receipt).toMatchObject({ status: 'failed', error: { code: 'timeout', reason: 'exceeded 2100000ms' }, output: 'last assistant text before the kill', toolCalls: 4, usage: { inputTokens: 120, outputTokens: 30, cachedTokens: 10, estimatedCostUSD: 0.0042 } });
+  });
+
+  test('names the first offending source path and rule in a failed receipt that keeps usage', async () => {
+    if (process.platform === 'win32') return;
+    const writable = (directory: string, change: () => void) => { chmodSync(directory, 0o755); try { change(); } finally { chmodSync(directory, 0o555); } };
+    const cases: Array<[string, (source: string, outside: string) => void, string]> = [
+      ['mount-point', source => writable(source, () => writeFileSync(join(source, '.mcp.json'), '', { mode: 0o444 })), '".mcp.json" is not in the expected source listing'],
+      ['missing', source => writable(source, () => rmSync(join(source, 'app.mjs'))), '"app.mjs" is missing from the source'],
+      ['hard-link', (source, outside) => linkSync(join(source, 'app.mjs'), join(outside, 'app.mjs')), '"app.mjs" has 2 hard links; expected 1'],
+      ['content', source => {
+        const file = join(source, 'app.mjs'), size = statSync(file).size;
+        chmodSync(file, 0o644); writeFileSync(file, 'y'.repeat(size)); chmodSync(file, 0o444);
+      }, '"app.mjs" does not match its expected sha256'],
+    ];
+    for (const [name, mutate, reason] of cases) {
+      const destination = join(root(), `${name}-prepared`), cell = selected[0], outside = root();
+      const schedule = prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+      const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+      const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(opts => mutate(opts.csoProducer!.sourceDirectory, outside)), paidExecutionAuthorized: true }));
+      expectIntegrityReceipt(receipt, receiptPath, { code: 'INVALID_PRODUCER_SOURCE', reason: `source content check: ${reason}` });
+      const group = collectProducerReceipts(producerMatrix, schedule, [receipt]).summary.groups.find(item => item.version === cell.version && item.mode === cell.mode);
+      expect(group).toMatchObject({ submitted: 1, succeeded: 0, failed: 1, estimatedCost: { measured: 1, totalUSD: 0.0042 } });
+    }
   });
 
   test('fails closed without a receipt or raw console reason when redaction cannot inspect output', async () => {
@@ -986,7 +1344,7 @@ describe('CSO matched producer orchestration', () => {
     expect(written).not.toMatch(/caseId|variant|vulnerable|"fixed"/); expect(written).not.toContain(native.caseId);
   });
 
-  test('seals source read-only and withholds a receipt after a mode/content mutation', async () => {
+  test('seals source read-only and records a failed receipt after a mode/content mutation', async () => {
     const destination = join(root(), 'prepared');
     const cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
@@ -1004,8 +1362,10 @@ describe('CSO matched producer orchestration', () => {
       }
       writeFileSync(join(source, 'app.mjs'), 'changed by producer\n');
     });
-    await expect(runProducerCell(isolated.input, receipt, withHelper({ adapter, paidExecutionAuthorized: true }))).rejects.toThrow(process.platform === 'win32' ? 'INVALID_PRODUCER_SOURCE' : 'PRODUCER_CHANGED_SOURCE_MODE');
+    const written = await runProducerCell(isolated.input, receipt, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(written, receipt, process.platform === 'win32'
+      ? { code: 'INVALID_PRODUCER_SOURCE', reason: `source content check: "app.mjs" is ${'changed by producer\n'.length} bytes; expected ${Buffer.byteLength(original)}` }
+      : { code: 'PRODUCER_CHANGED_SOURCE_MODE', reason: 'source modes check: "app.mjs" has mode 644; expected 444' });
     expect(readFileSync(join(isolated.source, 'app.mjs'), 'utf8')).not.toBe(original);
-    expect(existsSync(receipt)).toBe(false);
   });
 });

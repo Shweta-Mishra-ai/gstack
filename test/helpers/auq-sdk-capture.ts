@@ -251,7 +251,8 @@ export function detectSectionReads(toolCalls: SkillTestResult['toolCalls'], sect
       while (overlap > 0 && !text.endsWith(next.slice(0, overlap))) overlap--;
       return text + next.slice(overlap);
     }, '');
-    if (lines.length && lines.every(line => printed.has(line) || joined.includes(line))) readSections.add(name);
+    const abutted = outputs.join('');
+    if (lines.length && lines.every(line => printed.has(line) || joined.includes(line) || abutted.includes(line))) readSections.add(name);
   }
   return readSections;
 }

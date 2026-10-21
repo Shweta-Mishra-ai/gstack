@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { inspectPreparation, railsTestConfiguration } from '../lib/cso/preparation';
@@ -59,6 +59,17 @@ describe('CSO inert Node preparation', () => {
     const plan = inspectPreparation(fixture(nodeFiles(1)));
     expect(plan.prerequisites[0].code).toBe('UNSUPPORTED_LOCK'); expect(plan.acquisition).toEqual([]); expect(plan.metadata).toEqual([]);
   });
+  // npm 11 refuses one file loaded as both user and global config ("double-loading config").
+  test('every npm command loads distinct empty user and global configs', () => {
+    const plan = inspectPreparation(fixture(nodeFiles(3)));
+    const npm = [...plan.acquisition, ...plan.offline].filter(command => command.executable === '/usr/local/bin/npm');
+    expect(npm.length).toBeGreaterThanOrEqual(3);
+    for (const command of npm) {
+      const value = (flag: string) => command.args[command.args.indexOf(flag) + 1];
+      expect([value('--userconfig'), value('--globalconfig')]).toEqual(['/opt/cso/empty-config', '/opt/cso/empty-globalconfig']);
+    }
+    expect(readFileSync(join(import.meta.dir, '../lib/cso/images/node.Dockerfile'), 'utf8')).toContain('touch /opt/cso/empty-config /opt/cso/empty-globalconfig');
+  });
   for (const url of [CREDENTIAL_ARCHIVE_URL, 'http://registry.npmjs.org/a.tgz', 'https://registry.npmjs.org.evil.invalid/a.tgz', 'https://127.0.0.1/a.tgz', 'git+ssh://github.com/a/b', 'https://registry.npmjs.org/a.tgz?token=secret']) test(`rejects non-public archive ${url.split('@').at(-1)}`, () => {
     const files = nodeFiles(); files['package-lock.json'].packages['node_modules/cookie'].resolved = url;
     const plan = inspectPreparation(fixture(files)); expect(plan.status).toBe('prerequisites'); expect(plan.acquisition).toEqual([]);
@@ -116,6 +127,12 @@ describe('CSO inert Python preparation', () => {
     expect(plan.acquisition[0].args).toContain('--only-binary=:all:'); expect(plan.acquisition[0].args).toContain('--require-hashes');
     expect(plan.metadata).toHaveLength(1); expect(plan.offline[1].args).toContain('--no-index');
   });
+  test('offline Python preparation writes reproducible checked-hash bytecode', () => {
+    const plan = inspectPreparation(fixture({ 'requirements.txt': `Flask==3.1.0 --hash=sha256:${hash}\n` }));
+    expect(plan.status).toBe('ready');
+    // venv/ensurepip and pip compile .pyc files; without a fixed epoch each preparation differs and replay cannot match.
+    for (const command of plan.offline) expect(command.env.SOURCE_DATE_EPOCH).toMatch(/^[0-9]+$/);
+  });
   for (const requirement of ['flask>=3', '-e .', 'flask @ https://evil.invalid/x.whl', '--index-url https://evil.invalid', '-r other.txt', 'flask==3.1.0']) test(`rejects unpinned or executable requirement ${requirement}`, () => {
     expect(inspectPreparation(fixture({ 'requirements.txt': requirement })).prerequisites[0].code).toBe('UNPINNED_REQUIREMENTS');
   });
@@ -159,9 +176,17 @@ describe('CSO inert Rails preparation', () => {
     const plan = inspectPreparation(fixture({ 'Gemfile.lock': gemLock, 'Gemfile': 'system("touch /tmp/CSO_UNSAFE")\nsource "https://rubygems.org"' }));
     expect(plan.status).toBe('ready'); expect(plan.stack).toBe('rails'); expect(plan.metadata.some(m => m.path === 'Gemfile')).toBe(false);
     expect(plan.acquisition).toHaveLength(2); expect(plan.acquisition.every(c => c.args[0] === 'fetch')).toBe(true);
+    // One gem process per platform: each process loads the full RubyGems index once.
+    for (const command of plan.acquisition) {
+      const platform = command.args[command.args.indexOf('--platform') + 1];
+      expect(command.args.slice(1, command.args.indexOf('--platform'))).toEqual(plan.inputs.filter(input => input.platform === platform).map(input => `${input.name}:${input.version}`));
+      expect(command.args).not.toContain('--version');
+    }
     expect(plan.inputs[1].platform).toBe('x86_64-linux-gnu'); expect(plan.inputs[0].integritySource).toBe('registry-on-acquisition');
     expect(plan.runtimeRequirements).toEqual({ ruby: '3.3.6', bundler: '2.6.9' });
     expect(plan.offline[0].args).toContain('--local'); expect(plan.offline[0].env.BUNDLE_IGNORE_CONFIG).toBe('true');
+    // Parallel Bundler threads race RubyGems' File.umask calls and leave 0777 directories.
+    expect(plan.offline[0].args.slice(plan.offline[0].args.indexOf('--jobs'), plan.offline[0].args.indexOf('--jobs') + 2)).toEqual(['--jobs', '1']);
     expect(plan.offline[0].env.GEM_HOME).toBeUndefined(); expect(plan.offline[0].env.GEM_PATH).toBeUndefined();
   });
   test('records lock checksums separately from newly acquired archive hashes', () => {

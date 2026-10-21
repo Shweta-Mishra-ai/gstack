@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 // gstack-context-bill — token bill-of-materials for an installed skills tree.
 // All behavior lives in lib/context-bill.ts; this is the CLI shim.
 

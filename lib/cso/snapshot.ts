@@ -14,8 +14,9 @@ import {
   snapshotPathId,
   MAX_OUTPUT,
 } from './contracts';
+import { withholdHistory } from './history';
 import { childEnvironment, executable, git, redact, runProcess } from './process';
-import { secureDirectory, writeHelperJson, writeJson } from './state';
+import { boundedList, readJson, secureDirectory, writeHelperJson, writeJson } from './state';
 import { scan } from '../redact-engine';
 import { atomicWriteSync } from '../fs-atomic';
 
@@ -40,7 +41,8 @@ function containsDirectory(path: string, components: Set<string>, sequences: str
     parts.slice(0, -1).some((_, index) => sequence.every((part, offset) => parts[index + offset] === part)),
   );
 }
-function noReadPath(path: string): boolean {
+/** Host dependency trees: never read, copied, or counted, with or without --paths. */
+export function noReadPath(path: string): boolean {
   return containsDirectory(path, NO_READ_COMPONENTS, [['vendor', 'bundle']]);
 }
 function omittedPath(path: string): boolean {
@@ -52,6 +54,35 @@ function omittedPath(path: string): boolean {
 const SECRET_FILE =
   /(?:^|\/)(?:\.env(?:\..*)?|\.npmrc|\.yarnrc(?:\.yml)?|\.pypirc|pip\.conf|credentials(?:\.yml(?:\.enc)?)?|master\.key|id_(?:rsa|ed25519)|.*\.(?:pem|p12|pfx|key)|AGENTS\.md|CLAUDE\.md|GEMINI\.md|bunfig\.toml)$/i;
 const SOURCE_LIMIT = 64 * 1024 * 1024;
+/** snapshot.json holds one entry per source file, so it gets its own cap; other private state stays at 1 MiB. */
+export const SNAPSHOT_MANIFEST_LIMIT = 16 * 1024 * 1024;
+const SENSITIVE_EVIDENCE_BUDGET = 512 * 1024;
+const CAPACITY_ISSUE = 'https://github.com/garrytan/gstack/issues/2993';
+const COUNTED_SOURCE =
+  'every tracked or nonignored untracked file outside dependency and VCS directories (node_modules, .git, .venv, vendor/bundle and similar)';
+const mib = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+export function snapshotManifestCapMessage(entries: number, bytes: number): string {
+  return `Snapshot manifest cap exceeded: ${entries} source entries need a ${mib(bytes)} (${bytes} byte) manifest; the snapshot manifest cap is ${mib(SNAPSHOT_MANIFEST_LIMIT)}. One entry is recorded for ${COUNTED_SOURCE}. Next step: run /cso on a smaller checkout of the code you want audited, and add your entry count to ${CAPACITY_ISSUE}. No supported workaround raises this cap.`;
+}
+export function sourceCapMessage(bytes: number, files: number): string {
+  return `64 MiB source cap exceeded: ${files} source files hold about ${mib(bytes)} (${bytes} bytes); the source admission cap is ${mib(SOURCE_LIMIT)}. The full size of ${COUNTED_SOURCE} inside the --paths audit scope counts (the whole repository when --paths is not set), including files over 1 MiB whose payloads are withheld from the audit. Next step: rerun with --paths set to the comma-separated repo-relative directories you want audited (narrower ones if --paths is already set); snapshot-inputs coverage is then partial, the report counts every skipped path, and the run's snapshot manifest lists each one. Do not audit a hand-trimmed copy, which hides what was skipped. Add your measured size to ${CAPACITY_ISSUE}. No supported workaround raises this cap.`;
+}
+/** Transformation recorded for a source path outside the start --paths prefixes; its payload is never copied or assessed. */
+export const OUTSIDE_AUDIT_PATHS = 'withheld: outside the --paths audit scope';
+const HISTORY_MARKER_RESERVE = 1024;
+/** First line of a history.txt that holds fewer commits or less detail than Git returned. */
+export function historyMarker(note: string): string {
+  return `[gstack-cso history truncated: ${note}]\n`;
+}
+/** Transformation recorded for a repository boundary Git listed as one entry: an untracked nested repository or a registered submodule gitlink. */
+export const NESTED_REPOSITORY =
+  'excluded: nested Git repository; Git listed it as a single boundary entry and never descends into it, so its own source and history are not audited with this repository';
+export function inAuditPaths(path: string, prefixes: readonly string[]): boolean {
+  return prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+}
+export function readSnapshotManifest(runDir: string): SnapshotManifest {
+  return readJson(join(runDir, 'snapshot.json'), SNAPSHOT_MANIFEST_LIMIT) as SnapshotManifest;
+}
 const SNAPSHOT_ENTRY_LIMIT = 100_000;
 const GIT_POINTER_LIMIT = 8192;
 export interface SnapshotCaptureLimits {
@@ -351,7 +382,12 @@ export function assertOpenedFileContained(root: string, full: string, fd: number
   )
     throw new CsoError('SNAPSHOT_RACE', 'Opened source identity changed during containment validation');
 }
-function readStable(root: string, path: string, maxBytes = MAX_OUTPUT): { data: Buffer; mode: number } {
+function readStableWith<T>(
+  root: string,
+  path: string,
+  maxBytes: number,
+  read: (fd: number, size: number) => { bytes: number; value: T },
+): { value: T; mode: number } {
   const ancestors = directoryIdentities(root, path),
     full = containedFile(root, path),
     named = fs.lstatSync(full);
@@ -389,12 +425,7 @@ function readStable(root: string, path: string, maxBytes = MAX_OUTPUT): { data: 
         'MISSING_INPUT',
         `Source file exceeds the ${maxBytes}-byte snapshot admission limit: ${path}`,
       );
-    const buffer = Buffer.alloc(Math.min(maxBytes + 1, before.size + 1));
-    let bytes = 0,
-      count = 0;
-    while (bytes < buffer.length && (count = fs.readSync(fd, buffer, bytes, buffer.length - bytes, null)) > 0)
-      bytes += count;
-    const data = buffer.subarray(0, bytes),
+    const { bytes, value } = read(fd, before.size),
       after = fs.fstatSync(fd),
       current = fs.lstatSync(full);
     if (
@@ -411,10 +442,37 @@ function readStable(root: string, path: string, maxBytes = MAX_OUTPUT): { data: 
       throw new CsoError('SNAPSHOT_RACE', `Source changed while reading: ${path}`);
     assertOpenedFileContained(root, full, fd, after);
     assertDirectoryIdentities(ancestors, path);
-    return { data, mode: before.mode & 0o777 };
+    return { value, mode: before.mode & 0o777 };
   } finally {
     fs.closeSync(fd);
   }
+}
+function readStable(root: string, path: string, maxBytes = MAX_OUTPUT): { data: Buffer; mode: number } {
+  const { value, mode } = readStableWith(root, path, maxBytes, (fd, size) => {
+    const buffer = Buffer.alloc(Math.min(maxBytes + 1, size + 1));
+    let bytes = 0,
+      count = 0;
+    while (bytes < buffer.length && (count = fs.readSync(fd, buffer, bytes, buffer.length - bytes, null)) > 0)
+      bytes += count;
+    return { bytes, value: buffer.subarray(0, bytes) };
+  });
+  return { data: value, mode };
+}
+/** Stream a source file's Git blob hash in bounded chunks under readStable's identity checks. */
+function gitBlobStable(root: string, path: string, objectFormat: string, tick: () => void): string {
+  return readStableWith(root, path, Number.MAX_SAFE_INTEGER, (fd, size) => {
+    const hash = createHash(objectFormat).update(`blob ${size}\0`),
+      chunk = Buffer.alloc(Math.min(MAX_OUTPUT, size + 1));
+    let bytes = 0,
+      count = 0;
+    while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+      tick();
+      bytes += count;
+      if (bytes > size) break;
+      hash.update(chunk.subarray(0, count));
+    }
+    return { bytes, value: hash.digest('hex') };
+  }).value;
 }
 async function resolveHeadCommit(repo: string, home: string): Promise<string | undefined> {
   try {
@@ -447,9 +505,19 @@ async function paths(
   // for, while still collecting nonignored untracked source.
   admission.time();
   const [working, head] = await Promise.all([
-      git(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], home),
+      git(
+        repo,
+        ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+        home,
+        SNAPSHOT_MANIFEST_LIMIT,
+      ),
       headCommit
-        ? git(repo, ['ls-tree', '-r', '-z', '--name-only', '--full-tree', headCommit, '--'], home)
+        ? git(
+            repo,
+            ['ls-tree', '-r', '-z', '--name-only', '--full-tree', headCommit, '--'],
+            home,
+            SNAPSHOT_MANIFEST_LIMIT,
+          )
         : Promise.resolve(''),
     ]),
     seen = new Set<string>();
@@ -458,7 +526,12 @@ async function paths(
     for (const value of data.split('\0')) {
       admission.time();
       if (!value) continue;
-      seen.add(relativePath(value));
+      // `ls-files --others` reports a repository boundary as one entry with a
+      // trailing slash: an untracked nested repository that Git refuses to
+      // descend into. The path itself is the boundary, exactly like a
+      // registered submodule's gitlink, so record it under its own name
+      // instead of rejecting the whole run.
+      seen.add(relativePath(value.replace(/\/$/, '')));
       admission.count(seen.size);
     }
   const result = [...seen].sort();
@@ -478,6 +551,7 @@ async function rejectSpecialFiles(
       repo,
       ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'],
       home,
+      SNAPSHOT_MANIFEST_LIMIT,
     ),
     ignoredDirectories = new Set<string>();
   admission.time();
@@ -562,6 +636,7 @@ export async function capture(
   base?: string,
   requiredAncestor?: string,
   limits: SnapshotCaptureLimits = {},
+  auditPaths?: readonly string[],
 ): Promise<SnapshotManifest> {
   repo = fs.realpathSync(repo);
   const state = fs.realpathSync(runDir),
@@ -582,6 +657,7 @@ export async function capture(
       gitHashes = new Map<string, string>(),
       gitModes = new Map<string, string>(),
       sensitiveEvidence: any[] = [],
+      boundaries = new Map<string, fs.Stats>(),
       absentPaths = new Set<string>();
     let total = 0;
     guard();
@@ -593,6 +669,10 @@ export async function capture(
     guard();
     const list = await paths(repo, home, headCommit, admission);
     guard();
+    const unmatched = auditPaths?.find((prefix) => !list.some((path) => inAuditPaths(path, [prefix])));
+    if (unmatched !== undefined)
+      throw new CsoError('INVALID_ARGUMENT', `--paths entry matches no source file: ${unmatched}`);
+    const outsideAudit = (path: string) => auditPaths !== undefined && !inAuditPaths(path, auditPaths);
     await rejectSpecialFiles(repo, home, admission);
     guard();
     const manifest: SnapshotManifest = {
@@ -611,40 +691,80 @@ export async function capture(
       manifest.baseCommit = (await git(repo, ['rev-parse', '--verify', `${base}^{commit}`], home)).trim();
       guard();
     }
+    const sourceCapError = () => {
+      let measured = 0,
+        files = 0;
+      for (const candidate of list) {
+        if (noReadPath(candidate) || outsideAudit(candidate)) continue;
+        try {
+          measured += fs.lstatSync(join(repo, candidate)).size;
+          files++;
+        } catch {}
+      }
+      return new CsoError('MISSING_INPUT', sourceCapMessage(Math.max(measured, total), files));
+    };
     for (const path of list) {
       guard();
+      let source: fs.Stats;
       try {
-        fs.lstatSync(join(repo, path));
+        source = fs.lstatSync(join(repo, path));
       } catch (error: any) {
         if (error?.code === 'ENOENT') {
           absentPaths.add(path);
           continue;
         }
         throw error;
+      }
+      const size = source.size;
+      // A directory in Git's inventory is a repository boundary, not source:
+      // an untracked nested repository (listed with a trailing slash) or a
+      // registered submodule's gitlink. Git reports it as one entry and never
+      // descends, so its contents are not this repository's source. Record an
+      // explicit exclusion bound to the boundary's identity, exactly like a
+      // host dependency tree, instead of reading it or failing the run.
+      if (source.isDirectory()) {
+        boundaries.set(path, source);
+        entries.push({
+          path,
+          pathId: snapshotPathId(repo, path),
+          originalHash: 'not-read',
+          bytes: source.size,
+          mode: source.mode & 0o777,
+          transformation: NESTED_REPOSITORY,
+        });
+        guard();
+        continue;
       } // tracked deletions are represented by absence and the diff manifest
-      // Host dependency trees aren't copied or read. Their omission is still explicit.
-      if (noReadPath(path)) {
+      // Host dependency trees and paths outside --paths aren't copied, assessed,
+      // or counted toward the source cap. Their omission is still explicit.
+      const dependency = noReadPath(path);
+      if (dependency || outsideAudit(path)) {
         const stat = fs.lstatSync(containedFile(repo, path));
         if (stat.isSymbolicLink() || !stat.isFile())
           throw new CsoError('UNSAFE_PATH', `Special source input: ${path}`);
         gitModes.set(path, stat.mode & 0o111 ? '100755' : '100644');
-        const reason = exclusion(path) ?? 'host dependency input';
+        // A comparison base must still see every out-of-scope change, so the
+        // payload is hashed for changed-path detection but never retained.
+        if (!dependency && manifest.baseCommit)
+          gitHashes.set(path, gitBlobStable(repo, path, objectFormat, admission.time));
         entries.push({
           path,
           pathId: snapshotPathId(repo, path),
           originalHash: 'not-read',
           bytes: stat.size,
           mode: stat.mode & 0o777,
-          transformation: `excluded: ${reason}`,
+          transformation: dependency
+            ? `excluded: ${exclusion(path) ?? 'host dependency input'}`
+            : OUTSIDE_AUDIT_PATHS,
         });
         guard();
         continue;
       }
+      if (total + size > SOURCE_LIMIT) throw sourceCapError();
       const { data, mode } = readStable(repo, path, SOURCE_LIMIT);
       total += data.length;
       guard();
-      if (total > SOURCE_LIMIT)
-        throw new CsoError('MISSING_INPUT', 'Source exceeds the 64 MiB snapshot admission limit');
+      if (total > SOURCE_LIMIT) throw sourceCapError();
       const entry: SnapshotEntry = {
         path,
         pathId: snapshotPathId(repo, path),
@@ -722,13 +842,31 @@ export async function capture(
       for (const e of entries) {
         guard();
         if (e.originalHash === 'not-read') {
-          const current = fs.lstatSync(containedFile(repo, e.path));
+          const boundary = boundaries.get(e.path);
+          if (boundary) {
+            // A nested repository is recorded by identity, never read: a
+            // swap, symlink or replacement directory fails the capture.
+            const current = fs.lstatSync(containedFile(repo, e.path));
+            if (
+              current.isSymbolicLink() ||
+              !current.isDirectory() ||
+              current.dev !== boundary.dev ||
+              current.ino !== boundary.ino ||
+              current.mode !== boundary.mode
+            )
+              throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
+            guard();
+            continue;
+          }
+          const current = fs.lstatSync(containedFile(repo, e.path)),
+            compared = gitHashes.get(e.path);
           if (
             current.isSymbolicLink() ||
             !current.isFile() ||
             current.nlink !== 1 ||
             current.size !== e.bytes ||
-            (current.mode & 0o777) !== e.mode
+            (current.mode & 0o777) !== e.mode ||
+            (compared !== undefined && gitBlobStable(repo, e.path, objectFormat, admission.time) !== compared)
           )
             throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
         } else {
@@ -749,7 +887,12 @@ export async function capture(
       canonical(entries.filter((e) => e.executionHash).map((e) => [e.path, e.executionHash, e.mode])),
     );
     if (manifest.baseCommit) {
-      const tree = await git(repo, ['ls-tree', '-r', '-z', '--full-tree', manifest.baseCommit, '--'], home),
+      const tree = await git(
+          repo,
+          ['ls-tree', '-r', '-z', '--full-tree', manifest.baseCommit, '--'],
+          home,
+          SNAPSHOT_MANIFEST_LIMIT,
+        ),
         baseFiles = new Map<string, { hash: string; mode: string }>();
       guard();
       for (const row of tree.split('\0').filter(Boolean)) {
@@ -783,32 +926,71 @@ export async function capture(
         });
       } else {
         const range = manifest.baseCommit ? `${manifest.baseCommit}..${headCommit}` : headCommit;
+        const log = (patches: boolean, maxBytes?: number) =>
+          git(
+            repo,
+            [
+              '-c',
+              'core.quotePath=false',
+              'log',
+              '--no-ext-diff',
+              '--no-textconv',
+              '--max-count=100',
+              '--format=commit %H%nAuthor: %an%nDate: %aI%nSubject: %s',
+              ...(patches ? ['--unified=3', '-p'] : []),
+              range,
+              '--',
+              ...(auditPaths ?? []).map((prefix) => `:(literal)${prefix}`),
+            ],
+            home,
+            maxBytes,
+          );
         admission.time();
-        const raw = await git(
-          repo,
-          [
-            '-c',
-            'core.quotePath=false',
-            'log',
-            '--no-ext-diff',
-            '--no-textconv',
-            '--max-count=100',
-            '--format=commit %H%nAuthor: %an%nDate: %aI%nSubject: %s',
-            '--unified=3',
-            '-p',
-            range,
-            '--',
-          ],
-          home,
-        );
+        let patched: string | undefined;
+        try {
+          patched = await log(true, SNAPSHOT_MANIFEST_LIMIT);
+        } catch (error) {
+          if (!(error instanceof CsoError) || error.code !== 'MISSING_INPUT') throw error;
+        }
         guard();
-        const safe = redact(raw);
+        const commits = withholdHistory(patched ?? '', exclusion)
+            .split(/^(?=commit [0-9a-f]{40}(?:[0-9a-f]{24})?$)/m)
+            .filter(Boolean),
+          sizes = commits.map((commit) => Buffer.byteLength(commit)),
+          whole = sizes.reduce((sum, size) => sum + size, 0) <= MAX_OUTPUT;
+        let kept = 0,
+          bytes = 0,
+          safe = patched === '' ? '' : undefined,
+          truncated: string | undefined,
+          retainedCommits: number | string = 'at most 100';
+        while (kept < commits.length && (whole || bytes + sizes[kept] <= MAX_OUTPUT - HISTORY_MARKER_RESERVE))
+          bytes += sizes[kept++];
+        for (; kept > 0 && safe === undefined; kept--) {
+          admission.time();
+          const omitted = commits.length - kept,
+            note = omitted
+              ? `the newest ${kept} of ${commits.length} commits were retained with patches; ${omitted} older commits were omitted to stay within the ${MAX_OUTPUT}-byte history limit`
+              : undefined,
+            text = redact((note ? historyMarker(note) : '') + commits.slice(0, kept).join(''));
+          if (Buffer.byteLength(text) > MAX_OUTPUT) continue;
+          safe = text;
+          truncated = note;
+          if (omitted) retainedCommits = kept;
+        }
+        if (safe === undefined) {
+          const metadata = await log(false);
+          guard();
+          truncated = `patches were withheld because the newest commit's patch or the patch log exceeds the ${MAX_OUTPUT}-byte history limit; only commit metadata was retained`;
+          safe = redact(historyMarker(truncated) + metadata);
+          retainedCommits = 'metadata for at most 100';
+        }
         atomicWriteSync(join(runDir, 'history.txt'), safe, { mode: 0o600 });
         writeJson(join(runDir, 'history-status.json'), {
           status: 'captured',
-          range,
-          commits: 'at most 100',
+          range: auditPaths ? `${range}, limited to --paths ${auditPaths.join(', ')}` : range,
+          commits: retainedCommits,
           bytes: Buffer.byteLength(safe),
+          ...(truncated ? { truncated } : {}),
         });
       }
     } catch (error) {
@@ -858,15 +1040,27 @@ export async function capture(
     guard();
     assertAbsent();
     admission.time();
-    writeHelperJson(join(runDir, 'sensitive-evidence.json'), sensitiveEvidence);
+    writeHelperJson(
+      join(runDir, 'sensitive-evidence.json'),
+      boundedList<Record<string, unknown>>(
+        sensitiveEvidence.length,
+        (index) => sensitiveEvidence[index],
+        { bytes: SENSITIVE_EVIDENCE_BUDGET },
+        1,
+        (omitted) => ({
+          omitted,
+          note: `${omitted} more files with sensitive-pattern findings are not listed, to keep this artifact within its 1 MiB bound`,
+        }),
+      ),
+    );
     // The manifest contains helper-computed identities and source pathnames but
     // never source payloads. Persist it exactly in private state: generic
     // content redaction would silently break the path/hash identity relation.
-    const serialized = JSON.stringify(manifest, null, 2);
-    if (Buffer.byteLength(serialized) + 1 > MAX_OUTPUT)
+    const serialized = JSON.stringify(manifest);
+    if (Buffer.byteLength(serialized) + 1 > SNAPSHOT_MANIFEST_LIMIT)
       throw new CsoError(
         'MISSING_INPUT',
-        'Snapshot manifest exceeds the 1 MiB private-state admission limit',
+        snapshotManifestCapMessage(entries.length, Buffer.byteLength(serialized) + 1),
       );
     atomicWriteSync(join(runDir, 'snapshot.json'), serialized + '\n', { mode: 0o600 });
     return manifest;

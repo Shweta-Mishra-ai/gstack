@@ -13,13 +13,6 @@ triggers:
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
-
-## When to invoke this skill
-
-Use when: "security audit", "threat model", "OWASP", "CSO review", "recheck a vulnerability".
-
-Voice triggers (speech-to-text aliases): "see-so", "see so", "security review", "security check", "vulnerability scan", "run security".
-
 # /cso — evidence before assurance
 
 Find exploitable defects. State attacker, boundary, impact, and challenge. Static assessment remains available without runtime or scanner profiles. Qualified comprehensive profiles add reproduction and repair candidates without changing the branch. Trusted `gstack-cso` owns execution, persistence, and proof labels.
@@ -45,6 +38,7 @@ Do not send findings, source, secrets, harnesses, or bundles to gbrain, telemetr
 | `--base <ref>` | Select the comparison base, including for diff mode. |
 | `--budget <seconds>` | Bound wall-clock investigation time, including setup. |
 | `--offline` | Disable helper, scanner, download, and advisory network access. |
+| `--paths <p,q>` | Audit only these repo prefixes (never a trimmed copy); others become snapshot-inputs gaps. |
 
 ## Mode Resolution
 
@@ -64,10 +58,10 @@ Phases 0, 1, 12, 13, and 14 always run for an investigation. Select the remainin
 
 Diff mode may read unchanged callers, middleware, schemas, configuration, and dependencies needed for assessment. Report out-of-scope variants as follow-up scope. Historical-secret coverage uses only the helper's pinned base/snapshot.
 
-Use `gstack-cso schema` for JSON inputs and `--help` for the installed contract. Below, `gstack-cso` means the trusted absolute launcher:
+`gstack-cso schema` gives JSON inputs; `--help` the installed contract. Below, `gstack-cso` is the trusted absolute launcher:
 
 ```text
-gstack-cso start --repo <repo> [scope/diff/base/budget/offline flags] [--comprehensive]
+gstack-cso start --repo <repo> [scope/diff/base/budget/offline/paths] [--comprehensive]
 gstack-cso doctor --repo <repo>
 gstack-cso resume <run>
 gstack-cso replay <bundle> [--source <matching-source>]
@@ -94,11 +88,11 @@ gstack-cso inspect-v2 <import-id>
 
 **Audited-source access invariant.** After `start`, inspect source only with that run's `inspect`, `read`, and `history`. Pass the exact `path` from `inspect`; `displayPath` is only a redacted label. Never use host `Read`/`Glob`/`Grep`; direct reads bypass redaction and identity.
 
-Start first; inspect snapshot, readiness, deadline, transformations, and coverage. When a finding survives challenge, submit it to the helper **and surface it to the user immediately**; do not wait for the final report. This preserves evidence if the run is interrupted. Malformed model JSON gets **one bounded correction attempt**; then preserve a partial result.
+Start first; inspect snapshot, readiness, deadline, transformations, and coverage. When a finding survives challenge, submit it to the helper **and surface it to the user immediately**; do not wait for the final report; this preserves evidence if the run is interrupted. Malformed model JSON gets **one bounded correction attempt**; then preserve a partial result.
 
 When updating coverage, copy every record's `domain` and `scope` exactly from `inspect`; a new scope leaves the planned scope unassessed. Only helper commands may update helper-owned records.
 
-Budgets are ten minutes daily and thirty comprehensive, including one minute for reporting. Use at most three investigation workers and two reproduction groups per Docker endpoint. Attempts get five minutes and three harness repairs per finding, within the run deadline. Prioritize unresolved high impact. Report model usage only when exposed.
+Budgets: ten minutes daily, thirty comprehensive. Use at most three investigation workers and two reproduction groups per Docker endpoint. Attempts get five minutes and three harness repairs per finding. Prioritize unresolved high impact. Report model usage only when exposed. Helper replies carry investigation `remainingSeconds`: start only what fits; below 120, stop and `finish`.
 
 ---
 ## Section index — Read each section when its situation applies
@@ -117,7 +111,7 @@ Use the snapshot inventory and redacted source to map stacks, **actors, assets, 
 
 Use stack detection to prioritize nested services and cross-language paths. Comprehensive setup supports Node, Bun, Python, and Rails only with a matching qualified runtime profile. Missing profiles, runtimes, or tools are execution prerequisites, not vulnerabilities. Reduce coverage only for unfinished assessment work.
 
-In comprehensive mode, review snapshot transformations before reproduction. If sanitization removes or replaces the tested boundary, block reproduction. Never claim sanitized configuration equivalence without evidence. Readiness failures do not block static work.
+In comprehensive mode, review snapshot transformations first; block reproduction if sanitization removed or replaced the tested boundary. Never claim sanitized configuration equivalence without evidence. Readiness failures do not block static work.
 
 ### Phase 1: Attack surface census
 
@@ -134,13 +128,13 @@ This **CSO evidence rubric** governs CSO instead of shared review confidence ins
 - **Confidence:** how strongly available evidence supports that precise claim; explain unknowns and counterevidence. Do not turn a number into proof.
 - **Evidence:** candidate hypothesis, supported static evidence, or a helper-recorded reproduction. Code tracing can support a finding; it cannot establish that an application booted or a repair passed tests.
 
-Daily reports contain **supported findings**: a concrete attacker-controlled entrypoint, a path across an intended security boundary, demonstrated impact, and a challenge of relevant protective controls. Comprehensive reports retain unresolved candidates separately as **labeled hypotheses**, never mixed into supported totals. Disproved candidates are retained as disposition/coverage evidence, not vulnerabilities.
+Daily reports hold only **supported findings**: an attacker-controlled entrypoint, a security-boundary crossing, demonstrated in-scope impact, and challenged protective controls. Omit daily candidates whose impact needs out-of-snapshot code or a future change, or exposes nothing sensitive. Comprehensive reports keep unresolved candidates as separate **labeled hypotheses**; omitted or disproved ones are coverage.
 
-Do not apply blanket exclusions for development dependencies, availability/resource attacks, historical secrets, user-role prompt injection, or gstack-owned skills. Analyze attacker control and impact. Likewise, UUIDs do not provide authorization; user-controlled URL paths can still cross a sensitive boundary; environment variables may originate from untrusted workflows; and safe defaults can be bypassed by framework escape hatches. Missing hardening alone needs a concrete failure scenario before becoming a finding.
+Do not apply blanket exclusions for development dependencies, availability/resource attacks, historical secrets, user-role prompt injection, or gstack-owned skills. Analyze attacker control and impact. UUIDs are not authorization; user-controlled URL paths can cross a sensitive boundary; environment variables may come from untrusted workflows; framework escape hatches can bypass safe defaults. Missing hardening alone needs a concrete failure scenario before becoming a finding.
 
 For each candidate, use an already-authorized independent reviewer when available. Give it the relevant locations, invariant, and rubric without the producer's conclusion; have it inspect callers, middleware, configuration, validation, legitimate behavior, and mitigations. Use at most three; await them. Do not request broader tool access solely to obtain an independent reviewer. Otherwise perform a separate skeptical pass labeled **sequential challenge; independent agent unavailable**. Record dissent and assumptions. Agreement and scanner warnings do not prove runtime behavior.
 
-Search for root-cause variants after supporting a finding, honoring scope. Prioritize by impact, dependency reachability/exposure, known exploitation, and likely user benefit. Unknown reachability remains **unknown**, not “unreachable.”
+After supporting a finding, grep its pattern at every other in-scope ingress, command and call site; severity follows the worst sibling. Prioritize by impact, dependency reachability/exposure, known exploitation and likely user benefit. Unknown reachability remains **unknown**, not “unreachable.”
 
 **Comprehensive verification.** Read the schema and call `runtime-plan` before preparing the harness or patch. Continue only when the helper returns a matching qualified runtime catalog profile; otherwise record the exact execution prerequisite and continue static assessment. Copy its startup, full-test commands, and immutable inputs exactly. Execute only through `verify`, which records:
 
@@ -153,13 +147,13 @@ Keep finding evidence, reproduction outcome, patch validation, test-completion a
 
 ### Phase 13: Report and repair artifacts
 
-Finish every audit through the helper, including empty, cancelled, blocked, or interrupted audits when possible. Every report begins with **complete**, **partial**, or **not assessed**, followed by scope and material gaps. Completeness is independent of finding count. For an empty supported set, say **“No supported findings in the assessed scope.”**, or **not assessed** if nothing was. Lead incomplete reports with the helper's Status/Ran/Reason/Next lines. Never infer a clean result from setup failure or absent scanner output.
+Finish every audit through the helper, including empty, cancelled, blocked, or interrupted audits when possible. Every report begins with **complete**, **partial**, or **not assessed**, followed by scope and material gaps; a `--paths` run states partial snapshot-inputs coverage and summarizes skipped paths. Completeness is independent of finding count. For an empty supported set, say **“No supported findings in the assessed scope.”**, or **not assessed** if nothing was. Lead incomplete reports with the helper's Status/Ran/Reason/Next lines. Never infer a clean result from setup failure or absent scanner output.
 
 Present a compact SECURITY FINDINGS table with stable finding ID, severity, confidence/rationale, evidence state, location, and impact. Each finding needs an attacker scenario, supporting references, counterevidence considered, and a concrete repair recommendation. Include coverage, transformations, scanner versions/outcomes/freshness, runtime prerequisites, timing, and proposed repair-candidate paths. Include `runtime_tested` bundle paths only when an authenticated assertion witness actually produced one. Beside every bundle, show assertion, test-completion, and review assurance exactly as recorded; never collapse those labels or imply that self-reported project tests are authenticated. Comprehensive hypotheses belong in a separate labeled appendix.
 
 Use `RunReportV3`, `FindingV3`, `CoverageRecord`, `VerificationManifest`, and `RepairBundle` from `lib/cso/contracts.ts` through the installed schema command. Helper validation/persistence is mandatory. If saving fails, report **PERSISTENCE_FAILED** and a safe summary; never claim the report was saved. If redaction fails, withhold the payload entirely; do not show raw excerpts to explain the failure.
 
-The private state namespace is `security/cso/<repo>/<run>` under the existing state root, outside synchronization allowlists. Execution copies and services are removed immediately. Sanitized snapshots expire after seven days; redacted reports, repair candidates, and bundles after thirty days. Public archive caches are hash-verified, capped at 10 GiB, and evicted by LRU. Explicitly exported artifacts remain under user control. Repair candidates preserve their redacted request, patch, external observations, self-reported project-test outcome, provenance, and required input hashes. Authenticated bundles additionally preserve the inputs required for replay and their separate assurance labels. Currently issued `runtime_tested` bundles record authenticated external assertions and `self_reported` project-test completion.
+The private state namespace is `security/cso/<repo>/<run>` under the existing state root, outside synchronization allowlists. Execution copies and services are removed immediately. Sanitized snapshots expire after seven days; redacted reports, repair candidates, and bundles after thirty days. Public archive caches are hash-verified, capped at 10 GiB, and evicted by LRU. Explicitly exported artifacts remain under user control. Repair candidates preserve their redacted request, patch, external observations, self-reported project-test outcome, provenance, and required input hashes. Authenticated bundles additionally preserve the inputs required for replay and their separate assurance labels.
 
 ### Phase 14: Recovery and current-source rechecks
 

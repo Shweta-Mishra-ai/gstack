@@ -16,7 +16,7 @@ for (const { name: host } of ALL_HOST_CONFIGS) {
     const prompt = text.match(/"(Given this product context, propose a complete design direction:[\s\S]*?)"\n/)!;
     expect(prompt).not.toBeNull();
     expect(prompt[1]).toContain('Recommendation: <direction> because <product-specific reason>');
-    expect(validateOutsideReview('Recommendation: use a compact triage table because operators compare many incident rows.', 'review').completed).toBe(true);
+    expect(validateOutsideReview('Recommendation: use a compact triage table because operators compare many incident rows.', 'proposal').completed).toBe(true);
     expect(validateOutsideReview('A compact table sounds nice.', 'review').completed).toBe(false);
     const preparation = outsideVoiceInvocation(context(host), { timeoutMs: 300000, purpose: 'design-direction' });
     expect(preparation).toContain('missing Recommendation marker');
@@ -79,7 +79,7 @@ test('consultation drafts before independent dispatch and compares completed inp
   expect(section).toContain('label old proposals stale');
 });
 
-test('consultation opt-in probes the CLI without a disabled branch and rechecks its spawn', () => {
+test('consultation opt-in reads the stored consent, probes the CLI and rechecks its spawn', () => {
   const text = generateDesignOutsideVoices(context('claude'));
   const accepted = text.indexOf('**If accepted:**');
   const availability = text.indexOf('**Check Codex availability:**');
@@ -88,7 +88,8 @@ test('consultation opt-in probes the CLI without a disabled branch and rechecks 
   expect(invocation).toBeGreaterThan(availability);
   const preflight = text.slice(availability, invocation);
   expect(preflight).not.toContain('_OUTSIDE_CFG=enabled');
-  expect(preflight).not.toContain('CODEX_MODE: disabled');
+  expect(preflight).toContain('get --stored codex_reviews');
+  expect(preflight).toContain('CODEX_MODE: disabled');
   expect(preflight).toContain('CODEX_MODE: under_current_harness');
   expect(preflight).toContain('exit 78');
   expect(text.slice(invocation)).toContain('exit 78');

@@ -39,7 +39,7 @@ test('receipt transport: only recover-receipts restores this repository and PR\'
   const emit = planner.find((s: any) => s.run?.includes('--emit-plan /tmp/paid-plan/manifest.json'));
   expect(emit.env.EVALS_CACHE_DIR).toBe("${{ steps.reuse.outputs.reuse == 'on' && '/tmp/gstack-eval-input-cache' || '' }}");
   const upload = planner.find((s: any) => s.with?.name === 'paid-plan');
-  expect(upload.with.path.trim().split('\n')).toEqual(['/tmp/paid-plan/manifest.json', '/tmp/paid-plan/receipts', '/tmp/paid-plan/store']);
+  expect(upload.with.path.trim().split('\n')).toEqual(['/tmp/paid-plan/manifest.json', '/tmp/paid-plan/receipts', '/tmp/paid-plan/store', '/tmp/paid-plan/gate-reuse.json']);
   // Executors never restore or save a cache of their own: every slice sees the plan's one receipt set.
   const executor = paid.jobs['eval-slices'].steps;
   expect(executor.filter((s: any) => s.uses?.startsWith('actions/cache/'))).toHaveLength(0);
@@ -54,6 +54,12 @@ test('receipt transport: only recover-receipts restores this repository and PR\'
   expect(save[0].with.key).toBe('eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-merged');
   // Only PR runs save; a pr_receipts dispatch reads the PR store read-only.
   expect(save[0].if).toBe("always() && github.event_name == 'pull_request'");
+  // Restore and save share one cache backend (GSTA-48): an Ubicloud runner saves into Ubicloud's transparent
+  // cache, which a GitHub-hosted restore never sees, so every restore missed while the report ran on Ubicloud.
+  for (const job of Object.values(paid.jobs) as any[]) {
+    if (!job.steps.some((s: any) => s.uses?.startsWith('actions/cache/') && s.with?.path === '/tmp/gstack-eval-input-cache')) continue;
+    expect(job['runs-on']).toBe('ubuntu-24.04');
+  }
   expect(report.indexOf(save[0])).toBeGreaterThan(report.indexOf(merge));
   expect(paid.jobs['eval-slices'].permissions).toEqual({ contents: 'read', packages: 'read' });
   expect(paid.jobs['slices-report'].permissions).toEqual({ contents: 'read' });

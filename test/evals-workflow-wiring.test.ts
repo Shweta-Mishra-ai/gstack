@@ -22,7 +22,10 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { spawnSync } from 'child_process';
 import { buildRunManifest, isCodexShard, isOverlayTestFile, parseCliOptions, resolvePaidShardTimeoutMs, sliceExecutionOrder, sliceSupervisedWallMs, CI_SETUP_ALLOWANCE_MINUTES } from '../scripts/test-paid-shards';
+import { CENSUS_ARMS, MONTHLY_CENSUS_ARMS, MONTHLY_CENSUS_SCHEDULE, WEEKLY_CENSUS_ARMS, WEEKLY_CENSUS_SCHEDULE, censusArmEnv, censusMatrix, selectCensus } from '../scripts/census-arms';
 
 const ROOT = path.join(import.meta.dir, '..');
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf-8');
@@ -40,7 +43,7 @@ function plannerSites(source: string): Array<{ manifest: string; budgetSeconds: 
 
 type Step = { id?: string; name?: string; run?: string; uses?: string; env?: Record<string, string>; with?: Record<string, string> };
 type Job = { needs?: string[]; env?: Record<string, string>; outputs?: Record<string, string>; 'timeout-minutes': string | number;
-  strategy?: { 'max-parallel': number; matrix: { slice: string } }; steps: Step[] };
+  strategy?: { 'max-parallel': number; matrix: { slice?: string; include?: string } }; steps: Step[] };
 
 /**
  * An executor's matrix and timeout must come from the planner step that wrote
@@ -159,7 +162,6 @@ describe('evals.yml sliced-lane wiring (post-matrix)', () => {
 describe('evals-periodic.yml sliced-lane wiring', () => {
   const lanes = [
     { source: periodicYml, name: 'evals-periodic.yml', executor: 'eval-slices', prefix: 'periodic_', tier: 'periodic' },
-    { source: periodicYml, name: 'evals-periodic.yml', executor: 'gate-census', prefix: 'gate_', tier: 'gate' },
     { source: evalsYml, name: 'evals.yml', executor: 'eval-slices', prefix: '', tier: 'gate' },
     { source: marathonYml, name: 'evals-marathon.yml', executor: 'eval-slices', prefix: '', tier: 'marathon' },
   ] as const;
@@ -200,6 +202,64 @@ describe('evals-periodic.yml sliced-lane wiring', () => {
     });
   }
 
+  test('evals-periodic.yml:gate-census — one row per census arm and planned slice with its plan\'s ceiling, and every row of a scheduled census starts at once', () => {
+    const workflow = Bun.YAML.parse(periodicYml) as { env?: Record<string, string>; jobs: Record<string, Job> };
+    const planner = workflow.jobs['plan-slices']!;
+    const executor = workflow.jobs['gate-census']!;
+    expect(executor.needs).toContain('plan-slices');
+    expect(executor.strategy!.matrix).toEqual({ include: '${{ fromJSON(needs.plan-slices.outputs.gate_matrix) }}' });
+    expect(executor['timeout-minutes']).toBe('${{ matrix.timeout }}');
+    expect(executor.steps[0]!.run).toBe('echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"');
+    expect(planner.outputs!.gate_matrix).toBe('${{ steps.gate-matrix.outputs.gate_matrix }}');
+    expect(planner.steps.find(step => step.id === 'gate-matrix')!.run).toBe('bun --no-install run scripts/census-arms.ts --matrix /tmp/gate-census-plan "$ARMS" >> "$GITHUB_OUTPUT"');
+    const emit = planner.steps.filter(step => step.run?.includes('--emit-plan "/tmp/gate-census-plan/$arm/manifest.json" '));
+    expect(emit).toHaveLength(1);
+    expect(emit[0]!.run).toContain('mapfile -t arm_env < <(bun --no-install run scripts/census-arms.ts --env "$arm")');
+    expect(emit[0]!.run).toContain('env "${arm_env[@]}" EVALS_TIER=gate bun run scripts/test-paid-shards.ts');
+    const execute = executor.steps.filter(step => step.run?.includes('--plan '));
+    expect(execute).toHaveLength(1);
+    expect(execute[0]!.run).toContain('--plan /tmp/gate-census-plan/${{ matrix.arm }}/manifest.json --slice ${{ matrix.slice }}');
+    // The executor runs with its arm's host and model, and downloads every arm's plan.
+    expect(executor.steps.find(step => step.name === "Select the census arm's host and model")!.run).toBe('bun --no-install run scripts/census-arms.ts --env "$ARM" >> "$GITHUB_ENV"');
+    expect(executor.steps.some(step => step.with?.path === '/tmp/gate-census-plan')).toBe(true);
+    const cliArgs = (run: string) => {
+      const command = /\bbun(?: --no-install)? run scripts\/test-paid-shards\.ts (.*)$/m.exec(run)!;
+      return command[1]!.replace(/\$\{\{\s*matrix\.slice\s*\}\}/g, '1').replace(/\$\{\{\s*matrix\.arm\s*\}\}/g, 'claude-opus').trim().split(/\s+/);
+    };
+    const planned = parseCliOptions(cliArgs(emit[0]!.run!), { ...workflow.env, ...emit[0]!.env, EVALS_ALL: '1', EVALS_PROFILE: 'full' });
+    const active = parseCliOptions(cliArgs(execute[0]!.run!), { ...workflow.env, ...executor.env, ...execute[0]!.env, EVALS_PROFILE: 'full' });
+    expect(planned.tier).toBe('gate');
+    expect(active.tier).toBe('gate');
+    expect(active.jobs).toBe(planned.jobs);
+    expect(execute[0]!.env?.EVALS_JOBS).toBe(String(planned.jobs));
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'census-arms-'));
+    try {
+      for (const arm of Object.keys(CENSUS_ARMS)) {
+        const env = { ...workflow.env, ...emit[0]!.env, EVALS_ALL: '1', EVALS_PROFILE: 'full', ...censusArmEnv(arm) };
+        const manifest = buildRunManifest({ tier: 'gate', profile: 'full', sliceBudgetMs: planned.sliceBudgetMs!, jobs: planned.jobs,
+          evalsAll: true, env, rootDir: ROOT, skipJudges: planned.skipJudges });
+        expect(manifest.host ?? 'claude').toBe(CENSUS_ARMS[arm]!.host);
+        const sliceFiles = Array.from({ length: manifest.sliceCount }, (_, i) => sliceExecutionOrder(
+          manifest.entries.filter(entry => entry.status === 'planned' && entry.slice === i + 1)).map(entry => entry.file));
+        const ceilings = sliceFiles.map(files => Math.ceil(Math.max(2 * planned.sliceBudgetMs!,
+          ...files.map(file => resolvePaidShardTimeoutMs([file])),
+          files.some(isOverlayTestFile) ? sliceSupervisedWallMs(files, planned.jobs) : 0) / 60_000) + CI_SETUP_ALLOWANCE_MINUTES);
+        expect(manifest.plan!.sliceCiTimeoutMinutes).toEqual(ceilings);
+        expect(manifest.plan!.ciTimeoutMinutes).toBeLessThanOrEqual(360);
+        fs.mkdirSync(path.join(planDir, arm));
+        fs.writeFileSync(path.join(planDir, arm, 'manifest.json'), JSON.stringify(manifest));
+        expect(censusMatrix([arm], planDir)).toEqual(ceilings.map((timeout, i) => ({ arm, slice: i + 1, timeout })));
+      }
+      for (const arms of [WEEKLY_CENSUS_ARMS, MONTHLY_CENSUS_ARMS]) {
+        const rows = censusMatrix(arms, planDir);
+        expect(new Set(rows.map(row => `${row.arm}/${row.slice}`)).size).toBe(rows.length);
+        expect(rows.length, `${arms.join('+')} rows exceed max-parallel`).toBeLessThanOrEqual(executor.strategy!['max-parallel']);
+      }
+    } finally {
+      fs.rmSync(planDir, { recursive: true, force: true });
+    }
+  });
+
   test('planner/executor/report tier=periodic agree and plan with the ~7-minute budget (W5c)', () => {
     expect(periodicYml).toMatch(/EVALS_TIER=periodic bun --no-install run scripts\/test-paid-shards\.ts --tier periodic --emit-plan/);
     expect(periodicYml).toMatch(/EVALS_TIER=periodic bun run scripts\/test-paid-shards\.ts --tier periodic --plan .* --slice /);
@@ -207,7 +267,7 @@ describe('evals-periodic.yml sliced-lane wiring', () => {
     // Periodic work and the full gate census have distinct immutable plans.
     expect(plannerSites(periodicYml)).toEqual([
       { manifest: '/tmp/paid-plan/manifest.json', budgetSeconds: 420, jobs: 2 },
-      { manifest: '/tmp/gate-census-plan/manifest.json', budgetSeconds: 420, jobs: 2 },
+      { manifest: '"/tmp/gate-census-plan/$arm/manifest.json"', budgetSeconds: 420, jobs: 2 },
     ]);
   });
 });
@@ -228,7 +288,7 @@ describe('evals-periodic.yml host-run Codex slices', () => {
     expect(matrixStep.run).toContain('} >> "$GITHUB_OUTPUT"');
     expect(planner.outputs!.periodic_codex_slices).toBe('${{ steps.periodic-matrix.outputs.codex_slices }}');
     expect(codex.needs).toEqual(['build-image', 'plan-slices']);
-    expect(codex.if).toBe("${{ needs.plan-slices.outputs.periodic_codex_slices != '[]' }}");
+    expect(codex.if).toBe("${{ needs.plan-slices.outputs.periodic_lane == 'true' && needs.plan-slices.outputs.periodic_codex_slices != '[]' }}");
     expect(codex.strategy!.matrix.slice).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_codex_slices) }}');
     expect(codex['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slice_timeouts)[matrix.slice] }}');
     expect(codex.steps[0]!.run).toBe('echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"');
@@ -350,7 +410,7 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
 
   test('planners size the capacity preflight with their executor cap', () => {
     for (const [source, executor, manifest] of [[evalsYml, 'eval-slices', '/tmp/paid-plan/manifest.json'],
-      [periodicYml, 'eval-slices', '/tmp/paid-plan/manifest.json'], [periodicYml, 'gate-census', '/tmp/gate-census-plan/manifest.json']] as const) {
+      [periodicYml, 'eval-slices', '/tmp/paid-plan/manifest.json'], [periodicYml, 'gate-census', '"/tmp/gate-census-plan/$arm/manifest.json"']] as const) {
       const jobs = jobsOf(source);
       const emit = jobs['plan-slices']!.steps.find(step => step.run?.includes(`--emit-plan ${manifest} `))!;
       const cap = Number(/--max-parallel (\d+)/.exec(emit.run!)?.[1]);
@@ -362,7 +422,10 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
     for (const source of [evalsYml, periodicYml, marathonYml]) {
       const jobs = jobsOf(source);
       const uploads = Object.values(jobs).flatMap(job => job.steps).filter(step => step.uses?.startsWith('actions/upload-artifact@'))
-        .map(step => step.with?.name ?? '').filter(name => /slice|census-\$/.test(name));
+        .map(step => step.with?.name ?? '').filter(name => /slice|census-\$/.test(name))
+        // GSTA-49 T1b: the train record keeps the fixed name gstack-ship-queue reads; it is built from the
+        // first attempt's slice results only (scripts/train-gate.ts buildTrainRecord), so a re-run cannot change it.
+        .filter(name => name !== '${{ needs.plan-slices.outputs.record_artifact }}');
       expect(uploads.length).toBeGreaterThan(0);
       for (const name of uploads) expect(name, name).toContain('-a${{ github.run_attempt }}');
       const downloads = Object.values(jobs).flatMap(job => job.steps).filter(step => step.uses?.startsWith('actions/download-artifact@') && step.with?.pattern);
@@ -389,11 +452,11 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
     const gate = report.steps.find(step => step.id === 'pass-rates')!;
     expect(gate.run).toContain('bun run eval:pass-rates --gate --runs 10');
     expect(gate.if).toBe('always()');
-    for (const name of ['Upsert tracking issue on failure', 'Fail the workflow when reconciliation failed']) {
+    for (const name of ['Write the census report', 'Upsert tracking issue on failure', 'Fail the workflow when reconciliation failed']) {
       expect(report.steps.find(step => step.name === name)!.if).toContain("steps.pass-rates.outputs.exit != '0'");
     }
-    const upsert = report.steps.find(step => step.name === 'Upsert tracking issue on failure')!;
-    expect(upsert.run).toContain('report-summary.md');
+    // The report body is written once on every ref; the main-only upsert posts it (test/evals-tracking-issue.test.ts).
+    expect(report.steps.find(step => step.name === 'Write the census report')!.run).toContain('report-summary.md');
     expect(report.steps.find(step => step.name === 'Close the tracking issue on a green run')!.run).toContain('gh issue close');
     expect(report.steps.filter(step => step.with?.name?.startsWith('trial-outcomes-')).length).toBe(2);
     const redispatch = jobs.redispatch!;
@@ -401,6 +464,10 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
     expect(redispatch.permissions).toEqual({ actions: 'write' });
     expect(redispatch.if).toBe("${{ !cancelled() && needs.report.outputs.redispatch == 'true' }}");
     expect(redispatch.steps[0]!.run).toContain('-f redispatch_of="$GITHUB_RUN_ID"');
+    // A census-only run re-dispatches with its own arms, never as a weekly run.
+    expect(redispatch.steps[0]!.run).toContain('${CENSUS_ARMS:+-f census_arms="$CENSUS_ARMS"}');
+    expect(redispatch.steps[0]!.env?.CENSUS_ARMS).toBe('${{ needs.report.outputs.redispatch_census_arms }}');
+    expect(report.outputs!.redispatch_census_arms).toBe("${{ needs.plan-slices.outputs.periodic_lane != 'true' && join(fromJSON(needs.plan-slices.outputs.census_arms), ',') || '' }}");
     const classify = report.steps.find(step => step.id === 'verdict')!;
     expect(classify.run).toContain('.verdict.redispatchEligible == true');
     expect(classify.run).toContain('[ -z "$REDISPATCH_OF" ]');
@@ -426,7 +493,13 @@ describe('scheduled paid lanes: concurrency and branch dispatch scope', () => {
   test('a branch dispatch of evals-periodic runs the periodic lane only unless it opts into the gate census', () => {
     const wf = parse(periodicYml);
     expect(wf.on.workflow_dispatch!.inputs!.include_gate_census).toMatchObject({ type: 'boolean', default: false });
-    expect(wf.jobs['gate-census']!.if).toBe("${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}");
+    // The planner selects the census arms (scripts/census-arms.ts); no arm, no census job.
+    expect(wf.jobs['gate-census']!.if).toBe("${{ needs.plan-slices.outputs.gate_matrix != '[]' }}");
+    const select = wf.jobs['plan-slices']!.steps.find(step => step.id === 'census')!;
+    expect(select.env?.INCLUDE_GATE_CENSUS).toBe("${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}");
+    expect(select.run).toBe('bun --no-install run scripts/census-arms.ts --select >> "$GITHUB_OUTPUT"');
+    expect(selectCensus({ schedule: '', censusArms: '', includeGateCensus: false })).toEqual({ arms: [], periodicLane: true });
+    expect(selectCensus({ schedule: WEEKLY_CENSUS_SCHEDULE, includeGateCensus: true })).toEqual({ arms: [...WEEKLY_CENSUS_ARMS], periodicLane: true });
     const report = wf.jobs.report!.steps;
     const reconcile = report.find(step => step.name === 'Reconcile gate census against the manifest (fail-closed)')!;
     expect(reconcile.env?.GATE_CENSUS).toBe('${{ needs.gate-census.result }}');
@@ -434,5 +507,82 @@ describe('scheduled paid lanes: concurrency and branch dispatch scope', () => {
     // A skipped census is not a red lane; a failed or cancelled one still is.
     const fail = report.find(step => step.name === 'Fail the workflow when reconciliation failed') as Step & { if?: string };
     expect(fail.if).toContain(`!contains(fromJSON('["success","skipped"]'), needs.gate-census.result)`);
+  });
+});
+
+describe('evals-periodic.yml census arms: Monday two-arm census, monthly Fable/Astra census', () => {
+  type CensusStep = Step & { if?: string };
+  type CensusWf = { on: { schedule: Array<{ cron: string }>; workflow_dispatch: { inputs: Record<string, { type?: string; default?: unknown }> } };
+    concurrency: { group: string }; jobs: Record<string, { if?: string; outputs?: Record<string, string>; steps: CensusStep[] }> };
+  const wf = Bun.YAML.parse(periodicYml) as CensusWf;
+  const planner = wf.jobs['plan-slices']!;
+  const census = wf.jobs['gate-census']!;
+  const report = wf.jobs.report!;
+
+  test('each arm is one host and model: the capture default and gpt-6.1-sol weekly, claude-fable-5-1 and gpt-6-astra monthly', () => {
+    expect(WEEKLY_CENSUS_ARMS).toEqual(['claude-opus', 'codex-sol']);
+    expect(MONTHLY_CENSUS_ARMS).toEqual(['claude-fable', 'codex-astra']);
+    // claude-opus pins no model: the Claude runners' capture default (lib/eval-model.ts) applies.
+    expect(censusArmEnv('claude-opus')).toEqual({ EVALS_HOST: 'claude' });
+    expect(censusArmEnv('codex-sol')).toEqual({ EVALS_HOST: 'codex', GSTACK_CODEX_MODEL: 'gpt-6.1-sol' });
+    expect(censusArmEnv('claude-fable')).toEqual({ EVALS_HOST: 'claude', EVALS_MODEL: 'claude-fable-5-1' });
+    expect(censusArmEnv('codex-astra')).toEqual({ EVALS_HOST: 'codex', GSTACK_CODEX_MODEL: 'gpt-6-astra' });
+    expect(() => censusArmEnv('codex-luna')).toThrow('unknown census arm');
+    // The report files slice artifacts by arm suffix: no arm id may end another one.
+    const ids = Object.keys(CENSUS_ARMS);
+    for (const a of ids) for (const b of ids) if (a !== b) expect(a.endsWith(`-${b}`)).toBe(false);
+    for (const id of ids) expect(id).toMatch(/^[a-z]+-[a-z]+$/);
+  });
+
+  test('the monthly cron runs only the census, under its own concurrency group; the Monday and daily canary schedules are unchanged', () => {
+    expect(wf.on.schedule.map(entry => entry.cron)).toEqual([WEEKLY_CENSUS_SCHEDULE, '30 7 * * *', MONTHLY_CENSUS_SCHEDULE]);
+    expect(MONTHLY_CENSUS_SCHEDULE).toBe('0 6 1 * *');
+    expect(wf.concurrency.group.endsWith("${{ github.event.schedule == '0 6 1 * *' && '-monthly' || '' }}")).toBe(true);
+    expect(wf.concurrency.group).toContain("(github.event.schedule == '30 7 * * *' || inputs.schema_canary_only) && '-schema-canary'");
+    expect(selectCensus({ schedule: MONTHLY_CENSUS_SCHEDULE, includeGateCensus: true })).toEqual({ arms: [...MONTHLY_CENSUS_ARMS], periodicLane: false });
+    const select = planner.steps.find(step => step.id === 'census')!;
+    expect(select.env).toMatchObject({ SCHEDULE: '${{ github.event.schedule }}', CENSUS_ARMS: '${{ inputs.census_arms }}' });
+    expect(planner.outputs).toMatchObject({ periodic_lane: '${{ steps.census.outputs.periodic_lane }}', census_arms: '${{ steps.census.outputs.arms }}' });
+    // Without the periodic lane no periodic plan is emitted, executed or reconciled.
+    for (const step of planner.steps.filter(step => step.run?.includes('/tmp/paid-plan/manifest.json') || step.with?.name === 'paid-plan')) {
+      expect(step.if, step.name ?? step.with?.name).toBe("steps.census.outputs.periodic_lane == 'true'");
+    }
+    const reconcile = report.steps.find(step => step.id === 'reconcile')!;
+    expect(reconcile.env?.PERIODIC_LANE).toBe('${{ needs.plan-slices.outputs.periodic_lane }}');
+    expect(reconcile.run).toContain('if [ "$PERIODIC_LANE" != "true" ]; then');
+    // A census-only green run never closes the weekly tracking issue.
+    expect(report.steps.find(step => step.name === 'Close the tracking issue on a green run')!.if)
+      .toContain("needs.plan-slices.outputs.periodic_lane == 'true' && needs.eval-slices.result == 'success'");
+  });
+
+  test('a census_arms dispatch runs only the named arms and refuses unknown ones', () => {
+    expect(wf.on.workflow_dispatch.inputs.census_arms).toMatchObject({ type: 'string', default: '' });
+    expect(selectCensus({ censusArms: 'codex-sol', includeGateCensus: true })).toEqual({ arms: ['codex-sol'], periodicLane: false });
+    expect(selectCensus({ censusArms: 'claude-opus, codex-sol,codex-sol', includeGateCensus: false })).toEqual({ arms: ['claude-opus', 'codex-sol'], periodicLane: false });
+    expect(() => selectCensus({ censusArms: 'codex-sol,gpt', includeGateCensus: false })).toThrow('unknown census arm(s): gpt');
+    const cli = (args: string[], env: Record<string, string>) => {
+      const proc = spawnSync(process.execPath, ['--no-install', 'run', 'scripts/census-arms.ts', ...args],
+        { cwd: ROOT, env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8', timeout: 15_000 });
+      expect(proc.status, proc.stderr).toBe(0);
+      return proc.stdout;
+    };
+    expect(cli(['--select'], { SCHEDULE: MONTHLY_CENSUS_SCHEDULE })).toBe('arms=["claude-fable","codex-astra"]\nperiodic_lane=false\n');
+    expect(cli(['--select'], { CENSUS_ARMS: 'codex-sol', INCLUDE_GATE_CENSUS: 'true' })).toBe('arms=["codex-sol"]\nperiodic_lane=false\n');
+    expect(cli(['--env', 'codex-sol'], {})).toBe('EVALS_HOST=codex\nGSTACK_CODEX_MODEL=gpt-6.1-sol\n');
+  });
+
+  test('census artifacts and reconciliation are per arm', () => {
+    const upload = census.steps.find(step => step.name === 'Upload census results')!;
+    expect(upload.with!.name).toBe('gate-census-${{ matrix.slice }}-a${{ github.run_attempt }}-${{ matrix.arm }}');
+    expect(census.steps.find(step => step.name?.startsWith('Run gate census slice'))!.name).toContain('(${{ matrix.arm }})');
+    expect(report.steps.some(step => step.with?.pattern === 'gate-census-[0-9]*' && step.with?.path === '/tmp/gate-census-slices')).toBe(true);
+    const reconcile = report.steps.find(step => step.id === 'gate-reconcile')!;
+    expect(reconcile.env?.ARMS).toBe('${{ needs.plan-slices.outputs.census_arms }}');
+    expect(reconcile.run).toContain('cp "/tmp/gate-census-plan/$arm/manifest.json" "$dir/manifest.json" || status=1');
+    expect(reconcile.run).toContain('for slice in /tmp/gate-census-slices/gate-census-*-"$arm"; do');
+    expect(reconcile.run).toContain('EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report "$dir"');
+    // Every arm's report counts: one red arm fails the census.
+    expect(reconcile.run).toContain('if [ "$code" -ne 0 ]; then status=$code; fi');
+    expect(reconcile.run).toContain('echo "exit=$status" >> "$GITHUB_OUTPUT"');
   });
 });

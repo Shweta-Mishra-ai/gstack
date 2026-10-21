@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Native trusted-CI verification for reviewed OCI build inputs. */
 import { spawnSync } from 'node:child_process';
 import { committedImageBuildMatrix, type ImageBuildRow } from './cso-image-matrix';

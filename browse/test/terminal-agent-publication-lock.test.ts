@@ -6,7 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { acquireAgentStateLock, agentRecordPath, readAgentStartTime, writeAgentRecord, type AgentRecord } from '../src/terminal-agent-control';
 
 const roots: string[] = [];
-const children: ReturnType<typeof Bun.spawn>[] = [];
+const children: Bun.Subprocess[] = [];
+let unfinished: (() => Promise<Error>) | undefined;
 const directory = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-lock-'));
   roots.push(root);
@@ -31,6 +32,8 @@ async function fixture(dead = true) {
 }
 
 afterEach(async () => {
+  if (unfinished) console.error((await unfinished()).message);
+  unfinished = undefined;
   for (const child of children.splice(0)) {
     if (child.exitCode === null) try { child.kill('SIGKILL'); } catch {}
     await child.exited;
@@ -51,25 +54,36 @@ describe('owned terminal-agent publication lock recovery', () => {
 
   test.skipIf(process.platform !== 'linux')('a dead zombie with the exact recorded birth cannot retain its publication lock', async () => {
     const root = directory();
-    const ready = path.join(root, 'zombie-pid');
     const python = [
       'import os,time',
       'pid=os.fork()',
       'if pid==0: os._exit(0)',
-      `with open(${JSON.stringify(ready)},'w') as f: f.write(str(pid))`,
+      'os.waitid(os.P_PID,pid,os.WEXITED|os.WNOWAIT)',
+      'print(pid,flush=True)',
       'time.sleep(30)',
     ].join('\n');
-    const parent = Bun.spawn(['python3', '-c', python], { stdio: ['ignore', 'ignore', 'ignore'] });
+    const parent = Bun.spawn(['python3', '-c', python], { stdio: ['ignore', 'pipe', 'pipe'] });
     children.push(parent);
-    for (let n = 0; n < 300 && !fs.existsSync(ready); n++) await Bun.sleep(10);
-    expect(fs.existsSync(ready)).toBe(true);
-    const pid = Number(fs.readFileSync(ready, 'utf8'));
-    let state = '';
-    for (let n = 0; n < 300; n++) {
-      state = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').match(/^\d+ \(.*\) ([A-Z])/u)?.[1] || '';
-      if (state === 'Z') break;
-      await Bun.sleep(10);
+    const failure = async (reason: string) => {
+      if (parent.exitCode === null) parent.kill('SIGKILL');
+      const status = await parent.exited;
+      const stderr = await new Response(parent.stderr).text();
+      return new Error(`${reason}; zombie parent exit status ${status}; stderr tail: ${stderr.slice(-500) || '(empty)'}`);
+    };
+    unfinished = () => failure('zombie parent never reported its exited child');
+    const reader = parent.stdout.getReader();
+    let line = '';
+    while (!line.includes('\n')) {
+      const chunk = await reader.read();
+      if (chunk.done) throw await failure(`zombie parent closed stdout before a full PID line (got ${JSON.stringify(line)})`);
+      line += new TextDecoder().decode(chunk.value);
     }
+    reader.releaseLock();
+    unfinished = undefined;
+    const reported = line.slice(0, line.indexOf('\n'));
+    if (!/^[1-9]\d*$/.test(reported)) throw await failure(`zombie parent reported a malformed PID ${JSON.stringify(reported)}`);
+    const pid = Number(reported);
+    const state = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').match(/^\d+ \(.*\) ([A-Z])/u)?.[1] || '';
     expect(state).toBe('Z');
     expect(() => process.kill(pid, 0)).not.toThrow();
     const record: AgentRecord = { pid, gen: 'zombie-generation', startedAt: Date.now(),

@@ -1,6 +1,6 @@
 import type { TemplateContext } from './types';
 import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
-import { CLAUDE_FRONTIER_EVAL_MODEL } from '../../lib/eval-model';
+import { CLAUDE_CAPTURE_EVAL_MODEL } from '../../lib/eval-model';
 
 /**
  * {{CODEX_WEB_SEARCH_FLAG}} — the non-deprecated codex web-search flag
@@ -25,7 +25,7 @@ export function generateCodexReviewModelConfigFlag(_ctx: TemplateContext): strin
 }
 
 export function generateClaudeModelFlag(_ctx: TemplateContext): string {
-  return `--model "\${GSTACK_CLAUDE_MODEL:-${CLAUDE_FRONTIER_EVAL_MODEL}}"`;
+  return `--model "\${GSTACK_CLAUDE_MODEL:-${CLAUDE_CAPTURE_EVAL_MODEL}}"`;
 }
 
 export function generateSlugEval(ctx: TemplateContext): string {

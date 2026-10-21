@@ -1,16 +1,30 @@
-import { afterEach, describe, expect, jest, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, jest, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { initializePlan, prepareMethodology, createSnapshot, preparePhaseClose, prepareAmendedInput } from '../bin/gstack-autoplan-snapshot';
 import { evaluateAutoplanPublication, runPublicationHook, autoplanReadRange, type PublicationHookInput } from '../autoplan/bin/phase-publication-hook.ts';
-import { readOwnedClaudePublicTranscript, nativePathSpelling, ownedNativePath, sameNativePath, type ClaudeParentPublicEvent } from '../lib/claude-public-transcript';
+import { readOwnedClaudePublicTranscript, readPlanCountTranscript, transcriptReadLimit, OWNED_TRANSCRIPT_MAX_BYTES, nativePathSpelling, ownedNativePath, sameNativePath, type ClaudeParentPublicEvent } from '../lib/claude-public-transcript';
 import { prematureAutoplanPhaseEntry } from './helpers/autoplan-method-read-audit';
 import captured from './fixtures/autoplan-publication-boundary-361c.json';
 import consumption from './fixtures/autoplan-phase-consumption-491.json';
+import { OWNED_READ_APPROVAL, renderSectionBase } from '../autoplan/bin/owned-read';
 
 const ROOT = fs.realpathSync(path.join(import.meta.dir, '..'));
+// Every guarded decision appends to the guard log; keep it out of the real state root.
+let previousGstackHome: string | undefined;
+let guardLogHome = '';
+beforeAll(() => {
+  previousGstackHome = process.env.GSTACK_HOME;
+  guardLogHome = fs.mkdtempSync(path.join(tmpdir(), 'autoplan-guard-log-'));
+  process.env.GSTACK_HOME = guardLogHome;
+});
+afterAll(() => {
+  if (previousGstackHome === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = previousGstackHome;
+  fs.rmSync(guardLogHome, { recursive: true, force: true });
+});
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 const phaseNumber = { ceo: 1, design: 2, dx: 2.5, eng: 3 };
@@ -154,7 +168,7 @@ describe('Autoplan parent publication guard', () => {
     expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT)))
       .toMatchObject({ hookSpecificOutput: { permissionDecisionReason: expect.stringContaining('Publish the filled Phase 3') } });
     f.events.pop(); f.message('Phase 3 complete.'); f.current(); f.journal();
-    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
   });
 
   for (const phase of ['ceo', 'design', 'dx', 'eng'] as const)
@@ -284,7 +298,7 @@ describe('Autoplan parent publication guard', () => {
   test('native project ownership survives a Bash cd through the installed skill link', async () => {
     const { f } = changedDirectory();
     expect(readOwnedClaudePublicTranscript(f.input.transcript_path, f.input.cwd, f.sessionId).transcript.status).toBe('missing');
-    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
   });
 
   test('native project ownership still requires publication and permits same-phase repair after cd', async () => {
@@ -292,7 +306,7 @@ describe('Autoplan parent publication guard', () => {
     const output: any = await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT));
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain('Publish the filled Phase 1');
     const same = changedDirectory(false, 'ceo-phase.md');
-    expect(await withNativeProjectDirectory(same.f.cwd, () => runPublicationHook(same.f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(same.f.cwd, () => runPublicationHook(same.f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
   });
 
   test('the literal init parser retains Windows drive and UNC identities', () => {
@@ -329,11 +343,69 @@ describe('Autoplan parent publication guard', () => {
     }
   });
 
+  const withReadLimit = async <T>(bytes: number, run: () => T | Promise<T>): Promise<T> => {
+    const prior = process.env.GSTACK_TRANSCRIPT_TEST_MAX_BYTES;
+    process.env.GSTACK_TRANSCRIPT_TEST_MAX_BYTES = String(bytes);
+    try { return await run(); } finally {
+      if (prior === undefined) delete process.env.GSTACK_TRANSCRIPT_TEST_MAX_BYTES; else process.env.GSTACK_TRANSCRIPT_TEST_MAX_BYTES = prior;
+    }
+  };
+  test('CEO-2 + UC1: a journal larger than the record bound reads; one record one byte over it is an unverified allow naming its size, code and anchor', async () => {
+    const f = fixture();
+    f.message(); f.current(); f.journal();
+    const size = fs.statSync(f.input.transcript_path).size;
+    const record = Math.max(...fs.readFileSync(f.input.transcript_path, 'utf8').split('\n').map(line => Buffer.byteLength(line)));
+    expect(size).toBeGreaterThan(record);
+    await withReadLimit(record, async () => {
+      expect(readOwnedClaudePublicTranscript(f.input.transcript_path, f.input.cwd, f.sessionId).transcript.status).toBe('ready');
+      expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
+    });
+    const output: any = await withReadLimit(record - 1, async () => {
+      expect(readOwnedClaudePublicTranscript(f.input.transcript_path, f.input.cwd, f.sessionId).transcript.reason).toBe('too_large');
+      return withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT));
+    });
+    // Claude Code wrote a journal the guard cannot verify: allow, warn visibly, never deny.
+    expect(output.hookSpecificOutput.permissionDecision).toBeUndefined();
+    const warning: string = output.systemMessage;
+    expect(warning).toContain('phase publication was NOT verified');
+    expect(warning).toMatch(/[\d.]+ MiB, over the [\d.]+ MiB record limit/);
+    expect(warning).not.toContain(' 0 MiB');
+    expect(warning).toContain('code too_large');
+    expect(warning).toContain('docs/autoplan-guard-troubleshooting.md#too-large');
+    expect(warning).toContain('Phase-report enforcement was skipped');
+    expect(output.hookSpecificOutput.additionalContext).toContain('true autoplan-published <phase>');
+  });
+
+  test('#3050: the batch read and the narrowed parent loop report too_large, not a plain error', async () => {
+    const f = fixture();
+    f.message(); f.current(); f.journal();
+    const size = fs.statSync(f.input.transcript_path).size;
+    const config = path.dirname(path.dirname(path.dirname(f.input.transcript_path)));
+    await withReadLimit(size - 1, () => {
+      const batch = readPlanCountTranscript(config, f.input.cwd, () => {});
+      expect([batch.status, batch.reason]).toEqual(['error', 'too_large']);
+      const narrowed = readPlanCountTranscript(config, f.input.cwd, () => {}, f.input.transcript_path);
+      expect([narrowed.status, narrowed.reason]).toEqual(['error', 'too_large']);
+    });
+  });
+
+  test('#3050: the test seam can only lower the cap', async () => {
+    await withReadLimit(OWNED_TRANSCRIPT_MAX_BYTES * 4, () => expect(transcriptReadLimit()).toBe(OWNED_TRANSCRIPT_MAX_BYTES));
+  });
+
+  test('#3050: a real identity failure still reports identity', () => {
+    const f = fixture();
+    f.message(); f.current(); f.journal();
+    const other = path.join(path.dirname(f.input.transcript_path), 'not-this-session.jsonl');
+    fs.copyFileSync(f.input.transcript_path, other);
+    expect(readOwnedClaudePublicTranscript(other, f.input.cwd, f.sessionId).transcript.reason).toBe('identity');
+  });
+
   test('native hook accepts platform paths without evaluating shell escapes', async () => {
     // The same actual hook receives native separators in Windows CI.
     const f = fixture();
     f.message(); f.current(); f.journal();
-    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
     const command = f.events[0]!.input!.command as string;
     for (const suffix of ['; true', ' && true', ' | cat']) {
       f.events[0]!.input!.command = command + suffix; f.journal();
@@ -349,7 +421,7 @@ describe('Autoplan parent publication guard', () => {
 
   test('native project ownership preserves the absent-env same-directory adapter', async () => {
     const f = fixture(); f.message(); f.current(); f.journal();
-    expect(await withNativeProjectDirectory(undefined, () => runPublicationHook(f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(undefined, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
   });
 
   for (const project of ['absent', 'empty', 'relative', 'foreign', 'unnormalized'] as const) {
@@ -459,6 +531,49 @@ describe('Autoplan parent publication guard', () => {
       expect(f.evaluate().allow).toBe(false);
     });
   }
+
+  test('#3045: no init at all keeps the generic missing-evidence denial', () => {
+    const f = fixture(); f.message(); f.current(); f.events.splice(0, 2); f.reorder();
+    const reason = (f.evaluate() as any).reason;
+    expect(reason).toContain('Complete the existing snapshot init step');
+    expect(reason).not.toContain('cannot bind');
+  });
+  for (const [name, command] of [
+    ['a snapshot scope call', (f: any) => `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" scope "${f.active}"`],
+    ['an unrelated init', (f: any) => `bun other.ts init "${f.source}"`],
+  ] as const)
+    test(`#3045 control: ${name} keeps the generic missing-evidence denial`, () => {
+      const f = fixture(); f.message(); f.current();
+      (f.events[0] as any).input.command = command(f);
+      const reason = (f.evaluate() as any).reason;
+      expect(reason).toContain('Complete the existing snapshot init step');
+      expect(reason).not.toContain('cannot bind');
+    });
+  for (const [name, command] of [
+    ['a substituted tool path', (f: any) => `bun "$(realpath ${ROOT}/bin/gstack-autoplan-snapshot.ts)" init "${f.source}" "${f.active}" "${f.restore}"`],
+    ['a redirected literal init', (f: any) => `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${f.source}" "${f.active}" "${f.restore}" > /dev/null`],
+  ] as const)
+    test(`#3045: ${name} is named as the cause`, () => {
+      const f = fixture(); f.message(); f.current();
+      (f.events[0] as any).input.command = command(f);
+      expect((f.evaluate() as any).reason).toContain('which this guard cannot bind');
+    });
+  for (const [name, command] of [
+    ['a resolved-variable init piped to tail', (f: any) => `ST=$(bun -e 'console.log(require("fs").realpathSync(process.argv[1]))' "${ROOT}/bin/gstack-autoplan-snapshot.ts"); bun "$ST" init "${f.source}" "${f.active}" "${f.restore}" 2>&1 | tail -5`],
+    ['an init through a variable from an earlier call', (f: any) => `bun "$SNAPSHOT_TOOL" init "${f.source}" "${f.active}" "${f.restore}"`],
+    ['a chained literal init', (f: any) => `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${f.source}" "${f.active}" "${f.restore}" && echo done`],
+  ] as const)
+    test(`#3045: ${name} is named as the cause with the literal re-run; only the literal re-run binds`, () => {
+      const f = fixture(); f.message(); f.current();
+      (f.events[0] as any).input.command = command(f);
+      const reason = (f.evaluate() as any).reason;
+      expect(reason).toContain('which this guard cannot bind');
+      expect(reason).toContain('`bun "<SNAPSHOT_TOOL>" init "<SOURCE_PLAN>" "<ACTIVE_PLAN>" "<RESTORE_PATH>"`');
+      f.events.splice(2, 0, { ...(structuredClone(f.events[0]!) as any), toolUseId: 're-init',
+        input: { command: `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${f.source}" "${f.active}" "${f.restore}"` } },
+        { ...(structuredClone(f.events[1]!) as any), toolUseId: 're-init', content: JSON.stringify({ ...f.init, reused: true }) });
+      f.reorder(); expect(f.evaluate()).toEqual({ allow: true });
+    });
 
   test('split successful close ranges through EOF are sufficient', () => {
     const f = fixture(); f.events.splice(4, 2); f.read('part1', f.packet.closePacketPath, 1, 10);
@@ -687,7 +802,7 @@ describe('Autoplan parent publication guard', () => {
     await withNativeProjectDirectory(f.cwd, () => withPublicationClock(async () => {
       const started = performance.now();
       setTimeout(() => f.journal(), 1_950);
-      expect(await runPublicationHook(f.input, ROOT)).toEqual({});
+      expect(await runPublicationHook(f.input, ROOT)).toEqual(OWNED_READ_APPROVAL);
       expect(performance.now() - started).toBe(1_950);
       const decoded = readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId);
       expect(decoded.transcript.status).toBe('ready');
@@ -697,7 +812,7 @@ describe('Autoplan parent publication guard', () => {
   test('the actual owned native reader and asynchronous hook admit a flushed same-response report', async () => {
     const f = fixture(); f.message(); f.current();
     setTimeout(() => f.journal(), 100);
-    expect(await runPublicationHook(f.input, ROOT)).toEqual({});
+    expect(await runPublicationHook(f.input, ROOT)).toEqual(OWNED_READ_APPROVAL);
     const decoded = readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId);
     expect(decoded.transcript.status).toBe('ready');
     const report = decoded.events.find(e => e.kind === 'message')!, current = decoded.events.find(e => e.kind === 'use' && e.toolUseId === 'next')!;
@@ -722,22 +837,36 @@ describe('Autoplan parent publication guard', () => {
   });
   test('an in-flight Read can revisit an earlier established phase', async () => {
     const f = fixture('design', 'ceo'); f.journal();
-    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual({});
+    expect(await withNativeProjectDirectory(f.cwd, () => runPublicationHook(f.input, ROOT))).toEqual(OWNED_READ_APPROVAL);
   });
-  for (const kind of ['initial-entry', 'new-phase', 'agent', 'foreign-methodology', 'duplicate',
-    'foreign-session', 'orphan-current-result', 'pending-prior-entry', 'unpublished-predecessor', 'rearmed-human',
-    'forged-prior-range', 'malformed-journal', 'symlinked-journal'] as const)
-    test.serial(`an in-flight native Read does not bypass ${kind}`, async () => {
+  // CEO-1 replaced the pending-Read rule: the payload stands in for an unflushed
+  // current call, so a first Phase 1 entry is allowed from it (it needs no prior
+  // report), and a tool pending in an earlier message is journal lag (UC1: unverified).
+  for (const [kind, expected] of [['initial-entry', 'allow'], ['forged-prior-range', 'allow'], ['pending-prior-entry', 'journal_lag']] as const)
+    test.serial(`an in-flight native Read under CEO-1: ${kind} is ${expected}`, async () => {
       const f = fixture(); f.input.tool_input = { file_path: f.method, offset: 1, limit: 1 };
       if (kind === 'initial-entry') f.events.splice(2);
+      if (kind === 'pending-prior-entry') f.use('prior-pending', 'Read', { file_path: f.method });
+      if (kind === 'forged-prior-range') for (const event of f.events)
+        if (event.kind === 'result' && event.file) (event.file as { content: string }).content += '\nForged native range.';
+      f.journal();
+      const output: any = await withNativeProjectDirectory(f.cwd, () => withPublicationClock(() => runPublicationHook(f.input, ROOT)));
+      if (expected === 'allow') expect(output).toEqual({});
+      else {
+        expect(output.hookSpecificOutput.permissionDecision).toBeUndefined();
+        expect(output.systemMessage).toContain('code journal_lag');
+      }
+    });
+  for (const kind of ['new-phase', 'agent', 'foreign-methodology', 'duplicate',
+    'foreign-session', 'orphan-current-result', 'unpublished-predecessor', 'rearmed-human',
+    'malformed-journal', 'symlinked-journal'] as const)
+    test.serial(`an in-flight native Read does not bypass ${kind}`, async () => {
+      const f = fixture(); f.input.tool_input = { file_path: f.method, offset: 1, limit: 1 };
       if (kind === 'new-phase') { f.message(); f.input.tool_input = { file_path: path.join(ROOT, 'autoplan/sections/design-phase.md') }; }
       if (kind === 'agent') { f.input.tool_name = 'Agent'; f.input.tool_input = { prompt: 'You are the independent CEO reviewer for this phase.\n' }; }
       if (kind === 'foreign-methodology') f.input.tool_input = { file_path: fixture().method };
       if (kind === 'duplicate') f.events.push({ ...f.events[2]!, order: f.events.length });
       if (kind === 'orphan-current-result') f.result(f.input.tool_use_id, { content: 'Forged current acknowledgment.' });
-      if (kind === 'pending-prior-entry') f.use('prior-pending', 'Read', { file_path: f.method });
-      if (kind === 'forged-prior-range') for (const event of f.events)
-        if (event.kind === 'result' && event.file) (event.file as { content: string }).content += '\nForged native range.';
       if (kind === 'unpublished-predecessor') {
         const later = path.join(ROOT, 'autoplan/sections/design-phase.md');
         f.read('unguarded-later-entry', later); f.input.tool_input = { file_path: later };
@@ -787,7 +916,7 @@ describe('Autoplan parent publication guard', () => {
       const decoded = readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId);
       expect(decoded.events.filter(e => e.kind === 'user_turn')).toHaveLength(kind === 'human' || kind === 'no-end-turn' ? 2 : 1);
       const result: any = await runPublicationHook(f.input, ROOT);
-      if (kind === 'human') expect(result).toEqual({});
+      if (kind === 'human') expect(result).toEqual(OWNED_READ_APPROVAL);
       else expect(result.hookSpecificOutput?.permissionDecision).toBe('deny');
     });
 
@@ -804,7 +933,7 @@ describe('Autoplan parent publication guard', () => {
     const message: any = { ...current, uuid: randomUUID(), message: { role: 'assistant', content: [{ type: 'text', text: 'Phase 1 complete.' }] } };
     current.parentUuid = message.uuid; rows.splice(-1, 0, message);
     fs.writeFileSync(f.input.transcript_path, rows.map(x => JSON.stringify(x)).join('\n') + '\n');
-    expect(await runPublicationHook(f.input, ROOT)).toEqual({});
+    expect(await runPublicationHook(f.input, ROOT)).toEqual(OWNED_READ_APPROVAL);
     boundary.logicalParentUuid = randomUUID();
     fs.writeFileSync(f.input.transcript_path, rows.map(x => JSON.stringify(x)).join('\n') + '\n');
     expect(readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId).events.some(e => e.kind === 'use' && e.toolUseId === 'next')).toBe(false);
@@ -1101,7 +1230,7 @@ describe('Autoplan native journal roots and Windows spellings', () => {
       rows[0].parentUuid = chain.at(-1)!.uuid;
       rows.unshift(...(shape === 'stray-before' ? [attachment(f, null)] : []), ...chain); save();
       expect(status(f)).toBe('ready');
-      expect(await hook(f)).toEqual({});
+      expect(await hook(f)).toEqual(OWNED_READ_APPROVAL);
     });
 
   test('an attachment root still requires the parent publication', async () => {
@@ -1145,8 +1274,8 @@ describe('Autoplan native journal roots and Windows spellings', () => {
 
   test.if(windows)('CLAUDE_PROJECT_DIR spelled C:/ or c:\\ names the native journal cwd', async () => {
     const { f } = published();
-    expect(await hook(f, f.cwd.replaceAll('\\', '/'))).toEqual({});
-    expect(await hook(f, f.cwd[0]!.toLowerCase() + f.cwd.slice(1))).toEqual({});
+    expect(await hook(f, f.cwd.replaceAll('\\', '/'))).toEqual(OWNED_READ_APPROVAL);
+    expect(await hook(f, f.cwd[0]!.toLowerCase() + f.cwd.slice(1))).toEqual(OWNED_READ_APPROVAL);
     expect((await hook(f, f.cwd + '\\.') as any).hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
@@ -1212,10 +1341,7 @@ describe('Autoplan phase entry through the gbrain :user render (#2569)', () => {
     const linkRoot = path.join(scratch(), 'render', 'claude');
     for (const name of [...sections, 'phase-close.md']) {
       const text = fs.readFileSync(path.join(ROOT, 'autoplan/sections', name), 'utf8');
-      const hook = fs.readFileSync(path.join(ROOT, 'autoplan/bin/phase-publication-hook.ts'), 'utf8');
-      const fn = hook.slice(hook.indexOf('function renderSectionBase('), hook.indexOf('\n}\n', hook.indexOf('function renderSectionBase(')) + 2);
-      const ours = new Function(new Bun.Transpiler({ loader: 'ts' }).transformSync(fn) + '\nreturn renderSectionBase;')();
-      expect(ours(text, linkRoot)).toBe(rewriteSectionBase(text, linkRoot));
+      expect(renderSectionBase(text, linkRoot)).toBe(rewriteSectionBase(text, linkRoot));
     }
   });
 
@@ -1324,7 +1450,7 @@ describe('Autoplan ownership in a linked git worktree session', () => {
   test('the repository root owns its linked worktree journal', async () => {
     const f = fixture(); f.message(); f.current(); f.journal();
     const root = repo(); pointer(f.cwd, admin(root, f.cwd));
-    expect(await run(f, root)).toEqual({});
+    expect(await run(f, root)).toEqual(OWNED_READ_APPROVAL);
   });
 
   test('a linked worktree journal still requires the parent publication', async () => {
@@ -1339,7 +1465,7 @@ describe('Autoplan ownership in a linked git worktree session', () => {
     const entry = path.join(root, '.git', 'worktrees', 'session'); fs.mkdirSync(entry, { recursive: true });
     fs.writeFileSync(path.join(entry, 'gitdir'), lower(path.join(f.cwd, '.git')) + '\n');
     fs.writeFileSync(path.join(f.cwd, '.git'), `gitdir: ${lower(entry)}\n`);
-    expect(await run(f, lower(root))).toEqual({});
+    expect(await run(f, lower(root))).toEqual(OWNED_READ_APPROVAL);
   });
 
   test('worktree.useRelativePaths links resolve against each file\'s own directory', async () => {
@@ -1348,14 +1474,14 @@ describe('Autoplan ownership in a linked git worktree session', () => {
     // Exactly what git 2.55 `-c worktree.useRelativePaths=true worktree add` writes.
     fs.writeFileSync(path.join(entry, 'gitdir'), posix(path.relative(entry, path.join(f.cwd, '.git'))) + '\n');
     fs.writeFileSync(path.join(f.cwd, '.git'), `gitdir: ${posix(path.relative(f.cwd, entry))}\n`);
-    expect(await run(f, root)).toEqual({});
+    expect(await run(f, root)).toEqual(OWNED_READ_APPROVAL);
   });
 
   test('an unrelated linked worktree leaves the exact project-directory owner unchanged', async () => {
     const f = fixture(); f.message(); f.current(); f.journal();
     const elsewhere = repo(); fs.mkdirSync(path.join(f.cwd, '.git', 'worktrees', 'session'), { recursive: true });
     fs.writeFileSync(path.join(f.cwd, '.git', 'worktrees', 'session', 'gitdir'), posix(path.join(elsewhere, '.git')) + '\n');
-    expect(await run(f, f.cwd)).toEqual({});
+    expect(await run(f, f.cwd)).toEqual(OWNED_READ_APPROVAL);
   });
 
   for (const kind of ['no-link', 'worktree-file-only', 'admin-entry-only', 'other-repository',
@@ -1381,4 +1507,92 @@ describe('Autoplan ownership in a linked git worktree session', () => {
       expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
       expect(output.hookSpecificOutput.permissionDecisionReason).toContain('code foreign_cwd');
     });
+});
+
+describe('PAX-3638: symlinked plan directory and superseded failed inits', () => {
+  const skipWin = process.platform === 'win32';
+  /** The init Bash command spells active/restore through a symlinked directory; the journaled JSON stays canonical. */
+  function aliasFixture() {
+    const f = fixture();
+    const aliasDir = `${f.cwd}-alias`; dirs.push(aliasDir);
+    fs.symlinkSync(f.cwd, aliasDir, 'dir');
+    const aliasActive = path.join(aliasDir, 'active.md'), aliasRestore = path.join(aliasDir, 'restore.md');
+    const command = `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${f.source}" "${aliasActive}" "${aliasRestore}"`;
+    (f.events[0] as any).input.command = command;
+    expect(f.init.activePlan).toBe(f.active); // canonical, unlike the argv above
+    expect(aliasActive).not.toBe(f.active);
+    const erroredInit = (id: string) => [
+      { ...(structuredClone(f.events[0]!) as any), toolUseId: id },
+      { ...(structuredClone(f.events[1]!) as any), toolUseId: id, isError: true, content: 'Error: Initialization source must be nonempty UTF-8 text' },
+    ];
+    const ready = () => { f.message(); f.current(); f.reorder(); };
+    return { ...f, aliasDir, aliasActive, aliasRestore, command, erroredInit, ready };
+  }
+
+  test.skipIf(skipWin)('PAX-3638 Fix A: alias argv binds to init canonical paths', () => {
+    const f = aliasFixture(); f.ready();
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix B: errored first init followed by a correct init binds', () => {
+    const f = aliasFixture(); f.events.unshift(...f.erroredInit('bad-init') as any); f.ready();
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix C: errored init with no later success is init_failed and says re-run', () => {
+    const f = aliasFixture(); (f.events[1] as any).isError = true; f.ready();
+    const decision = f.evaluate() as any, reason: string = decision.reason;
+    expect(decision.allow).toBe(false); expect(reason).toContain('(code init_failed,');
+    expect(reason).toContain('re-run');
+    expect(reason).toContain('The most recent snapshot init call failed');
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix B: a trailing errored init after a good bind is init_failed', () => {
+    const f = aliasFixture(); f.events.splice(2, 0, ...f.erroredInit('late-bad-init') as any); f.ready();
+    expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('(code init_failed,') });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix B: a later good init supersedes a trailing errored one', () => {
+    const f = aliasFixture(); f.events.splice(2, 0, ...f.erroredInit('late-bad-init') as any);
+    f.events.splice(4, 0, { ...(structuredClone(f.events[0]!) as any), toolUseId: 'again' },
+      { ...(structuredClone(f.events[1]!) as any), toolUseId: 'again', content: JSON.stringify({ ...f.init, reused: true }) });
+    f.ready();
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  for (const field of ['activePlan', 'restorePath'] as const)
+    test.skipIf(skipWin)(`PAX-3638 Fix C: retargeted ${field} is init_mismatch without a re-run hint`, () => {
+      const f = aliasFixture(); (f.events[1] as any).content = JSON.stringify({ ...f.init, [field]: f.source }); f.ready();
+      const decision = f.evaluate() as any, reason: string = decision.reason;
+      expect(decision.allow).toBe(false); expect(reason).toContain('(code init_mismatch,');
+      expect(reason).toContain('do not match the canonical form of its own command arguments');
+      expect(reason).not.toContain('re-run');
+    });
+
+  test.skipIf(skipWin)('PAX-3638 Fix B: zero results for an init use still denies', () => {
+    const f = aliasFixture(); f.events.splice(1, 1); f.ready();
+    expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('(code init_mismatch,') });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix A: an argv that cannot be canonicalized is init_mismatch, not a hook crash', () => {
+    const f = aliasFixture();
+    (f.events[0] as any).input.command = `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${f.source}" "${f.source}/not-a-dir/active.md" "${f.aliasRestore}"`;
+    f.ready();
+    expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('(code init_mismatch,') });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix A: a mistyped tool path is unbindable, and a later correct init still binds', () => {
+    const f = aliasFixture();
+    const bad = { ...(structuredClone(f.events[0]!) as any), toolUseId: 'typo' };
+    bad.input.command = bad.input.command.replace('gstack-autoplan-snapshot.ts', 'gstack-autoplan-snapshto.ts');
+    f.events.unshift(bad); f.ready();
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  test.skipIf(skipWin)('PAX-3638 Fix A2: a pending Edit through the alias spelling is the same file', () => {
+    const f = aliasFixture(); f.message();
+    f.use('alias-edit', 'Edit', { file_path: f.aliasActive, old_string: 'Keep documented behavior.', new_string: 'Implement new behavior.' });
+    f.current(); f.reorder();
+    expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('(code mutation_pending,') });
+  });
 });

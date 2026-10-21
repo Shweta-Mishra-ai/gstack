@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * One-release stubs for retired package scripts. Each retired name in
  * package.json runs `bun run scripts/retired-command.ts <name>`, which prints

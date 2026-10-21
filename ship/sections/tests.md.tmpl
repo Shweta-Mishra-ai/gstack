@@ -6,6 +6,18 @@
 
 ## Step 5: Run tests (on merged code)
 
+**Pre-gate first** — free, before any lane, eval or remote gate:
+
+```bash
+~/.claude/skills/gstack/bin/gstack-pregate --allow-repo-commands
+```
+
+Stage 1 (regen, secrets, strays, literals) is the two-minute preflight; stage 2
+runs the selected lanes under pipefail. `fail` or `incomplete` blocks: fix,
+rerun. `requires-remote` (other platforms; the remote gate under 8 cores) needs
+`gstack-pregate clear` or, under a user cap, `--remote --spend-cap <usd>`. Rerun
+after the final stamp; Step 18 refuses a stale one.
+
 Use the project's test commands discovered in Step 4 or documented in CLAUDE.md/AGENTS.md. Run every applicable suite; do not assume Rails or Vitest. The commands below are examples only for repositories that actually provide them. Use the same lane labels and exact commands again in Step 16.
 
 **If no applicable test suite exists:** Name the untested scope. AskUserQuestion:
@@ -28,9 +40,10 @@ records `{command, exit, working-tree fingerprint, log path}` to
 record instead of re-running when the content hasn't changed:
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-evidence run --label tests -- 'bin/test-lane 2>&1' &
-~/.claude/skills/gstack/bin/gstack-evidence run --label vitest -- 'npm run test 2>&1' &
-wait
+set -o pipefail; pids=()
+~/.claude/skills/gstack/bin/gstack-evidence run --label tests -- 'bin/test-lane 2>&1' & pids+=($!)
+~/.claude/skills/gstack/bin/gstack-evidence run --label vitest -- 'npm run test 2>&1' & pids+=($!)
+fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done; echo "lanes failed=$fail"
 ```
 
 After all suites complete, check the `gstack-evidence: recorded label=... exit=...
@@ -38,13 +51,29 @@ log=...` summary lines — each carries the lane's exit code and a per-run log
 file (no shared /tmp collisions between concurrent ships). Read the log files
 for failure detail.
 
-**If any test fails:** Do NOT immediately stop. Apply the Test Failure Ownership Triage:
+**A lane passes on its runner summary line, not on exit 0 alone.** Read each
+lane's `tests_ran` from its receipt (or from the runner's own summary in the log)
+and keep the three states apart; never merge them:
+
+1. `tests_ran: N` (N > 0) with exit 0 — the lane passed; record N for the PR body.
+2. `tests_ran: 0` — **ZERO-RUN**: bun `0 pass 0 fail`, jest "No tests found", pytest
+   "no tests ran", rspec "0 examples", `go test` with only `[no test files]`, or an
+   empty selection after a filter. Exit 0 here is not a pass, so triage a ZERO-RUN
+   lane below as a failed lane: a bad selector, a missing file or a skipped `describe`
+   is an in-branch failure until proven otherwise.
+3. `tests_ran: unknown` — the runner's summary was not recognised. Keep today's
+   exit-0 pass and record `count unavailable` for that lane in the PR body.
+
+**If any test fails:** Do NOT immediately stop. When a free-suite shard failed,
+first Read `~/.claude/skills/gstack/ship/sections/measure.md` and rerun that
+shard's file list as it says (diagnostic, not a verdict). Then apply the Test
+Failure Ownership Triage:
 
 {{TEST_FAILURE_TRIAGE}}
 
 **After triage:** If any in-branch failures remain unfixed, **STOP**. Do not proceed. If all failures were pre-existing and handled (fixed, TODOed, assigned, or skipped), continue to Step 6.
 
-**If all pass:** Report the pass counts in one line and continue to Step 6.
+**If all pass:** Report each lane's pass count (or `count unavailable`) in one line and continue to Step 6.
 
 ---
 
@@ -105,7 +134,10 @@ satisfy coverage.
 
 **3. Check results and save evidence for Step 19.**
 
-- **If any eval fails:** Show failures and available costs, then **STOP**.
+- **If any eval fails:** Do not rerun the full gate. Show failures and available
+  costs, then Read `~/.claude/skills/gstack/ship/sections/measure.md` and run its
+  loop for each red case: classify, measure alone, fix at the cause, re-measure,
+  then gate once. **STOP** only at its named-red stop.
 - **If all selected evals pass:** Record actual counts, any reused evidence and
   its source, and available costs. Continue to Step 7.
 

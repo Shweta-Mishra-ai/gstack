@@ -27,7 +27,7 @@ Invoke them by name (e.g., `/office-hours`).
 
 | Skill | What it does |
 |-------|-------------|
-| `/review` | Pre-landing PR review. Finds bugs that pass CI but break in prod. |
+| `/review` | Pre-landing PR review. Finds bugs that pass CI but break in prod; lists every gate edit for gate integrity. |
 | `/deslop-shared-libs` | Find worthwhile shared-code extractions in recent work. Recommendations only. |
 | `/test-audit` | Sweep existing tests for low-value, implementation-coupled or duplicate tests. Report-only unless you approve a batch. |
 | `/codex` | Second opinion via OpenAI Codex. Review, challenge, or consult modes. Available outside the Codex harness. |
@@ -46,7 +46,7 @@ Invoke them by name (e.g., `/office-hours`).
 
 | Skill | What it does |
 |-------|-------------|
-| `/ship` | Run tests, review, push, open PR. Workspace-aware version queue. |
+| `/ship` | Run tests, review, gate integrity, push, open PR. Workspace-aware version queue. |
 | `/land-and-deploy` | Merge the PR, wait for CI and deploy, verify production health. |
 | `/canary` | Post-deploy monitoring loop in your Aside browser (or gstack's own when Aside is absent). |
 | `/landing-report` | Read-only dashboard for the workspace-aware ship queue. |
@@ -66,6 +66,7 @@ Invoke them by name (e.g., `/office-hours`).
 | `/health` | Code quality dashboard (type checker, linter, tests, dead code). |
 | `/benchmark` | Performance regression detection (page load, Core Web Vitals). |
 | `/benchmark-models` | Cross-model benchmark for skills (Claude, GPT, Gemini side-by-side). |
+| `/eval-plan` | Preregister a paid eval (bars, arms, decoys, stop rules), dry-run it for $0, pilot three priced items, then approve the spend. |
 | `/cso` | Supported security findings with explicit coverage. Static assessment remains available without catalog profiles; contained runtime/scanner execution requires matching qualified profiles, and no catalog has one yet (scanner build inputs are reviewed and await their qualification run; runtime qualification needs a private evaluator that is still being built), so `/cso` runs static assessment only. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
 | `/setup-gbrain` | Set up gbrain for cross-machine session memory sync. |
 | `/sync-gbrain` | Keep gbrain current with this repo's code; refresh agent search guidance in CLAUDE.md. |
@@ -210,11 +211,16 @@ When fixing failures or preparing `/ship`, follow this order:
    result and pending permission state; diagnose a blocked actor before waiting
    through its deadline. Preserve cancellation separately from a test verdict.
    Skipped or unstarted cases
-   do not satisfy coverage; preserve every attempt. Paid evals never retry. Each
+   do not satisfy coverage; preserve every attempt. Paid evals never retry, with
+   one exception: the gate reruns a red rule, behavior or judge case verdict once
+   at the same head (Garry, 2026-10-19: "you can just run the failed test again
+   and note that it is flaky"); a pass is green with a flaky annotation and a
+   flake record, a second failure is a real red, and harness, INFRA, INCOMPLETE
+   or unattributed reds never rerun (`docs/TESTING_INTERNALS.md#flaky-reruns`). Each
    case's kind (`E2E_KINDS`) fixes its trials before the run: `rule` one trial;
    `behavior` a panel of 3 independent trials, PASS at >= 2 with no contract
-   violation; `judge` 3 samples on one output, gated on the mean against the
-   unchanged threshold. Never add trials, samples or dispatches after seeing a
+   violation; `judge` 3 samples on one output, each dimension gated on its
+   median (at least 2 of 3 samples) against the unchanged threshold. Never add trials, samples or dispatches after seeing a
    result, never change a kind to change a verdict without pass-rate evidence,
    and report every trial. Quarantine follows `CASE_QUARANTINE`'s entry and exit
    rules only (`EVAL_POLICY`, `docs/TESTING_INTERNALS.md`). A census whose every
@@ -297,3 +303,4 @@ Agents poll `eval:bg:*` logs for the `### gstack-detach EXIT=<code> ###` sentine
 - Every Codex run's verdict goes through `lib/outside-review-result.ts`; its reason codes live in `lib/gate-outcomes.ts`, each with a `docs/troubleshooting.md` anchor.
 - `test/module-size-ratchet.test.ts` keeps refactored owner modules at or under 800 lines (150 per function) and residual files from growing.
 - The `claude` CLI binary resolves via `lib/claude-bin.ts` (re-exported from `browse/src/claude-bin.ts` for browse internals; `Bun.which()` + `GSTACK_CLAUDE_BIN` override). Set `GSTACK_CLAUDE_BIN=wsl` plus `GSTACK_CLAUDE_BIN_ARGS='["claude"]'` to run Claude through WSL on Windows.
+- Every Bun gstack starts ignores the working directory's `.env` files and `bunfig.toml`: bun shebangs are `#!/usr/bin/env -S bun --no-env-file --config=/dev/null`, shell and skill callers pass `bun --no-env-file --config=/dev/null`, TypeScript spawns use `bunIsolationArgs()` from `lib/bun-isolation.ts`, and `bun build --compile` adds `--no-compile-autoload-dotenv --no-compile-autoload-bunfig`. `test/bun-entry-isolation.test.ts` enforces all four.

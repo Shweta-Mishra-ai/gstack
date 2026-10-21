@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * test:health — the audit's success metrics as one command, read from CI
  * history (scripts/lib/ci-history.ts, the same reader pass-rates uses) plus
@@ -33,7 +33,7 @@ export const COMPLEXITY_PATHS = ['scripts', 'test/helpers', '.github/workflows']
 export interface Metric { id: string; title: string; rule: string; value?: string; detail?: string[]; unavailable?: string }
 export interface Check { id: string; title: string; status: 'pass' | 'fail' | 'unavailable'; detail: string; fix: string }
 export type IssueAction = 'upsert' | 'keep-open' | 'close';
-export interface HealthReport { repo: string; sinceDays: number; generatedAt: string; metrics: Metric[]; checks: Check[]; issueAction: IssueAction }
+export interface HealthReport { repo: string; sinceDays: number; generatedAt: string; headline?: string; metrics: Metric[]; checks: Check[]; issueAction: IssueAction }
 
 export interface HealthInputs {
   client: GhClient;
@@ -138,7 +138,7 @@ export function flakeCheck(window: FlakeWindow | Error): Check {
 
 export function unseededCheck(root: string): Check {
   const base = { id: 'unseeded-free-files', title: 'Free test files missing from the duration seed (CEO-10)',
-    fix: 'Refresh the seed: `bun run test:ubicloud --record-durations` (or a CI recording; a 4-core laptop recording is not acceptable), then commit scripts/free-test-durations.json (docs/TESTING_INTERNALS.md#free-suite-duration-seed).' };
+    fix: 'Refresh the seed with UBICLOUD_API_KEY set: `bun run test:ubicloud --record-durations` times every free file on a CI-mirrored VM and copies scripts/free-test-durations.json back into this checkout; commit it (docs/TESTING_INTERNALS.md#free-suite-duration-seed). Without UBICLOUD_API_KEY, leave the refresh to a maintainer: a 4-core laptop or sandbox recording skips or slows browser and display tests, so it is not accepted.' };
   const durations = loadFreeTestDurations(root);
   if (!durations) return { ...base, status: 'unavailable', detail: 'unavailable: scripts/free-test-durations.json is missing or unreadable; next: refresh the seed' };
   const unseeded = unseededFreeFiles(collectFreeTestFiles(root), durations);
@@ -188,20 +188,68 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
   const need = <T>(value: T | Error): T => { if (value instanceof Error) throw value; return value; };
   const prRecords = attempt(() => need(prRuns).filter(run => run.conclusion !== 'cancelled')
     .map(run => ({ run, trials: records(artifactDirs(run, name => name.startsWith('trial-outcomes'))) })));
+  const prManifests = attempt(() => need(prRuns).flatMap(run => {
+    const file = artifactDirs(run, name => name === 'paid-plan').map(dir => path.join(dir, 'manifest.json')).find(candidate => fs.existsSync(candidate));
+    return file ? [{ run, manifest: readJson(file) }] : [];
+  }));
   const metrics: Metric[] = [];
+  let costPerMergedPr: string | undefined;
 
-  metrics.push(metric('pr-fallback-rate', 'PR full-fallback rate', 'share of evals.yml pull_request runs whose paid-plan manifest has prCoverage.mode = full-fallback', () => {
+  metrics.push(metric('pr-fallback-rate', 'PR full-fallback rate', 'share of evals.yml pull_request runs whose paid-plan manifest has prCoverage.mode = full-fallback (a label, not spend: dependents runs select about as much)', () => {
     const modes = new Map<string, number>();
-    for (const run of need(prRuns)) {
-      const manifest = artifactDirs(run, name => name === 'paid-plan').flatMap(dir => [path.join(dir, 'manifest.json')]).find(file => fs.existsSync(file));
-      if (!manifest) continue;
-      const mode = String(readJson(manifest).prCoverage?.mode ?? 'none');
+    for (const { manifest } of need(prManifests)) {
+      const mode = String(manifest.prCoverage?.mode ?? 'none');
       modes.set(mode, (modes.get(mode) ?? 0) + 1);
     }
     const total = [...modes.values()].reduce((a, b) => a + b, 0);
     if (total === 0) throw new Error('no paid-plan manifests in the window');
     return { value: `${pct((modes.get('full-fallback') ?? 0) / total)} (${modes.get('full-fallback') ?? 0}/${total} runs)`,
       detail: [...modes].map(([mode, count]) => `${mode}: ${count}`) };
+  }));
+
+  metrics.push(metric('pr-cases-per-run', 'Selected gate cases and judges per PR run', 'mean length of prCoverage.e2e (gate cases) and prCoverage.judges in the paid-plan manifests of evals.yml pull_request runs, overall and per mode', () => {
+    const planned = need(prManifests).filter(({ manifest }) => Array.isArray(manifest.prCoverage?.e2e) && Array.isArray(manifest.prCoverage?.judges));
+    if (planned.length === 0) throw new Error('no paid-plan manifest with prCoverage.e2e and prCoverage.judges in the window');
+    const mean = (entries: typeof planned) => `${(entries.reduce((sum, { manifest }) => sum + manifest.prCoverage.e2e.length, 0) / entries.length).toFixed(1)} gate cases, ${(entries.reduce((sum, { manifest }) => sum + manifest.prCoverage.judges.length, 0) / entries.length).toFixed(1)} judges`;
+    const modes = [...new Set(planned.map(({ manifest }) => String(manifest.prCoverage.mode)))].sort();
+    return { value: `${mean(planned)} per run (${planned.length} runs)`,
+      detail: modes.map(mode => { const entries = planned.filter(({ manifest }) => String(manifest.prCoverage.mode) === mode); return `${mode}: ${mean(entries)} (${entries.length} runs)`; }) };
+  }));
+
+  metrics.push(metric('pr-known-cost-per-run', 'Known cost per PR run', 'mean over non-cancelled evals.yml pull_request runs of executed trial cost_usd with a known cost (a run with no trial records counts $0), overall and per manifest mode; unknown-cost trials (PTY) are counted, not priced', () => {
+    const entries = need(prRecords);
+    if (entries.length === 0) throw new Error('no non-cancelled PR runs in the window');
+    const known = (trials: TrialRecord[]) => trials.filter(record => record.execution === 'executed' && record.cost_known !== false).reduce((sum, record) => sum + record.cost_usd, 0);
+    const unknown = entries.flatMap(entry => entry.trials).filter(record => record.execution === 'executed' && record.cost_known === false).length;
+    const modeOf = new Map((prManifests instanceof Error ? [] : prManifests).map(({ run, manifest }) => [run.id, String(manifest.prCoverage?.mode ?? 'none')]));
+    const mean = (list: typeof entries) => `$${(list.reduce((sum, entry) => sum + known(entry.trials), 0) / list.length).toFixed(2)}`;
+    const modes = [...new Set(entries.map(entry => modeOf.get(entry.run.id) ?? 'no manifest'))].sort();
+    return { value: `${mean(entries)} per run (${entries.length} runs; ${unknown} executed trial(s) with unknown cost)`,
+      detail: modes.map(mode => { const list = entries.filter(entry => (modeOf.get(entry.run.id) ?? 'no manifest') === mode); return `${mode}: ${mean(list)} (${list.length} runs)`; }) };
+  }));
+
+  metrics.push(metric('pr-shadow-map', 'Exercised-path map shadow (not active)', 'over evals.yml pull_request runs whose paid-plan manifest carries prCoverage.shadow: the predicted saving (map per-case known cost of dropped minus added cases; a lower bound, since known cost excludes PTY trials with unknown cost) and shadow drops of red cases (more executed failed than passed trials in the run, on a case the shadow would drop). A drop counts toward the D3 activation bar as a miss unless the case passed in a later run of the same branch at the same head SHA, which marks it a flaky drop. Scaled to 7 days; docs/TESTING_INTERNALS.md#exercised-path-map', () => {
+    const shadowed = need(prManifests).filter(({ manifest }) => manifest.prCoverage?.shadow && !manifest.prCoverage.shadow.error);
+    if (shadowed.length === 0) throw new Error('no paid-plan manifest with a prCoverage.shadow block in the window');
+    const records = prRecords instanceof Error ? [] : prRecords;
+    const executed = (trials: TrialRecord[], id: string, outcome: string) => trials.filter(record => record.case === id && record.execution === 'executed' && record.outcome === outcome).length;
+    const saving = shadowed.reduce((sum, { manifest }) => sum + (Number(manifest.prCoverage.shadow.predictedSavingUsd) || 0), 0);
+    const shares = shadowed.map(({ manifest }) => Number(manifest.prCoverage.shadow.unknownCostShare)).filter(share => Number.isFinite(share) && share > 0);
+    const misses: string[] = [];
+    const flaky: string[] = [];
+    for (const { run, manifest } of shadowed) {
+      const trials = records.find(entry => entry.run.id === run.id)?.trials ?? [];
+      for (const id of (manifest.prCoverage.shadow.wouldDrop ?? []) as string[]) {
+        if (executed(trials, id, 'failed') <= executed(trials, id, 'passed')) continue;
+        const laterPass = records.find(entry => entry.run.branch === run.branch && entry.run.sha === run.sha
+          && (entry.run.createdAt > run.createdAt || (entry.run.id === run.id && entry.run.attempt > run.attempt)) && executed(entry.trials, id, 'passed') > 0);
+        if (laterPass) flaky.push(`${run.id}:${id} (passed in run ${laterPass.run.id})`); else misses.push(`${run.id}:${id}`);
+      }
+    }
+    const week = 7 / sinceDays;
+    const bound = shares.length ? `a lower bound: known cost excludes the ${Math.round(100 * Math.max(...shares))}% of observed case runs with unknown cost (PTY)` : 'a lower bound: known cost excludes PTY trials with unknown cost';
+    return { value: `$${(saving * week).toFixed(2)} predicted saving/week (${bound}); ${(misses.length * week).toFixed(1)} activation miss(es)/week, ${flaky.length} flaky drop(s) not counted (${shadowed.length} runs)`,
+      detail: [...misses.slice(0, 20).map(miss => `shadow miss: ${miss}`), ...flaky.slice(0, 20).map(drop => `flaky drop: ${drop}`)] };
   }));
 
   metrics.push(metric('pr-reused-trials', 'Reused PR trial records', 'trial-outcomes records with execution = reused across non-cancelled PR runs', () => {
@@ -216,6 +264,7 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
       .reduce((sum, record) => sum + record.cost_usd, 0);
     const revisions = new Set(entries.filter(entry => entry.run.conclusion === 'success' || entry.run.conclusion === 'failure').map(entry => entry.run.sha)).size;
     const merged = listMergedPulls(client, repo, since);
+    if (merged) costPerMergedPr = `$${(spend / merged).toFixed(2)} (${merged} merged PRs, $${spend.toFixed(2)} recorded)`;
     return { value: `$${spend.toFixed(2)} recorded`, detail: [
       `per merged PR: ${merged ? `$${(spend / merged).toFixed(2)} (${merged} merged)` : 'n/a (0 merged)'}`,
       `per validated revision: ${revisions ? `$${(spend / revisions).toFixed(2)} (${revisions} revisions)` : 'n/a'}`] };
@@ -228,7 +277,7 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
     return { value: `${(total / 60_000 * 7 / sinceDays).toFixed(0)} min/week (${cancelled.length} cancelled run(s))` };
   }));
 
-  metrics.push(metric('push-to-verdict', 'PR lane push-to-verdict', 'created_at to updated_at of evals.yml pull_request runs that reached success or failure (includes queue and debounce)', () => {
+  metrics.push(metric('push-to-verdict', 'PR lane push-to-verdict', 'created_at to updated_at of evals.yml pull_request runs that reached success or failure (includes queue and the readiness wait)', () => {
     const walls = need(prRuns).filter(run => run.conclusion === 'success' || run.conclusion === 'failure').map(run => span(run.createdAt, run.updatedAt)!);
     if (walls.length === 0) throw new Error('no PR run reached a verdict in the window');
     return { value: `p50 ${minutes(percentile(walls, 0.5))}, p95 ${minutes(percentile(walls, 0.95))} (${walls.length} runs)` };
@@ -243,12 +292,13 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
       detail: window.files.slice(0, 15).map(file => `${file.file}: ${file.flakyRuns}/${window.runs} runs (${pct(file.rate)})${file.failing ? ' FAIL > 5%' : ''}`) };
   }));
 
-  metrics.push(metric('free-wall', 'Free-suite and Windows wall', 'p50 of run_started_at to updated_at for successful main runs of free-tests.yml and windows-free-tests.yml', () => {
-    const wall = (workflow: string) => {
-      const walls = listWorkflowRuns(client, repo, workflow, { since, branch: 'main' }).filter(run => run.conclusion === 'success').map(run => span(run.startedAt, run.updatedAt)!);
-      return `${minutes(percentile(walls, 0.5))} (${walls.length} runs)`;
-    };
-    return { value: `free-tests ${wall('free-tests.yml')}; windows-free-tests ${wall('windows-free-tests.yml')}` };
+  metrics.push(metric('free-wall', 'Free-suite and Windows wall', 'p50 of run_started_at to updated_at for successful main runs of free-tests.yml and successful pull_request runs of windows-free-tests.yml (its workflow_dispatch duration recordings excluded)', () => {
+    const walls = (workflow: string, filter: { branch?: string; event?: string }) =>
+      listWorkflowRuns(client, repo, workflow, { since, ...filter }).filter(run => run.conclusion === 'success').map(run => span(run.startedAt, run.updatedAt)!);
+    const free = walls('free-tests.yml', { branch: 'main' });
+    const windows = walls('windows-free-tests.yml', { event: 'pull_request' });
+    const windowsValue = windows.length ? `${minutes(percentile(windows, 0.5))} (${windows.length} runs)` : 'no successful PR runs in window';
+    return { value: `free-tests ${minutes(percentile(free, 0.5))} (${free.length} runs); windows-free-tests (successful PR runs) ${windowsValue}` };
   }));
 
   metrics.push(metric('free-serial', 'Free-suite serial time', 'sum of scripts/free-test-durations.json (the committed seed)', () => {
@@ -266,7 +316,8 @@ export function collectHealth(inputs: HealthInputs): HealthReport {
   }));
 
   const checks = [flakeCheck(flakes), unseededCheck(root)];
-  return { repo, sinceDays, generatedAt: new Date(now).toISOString(), metrics, checks, issueAction: issueActionFor(checks) };
+  const headline = `Cost per merged PR: ${costPerMergedPr ?? `unavailable (${metrics.find(entry => entry.id === 'pr-spend')?.unavailable ?? '0 merged PRs'})`}`;
+  return { repo, sinceDays, generatedAt: new Date(now).toISOString(), headline, metrics, checks, issueAction: issueActionFor(checks) };
 }
 
 function listMergedPulls(client: GhClient, repo: string, since: string): number {
@@ -339,7 +390,7 @@ function censusMetrics(inputs: HealthInputs, artifactDirs: (run: CiRun, match: (
 // --- Rendering ---
 
 export function formatHealth(report: HealthReport): string {
-  const lines = [`test:health ${report.repo}, last ${report.sinceDays} day(s), ${report.generatedAt}`];
+  const lines = [`test:health ${report.repo}, last ${report.sinceDays} day(s), ${report.generatedAt}`, ...(report.headline ? [report.headline] : [])];
   for (const entry of report.metrics) {
     lines.push(`- ${entry.title}: ${entry.unavailable ? `unavailable: ${entry.unavailable}` : entry.value}`);
     lines.push(`    rule: ${entry.rule}`);

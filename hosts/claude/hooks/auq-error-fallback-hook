@@ -4,4 +4,4 @@
 # references this file directly.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-exec bun "$HERE/auq-error-fallback-hook.ts"
+exec bun --no-env-file --config=/dev/null "$HERE/auq-error-fallback-hook.ts"

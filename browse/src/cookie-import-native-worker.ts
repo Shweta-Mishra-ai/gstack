@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import { writeSync } from 'node:fs';
 import { createNativeCookieJob, joinNativeCookieJob, nativeCookieDiagnostic, parseNativeCookieDiagnostic, type NativeCookieDiagnostic, type NativeCookieJob } from './cookie-import-native-job';
 import type { PlaywrightCookie } from './cookie-import-browser';
+import { emptyBunConfig } from './bun-child-config';
 
 export interface NativeCookieRequest {
   nodeExecutable: string;
@@ -131,7 +132,7 @@ export async function superviseNativeCookieImport(
 }
 
 function startMember(request: NativeCookieRequest, jobName: string, mode = '--member'): NativeCookieMember {
-  const child = spawn(process.execPath, ['--no-env-file', '--no-install', '--no-macros', '--config=NUL', import.meta.path, mode], {
+  const child = spawn(process.execPath, ['--no-env-file', '--no-install', '--no-macros', `--config=${emptyBunConfig()}`, import.meta.path, mode], {
     env: nativeCookieEnvironment(process.env),
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,

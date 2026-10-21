@@ -5,7 +5,7 @@
  */
 import { type TemplateContext } from './types';
 import { generateInvokeSkill } from './composition';
-import { CC_BACKGROUND_DEFAULT_SINCE } from './constants';
+import { CC_BACKGROUND_DEFAULT_SINCE, FOREGROUND_IF_AVAILABLE, BACKGROUND_RECOVERY } from './constants';
 import { DESIGN_DOC_DISCOVERY_BLOCK } from './design-doc-discovery';
 
 export function generateAntiShortcutClause(_ctx: TemplateContext): string {
@@ -39,45 +39,61 @@ Create a fresh review directory next to the design:
 \`\`\`bash
 mktemp -d "<design-path>.review.XXXXXX"
 \`\`\`
-Remember its actual path for this invocation. Keep these evidence files with the design.
-Maximum 3 iterations total. Before EACH dispatch, generate the complete prompt using
+Keep these evidence files with the design. Maximum 3 iterations total. Before EACH dispatch, generate the complete prompt using
 all preceding valid round files in order (omit them for round 1):
 
 \`\`\`bash
 ~/.claude/skills/gstack/bin/gstack-office-hours-review prepare --design "<design-path>" --out-dir "<review-directory>" "<round-1.json if present>" "<round-2.json if present>"
 \`\`\`
 
-Omit absent arguments rather than passing placeholders. The helper chooses the next
+Omit absent arguments rather than passing placeholders. Users get 3 rounds; only
+when a caller sets a lower review round limit, add \`--max-rounds <N>\` with that
+same value to every prepare, check, and finalize command. The helper chooses the next
 round and writes \`round-N.prompt.md\`. It includes the full finding schema, all five
 review dimensions (Completeness, Consistency, Clarity, Scope, Feasibility), the
-office-hours coaching contract, and the COMPLETE preceding JSON verdict.
+office-hours coaching contract, and the COMPLETE preceding JSON verdict. It also
+saves the design as reviewed (\`round-N.design.md\`). Round 1 is a full review;
+rounds 2 and 3 are delta re-reviews of the exact design diff since the last round,
+so prepare every round in the same review directory and do not edit the design
+between prepare and its review.
 
-Use the Agent tool with \`run_in_background: false\` and its returned \`dispatch\`
-string unchanged as the prompt. The reviewer must Read the entire prepared prompt
+Use the Agent tool with ${FOREGROUND_IF_AVAILABLE} and its returned \`dispatch\`
+string unchanged as the prompt. ${BACKGROUND_RECOVERY} The reviewer must Read the entire prepared prompt
 file before reviewing the design. Do not recreate the prompt, copy selected fields,
 or summarize prior findings. A parent Read does not deliver the file to the reviewer.
 The reviewer has fresh context and cannot see the brainstorming conversation.
-Its prepared contract requires a complete JSON Write and an identical JSON response.
+Its prepared contract requires a complete JSON Write, sealed by the dispatch's
+\`Seal:\` command, and a one-line \`OFFICE_HOURS_VERDICT\` receipt as its entire response.
 It protects the required coaching and Assignment sections, distinguishes unknown
 customer facts from committed behavior, and requires evidence for every prior status.
 
 **Step 2: Check stop conditions, then fix and re-dispatch**
 
 After each verdict, BEFORE fixing any findings or dispatching again, validate the
-saved files with the helper (list every completed round in order):
+saved files with the helper. Pass the reviewer's entire response unchanged as the
+receipt (a lone \`OFFICE_HOURS_VERDICT\` line; with a quote, backtick, \`$\` or \`\\\` it is
+malformed) and list every completed round in order:
 
 \`\`\`bash
-~/.claude/skills/gstack/bin/gstack-office-hours-review check "<round-1.json>" "<round-2.json if present>" "<round-3.json if present>"
+~/.claude/skills/gstack/bin/gstack-office-hours-review check --receipt "<receipt line>" "<round-1.json>" "<round-2.json if present>" "<round-3.json if present>"
 \`\`\`
 
-Omit absent arguments rather than passing placeholders.
-**Convergence guard and stopping rules:** Read its stop reason:
-- PASS: no unresolved findings; proceed to Step 3.
-- CONVERGENCE: the reviewer explicitly marked a prior obligation persisting with
-  a concrete prior/current finding pair and document evidence. Stop even if new
-  findings appear. Shared topic labels or new refinements alone are insufficient.
-- MAX_ITERATIONS: round 3 completed; stop.
-- CONTINUE: fix the listed findings in the design, then return to Step 1 to prepare and dispatch the next review.
+A missing, malformed, or mismatched receipt fails the check: that attempt is a failed review.
+
+**Convergence guard and stopping rules:** Each finding is blocking or minor. Only
+blocking findings require another round. Read its stop reason:
+- PASS: no blocking findings remain. Any minor findings are recorded, not fixed,
+  and never justify another round; proceed to Step 3.
+- CONVERGENCE: the reviewer explicitly marked a blocking prior obligation
+  persisting with a concrete prior/current finding pair and document evidence.
+  Stop even if new findings appear. Shared topic labels or new refinements alone
+  are insufficient.
+- MAX_ITERATIONS: round 3 completed (or the caller's lower round limit); stop.
+- CONTINUE: fix only the blocking findings in the design, then return to Step 1
+  to prepare and dispatch the next review. Do not edit for minor findings
+  mid-loop: they stay recorded for the user, and new text only gives the next
+  diff more to review. Its reviewer checks every prior finding and raises new
+  blocking findings only for problems your changes introduced or exposed.
 
 On a stop, do not fix again or re-dispatch. Run the finalizer before approval:
 
@@ -87,6 +103,14 @@ On a stop, do not fix again or re-dispatch. Run the finalizer before approval:
 
 It installs the complete \`## Reviewer Concerns\` section directly from the JSON.
 Recording concerns does not mark them fixed. Do not edit that generated section.
+At the cap (MAX_ITERATIONS or CONVERGENCE) it lists the unresolved blocking findings
+as numbered gaps. Never launch a fourth reviewer or re-review unchanged input. Either
+apply the listed fixes first and add \`--fixes <fixes.json>\`
+(\`[{"id":"<finding id>","applied_text":"<verbatim new excerpt>"}]\`): it records
+\`issues verified: k of N\` deterministically (new text present, snapshot lacks it),
+never a review verdict; or finalize without it and carry its
+\`N fixes unconfirmed — decision: spec not re-verified\` into the approval step, which
+stays blocked until the owner accepts it explicitly.
 Then proceed to Step 3 and the existing user approval.
 
 If the subagent fails, times out, or is unavailable — stop the loop and present the
@@ -100,10 +124,9 @@ UNREVIEWED. The independent review remains a quality bonus, not an approval gate
 **Step 3: Report and persist metrics**
 
 The finalizer prints the exact Spec Review block, quality score, and metrics. Tell the user the
-result using that block; link the design and saved verdicts for details. Report
-finding observations across rounds separately from unresolved final findings.
-Confirmed resolutions require explicit later reviewer evidence; attempted fix
-rounds are counted separately and never described as successful fixes.
+result using that block; link the design and saved verdicts for details. Confirmed
+resolutions require explicit later reviewer evidence; attempted fix rounds are never
+described as successful fixes.
 
 When writing a completion report, write its other sections normally, then run the
 same finalizer with \`--report "<report-path>"\` after the report exists. This installs
@@ -119,7 +142,7 @@ mkdir -p "$GSTACK_STATE_ROOT/analytics"
 echo '{"skill":"office-hours","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","iterations":ITERATIONS,"issues_found":FOUND,"issues_fixed":FIXED,"remaining":REMAINING,"quality_score":SCORE}' >> "$GSTACK_STATE_ROOT/analytics/spec-review.jsonl" 2>/dev/null || true
 \`\`\`
 Use iterations, issues_found, issues_fixed, remaining, and quality_score from the
-helper. FOUND counts finding observations across rounds; FIXED counts only
+helper; its remaining_blocking and remaining_minor split the remaining count. FOUND counts finding observations across rounds; FIXED counts only
 reviewer-confirmed resolutions. An unavailable score is null, never invented.`;
 }
 
@@ -171,7 +194,7 @@ ${ceo ? `**Step 2: Process the result**
 - **PASS:** Stop the loop.
 - **Issues:** Stop after the third review, or when consecutive reviews repeat the same unresolved issues (the same requirements and problems). Otherwise use 0D for new or reopened choices, amend the working plan and CEO summary under the storage policy, Keep both consistent, and re-dispatch with both updated inputs and the same instructions.
 
-Make at most three reviewer launches. A missing score alone does not require another review.` : `**Step 2: Fix and re-dispatch**
+Make at most three reviewer launches. A missing score alone does not require another review. At the cap, list the unresolved issues as numbered gaps and never re-review unchanged input: verify each listed fix against the amended plan text and report \`issues verified: k of N\` (applied edits, not a verdict), or report \`N fixes unconfirmed\` and add a \`spec not re-verified\` decision to 0H. DONE_WITH_CONCERNS names the missing points next to the score.` : `**Step 2: Fix and re-dispatch**
 
 If the reviewer returns issues:
 1. Fix each issue in the document on disk (use Edit tool)
@@ -206,7 +229,11 @@ if a required save fails, stop before claiming completion.` : `After the loop co
    If they ask "what did the reviewer find?", show the full reviewer output.
 
 2. If issues remain after max iterations or convergence, add a "## Reviewer Concerns"
-   section to the document listing each unresolved issue. Downstream skills will see this.
+   section to the document listing each unresolved issue as a numbered gap. Never
+   re-review unchanged input: record \`issues verified: k of N\` after checking each
+   listed fix in the text (not a verdict), or \`N fixes unconfirmed\` with a
+   \`spec not re-verified\` decision. DONE_WITH_CONCERNS names the missing points next
+   to the score. Downstream skills will see this.
 
 3. Append metrics:`}
 \`\`\`bash
@@ -230,6 +257,8 @@ export function generateBenefitsFrom(ctx: TemplateContext): string {
 
 When the design doc check above prints "No design doc found," offer the prerequisite
 skill before proceeding.
+
+Skip the offer and proceed with the standard review when the preamble echoed \`SESSION_KIND\` \`spawned\` or \`headless\`.
 
 ${ctx.skillName === 'plan-eng-review' ? 'Build the next full decision brief from these facts and options, using the preamble transport, numbering and format:' : 'Say to the user via AskUserQuestion:'}
 

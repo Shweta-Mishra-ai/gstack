@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 // gstack-design-approved — print the absolute path of the image an
 // approved.json names.
 //

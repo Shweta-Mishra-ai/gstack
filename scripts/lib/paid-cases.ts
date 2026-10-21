@@ -9,6 +9,7 @@ import type { EvalCaseKind, PanelShape } from '../../test/helpers/eval-store';
 import { E2E_KINDS } from '../../test/helpers/touchfiles-data';
 import { E2E_TOUCHFILES, E2E_TIERS } from '../../test/helpers/touchfiles';
 import { type PaidTier, ROOT } from './paid-types';
+import { type EvalHost, hostSkipReason, resolveEvalHost } from '../../test/helpers/e2e-hosts';
 
 /**
  * The E2E ids a paid file registers: the touchfile registrations that list the
@@ -227,11 +228,37 @@ export function partitionCaseExclusions(keys: string[]): { runnable: string[]; e
 }
 
 /**
+ * Host exclusions (EVALS_HOST, test/helpers/e2e-hosts.ts): on a non-Claude
+ * host a case key whose case is Claude-only, or a file key none of whose
+ * `tier` cases runs on the host, is excluded with its reason. A file that
+ * keeps one host case stays runnable; its Claude-only cases skip at module
+ * load and the report deselects them. The Claude host excludes nothing.
+ */
+export function partitionHostExclusions(keys: string[], tier: PaidTier, host: EvalHost, rootDir = ROOT): { runnable: string[]; excluded: Array<{ file: string; reason: string }> } {
+  if (host === 'claude') return { runnable: keys, excluded: [] };
+  const excluded: Array<{ file: string; reason: string }> = [];
+  const runnable = keys.filter(key => {
+    const caseId = shardCaseId(key);
+    const ids = caseId !== null ? [caseId]
+      : fileCaseRegistration(shardFile(key), fs.readFileSync(path.join(rootDir, shardFile(key)), 'utf8')).registered.filter(id => E2E_TIERS[id] === tier);
+    if (ids.some(id => hostSkipReason(id, host) === null)) return true;
+    const reason = ids.length === 1 ? hostSkipReason(ids[0]!, host)!
+      : ids.length === 0 ? `Claude-only on the ${host} host: no Codex host metadata (no ${tier} case registered)`
+      : `Claude-only on the ${host} host: no case runs on it (${ids.join(', ')})`;
+    excluded.push({ file: key, reason: `skipped: ${reason}` });
+    return false;
+  });
+  return { runnable, excluded };
+}
+
+/**
  * Codex access in the CI eval image, scoped per paid shard.
  *
  * The image installs the pinned Codex CLI off PATH (GSTACK_CI_CODEX_BIN_DIR)
  * and the eval workflows log it in under a non-default home
- * (GSTACK_CI_CODEX_HOME). A gate shard never sees either. A non-gate shard
+ * (GSTACK_CI_CODEX_HOME). On the Codex host (EVALS_HOST=codex) Codex is the
+ * agent, so every shard gets the CLI on PATH and the home as CODEX_HOME.
+ * Otherwise a gate shard never sees either. A non-gate shard
  * whose every file exercises Codex gets the CLI on PATH and the home as
  * CODEX_HOME. A file that mixes one Codex case with other cases keeps only
  * the two variables, and that case opts in on its own session; hermetic
@@ -251,6 +278,7 @@ export const CODEX_CI_FILES: readonly string[] = [
   'test/skill-e2e-outside-voice.test.ts',
   'test/skill-e2e-outside-plan-disabled.test.ts',
   'test/skill-e2e-safety-codex-boundary.test.ts',
+  'test/codex-e2e-multiblock-live.test.ts',
 ];
 
 /**
@@ -265,8 +293,10 @@ export const CODEX_CI_CASES: Readonly<Record<string, readonly string[]>> = {
 export type CodexShardAccess = 'none' | 'case-opt-in' | 'path';
 
 /** What one shard, given the test files behind its keys, may see of the CI Codex install in `tier`. */
-export function codexShardAccess(files: readonly string[], tier: string | undefined): CodexShardAccess {
-  if (tier === 'gate' || files.length === 0) return 'none';
+export function codexShardAccess(files: readonly string[], tier: string | undefined, host: EvalHost = 'claude'): CodexShardAccess {
+  if (files.length === 0) return 'none';
+  if (host === 'codex') return 'path';
+  if (tier === 'gate') return 'none';
   if (files.every(file => CODEX_CI_FILES.includes(file))) return 'path';
   return files.every(file => file in CODEX_CI_CASES) ? 'case-opt-in' : 'none';
 }
@@ -276,7 +306,7 @@ export function scopeCodexAccess(env: NodeJS.ProcessEnv, files: readonly string[
   const binDir = env[CODEX_CI_ENV.binDir];
   if (!binDir) return;
   const home = env[CODEX_CI_ENV.home];
-  const access = codexShardAccess(files, env.EVALS_TIER);
+  const access = codexShardAccess(files, env.EVALS_TIER, resolveEvalHost(env));
   delete env.CODEX_HOME;
   if (access === 'case-opt-in') return;
   delete env[CODEX_CI_ENV.binDir];

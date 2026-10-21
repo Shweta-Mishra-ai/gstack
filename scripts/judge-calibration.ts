@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * W2 judge calibration harness (comparison 1: schema transport, prose unchanged).
  *

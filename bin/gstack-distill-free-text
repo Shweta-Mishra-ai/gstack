@@ -59,7 +59,7 @@ esac
 # --- Status subcommand --------------------------------------------------
 
 if [ "$MODE" = "status" ]; then
-  COST_LOG_PATH="$COST_LOG" SLUG_PATH="$SLUG" bun -e '
+  COST_LOG_PATH="$COST_LOG" SLUG_PATH="$SLUG" bun --no-env-file --config=/dev/null -e '
     const fs = require("fs");
     const slug = process.env.SLUG_PATH;
     const path = process.env.COST_LOG_PATH;
@@ -98,7 +98,7 @@ if [ ! -f "$LOG_FILE" ]; then
   exit 0
 fi
 
-EVENTS_JSON=$(LOG_FILE_PATH="$LOG_FILE" bun -e '
+EVENTS_JSON=$(LOG_FILE_PATH="$LOG_FILE" bun --no-env-file --config=/dev/null -e '
   const fs = require("fs");
   const lines = fs.readFileSync(process.env.LOG_FILE_PATH, "utf-8").trim().split("\n").filter(Boolean);
   const out = [];
@@ -119,7 +119,7 @@ EVENTS_JSON=$(LOG_FILE_PATH="$LOG_FILE" bun -e '
   process.stdout.write(JSON.stringify(out));
 ')
 
-EVENT_COUNT=$(printf '%s' "$EVENTS_JSON" | bun -e 'const a = JSON.parse(await Bun.stdin.text()); console.log(a.length);')
+EVENT_COUNT=$(printf '%s' "$EVENTS_JSON" | bun --no-env-file --config=/dev/null -e 'const a = JSON.parse(await Bun.stdin.text()); console.log(a.length);')
 if [ "$EVENT_COUNT" -eq 0 ]; then
   echo "NO_FREE_TEXT: nothing to distill"
   exit 0
@@ -172,7 +172,7 @@ if [ "$MODE" = "dry-run" ]; then
   echo "$DISTILL_PROMPT"
   echo
   echo "=== EVENTS ($EVENT_COUNT) ==="
-  echo "$EVENTS_JSON" | bun -e 'console.log(JSON.stringify(JSON.parse(await Bun.stdin.text()), null, 2));'
+  echo "$EVENTS_JSON" | bun --no-env-file --config=/dev/null -e 'console.log(JSON.stringify(JSON.parse(await Bun.stdin.text()), null, 2));'
   exit 0
 fi
 
@@ -196,7 +196,7 @@ fi
 RESULT=$(EVENTS_JSON="$EVENTS_JSON" DISTILL_PROMPT="$DISTILL_PROMPT" \
          PROPOSAL_FILE_PATH="$PROPOSAL_FILE" LOG_FILE_PATH="$LOG_FILE" \
          ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-         bun --cwd "$ROOT_DIR" -e '
+         bun --no-env-file --config=/dev/null --cwd "$ROOT_DIR" -e '
   const fs = require("fs");
   const Anthropic = require("@anthropic-ai/sdk").default;
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });

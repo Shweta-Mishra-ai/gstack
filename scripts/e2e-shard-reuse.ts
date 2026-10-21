@@ -83,6 +83,7 @@ export function e2eReuseLaneProblem(env: NodeJS.ProcessEnv, profileMode: string 
   if (!/^(?:sha256:)?[a-f0-9]{64}$/.test(env.EVALS_CACHE_RUNTIME_ID ?? '')) return 'No immutable runtime identity';
   if (env.EVALS_TIER !== 'gate' || env.EVALS_FRESH === '1') return 'Fresh validation requested';
   if (['release', 'periodic', 'marathon'].includes(env.EVALS_CACHE_PURPOSE ?? '')) return 'Scheduled and release lanes execute fresh';
+  if ((env.EVALS_HOST ?? '').trim() && env.EVALS_HOST!.trim() !== 'claude') return 'Non-Claude hosts execute fresh';
   if (env.NODE_OPTIONS || env.BUN_OPTIONS) return 'Preload options change execution outside the consumed source';
   if (env.ANTHROPIC_BASE_URL && env.ANTHROPIC_BASE_URL !== 'https://api.anthropic.com') return 'Custom model endpoint';
   return null;

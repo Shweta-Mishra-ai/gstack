@@ -69,6 +69,12 @@ export interface ScanOptions {
   repoPublicEmails?: string[];
   /** Hard byte cap. Oversize input fails CLOSED. Default 1 MiB. */
   maxBytes?: number;
+  /**
+   * Path of the file the input came from, when known (the pre-push hook's
+   * `+++ b/` path, `--from-file`). Lets a pattern tell source syntax from a
+   * literal: in a TypeScript/JSX file `session: SessionState,` is a type.
+   */
+  sourcePath?: string;
 }
 
 export interface ScanResult {
@@ -399,7 +405,7 @@ function scanInternal(input: string, opts: ScanOptions, spans?: Map<Finding, Ori
       if (allow.has(span)) continue;
 
       // Pattern-specific validators (Luhn, entropy, RFC1918, etc).
-      if (pat.validate && !pat.validate(span, m)) continue;
+      if (pat.validate && !pat.validate(span, m, opts)) continue;
 
       // Proximity requirement.
       if (
@@ -547,6 +553,76 @@ const MARKER_ONLY_PATTERN_IDS = new Set(["pem.private_key", "gcp.service_account
  * structure-preserving path.)
  */
 export function redactFindingSpans(input: string, opts: ScanOptions = {}): string | null {
+  const merged = mergedFindingSpans(input, opts);
+  return merged && spliceEdits(input, merged.map((m) => ({ start: m.start, end: m.end, text: marker(m.ids) })));
+}
+
+/** One replacement on the original text: [start, end) becomes `text`. */
+export interface RedactionEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/**
+ * redactFindingSpans for a stream declared as JSON (a scanner report: one
+ * document, several top-level values, or NDJSON), keeping it parseable. A span
+ * inside a string keeps the in-string marker, widened to whole escape
+ * sequences; a span inside a number replaces that whole number token with the
+ * quoted marker, so `{"max_memory_bytes":1145427776}` stays valid JSON
+ * (#3185). A span that touches more than one token, a structural character,
+ * whitespace, a literal or a string's quotes returns null (withhold). A
+ * stream that does not tokenize as JSON gets the plain splice. Returns the
+ * edits (sorted, disjoint, on the original offsets) so a caller can map
+ * interleaved runs onto the result.
+ */
+export function redactJsonFindingSpans(input: string, opts: ScanOptions = {}): { body: string; edits: RedactionEdit[] } | null {
+  const merged = mergedFindingSpans(input, opts);
+  if (!merged) return null;
+  const tokens = jsonTokens(input);
+  const spans: Array<{ start: number; end: number; ids: string[]; quote: boolean }> = [];
+  for (const m of merged) {
+    if (!tokens) {
+      spans.push({ ...m, quote: false });
+      continue;
+    }
+    let lo = 0, hi = tokens.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (tokens[mid].end <= m.start) lo = mid + 1; else hi = mid;
+    }
+    const t = tokens[lo];
+    if (!t || t.start > m.start || t.end < m.end) return null;
+    let span: { start: number; end: number; quote: boolean };
+    if (t.kind === "number") span = { start: t.start, end: t.end, quote: true };
+    else if (t.kind === "string" && m.start > t.start && m.end < t.end) {
+      span = { start: m.start, end: m.end, quote: false };
+      for (const [s, e] of t.escapes) {
+        if (s < span.start && span.start < e) span.start = s;
+        if (s < span.end && span.end < e) span.end = e;
+      }
+    } else return null;
+    const last = spans[spans.length - 1];
+    if (last && span.start < last.end) {
+      last.end = Math.max(last.end, span.end);
+      for (const id of m.ids) if (!last.ids.includes(id)) last.ids.push(id);
+    } else spans.push({ ...span, ids: [...m.ids] });
+  }
+  const edits = spans.map((x) => ({ start: x.start, end: x.end, text: x.quote ? `"${marker(x.ids)}"` : marker(x.ids) }));
+  return { body: spliceEdits(input, edits), edits };
+}
+
+const marker = (ids: string[]) => `<REDACTED-${ids.join("+")}>`;
+
+function spliceEdits(input: string, edits: RedactionEdit[]): string {
+  // Right-to-left so earlier offsets remain valid after splicing.
+  let body = input;
+  for (let i = edits.length - 1; i >= 0; i--) body = body.slice(0, edits[i].start) + edits[i].text + body.slice(edits[i].end);
+  return body;
+}
+
+/** Every finding's span, coalesced; null when one cannot be located or is marker-only. */
+function mergedFindingSpans(input: string, opts: ScanOptions): Array<{ start: number; end: number; ids: string[] }> | null {
   const spans = new Map<Finding, OriginalSpan>();
   const { findings } = scanInternal(input, opts, spans);
   if (findings.some((f) => MARKER_ONLY_PATTERN_IDS.has(f.id))) return null;
@@ -567,14 +643,49 @@ export function redactFindingSpans(input: string, opts: ScanOptions = {}): strin
       merged.push({ start: t.start, end: t.end, ids: [t.f.id] });
     }
   }
+  return merged;
+}
 
-  // Right-to-left so earlier offsets remain valid after splicing.
-  let body = input;
-  for (let i = merged.length - 1; i >= 0; i--) {
-    const m = merged[i];
-    body = body.slice(0, m.start) + `<REDACTED-${m.ids.join("+")}>` + body.slice(m.end);
+type JsonToken = { kind: "string" | "number" | "other"; start: number; end: number; escapes: Array<[number, number]> };
+const JSON_NUMBER = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const JSON_LITERAL = /true|false|null/y;
+
+/** Lexical JSON tokens of one or more top-level values (NDJSON included); null when the text is not JSON. */
+function jsonTokens(text: string): JsonToken[] | null {
+  const tokens: JsonToken[] = [];
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") { i++; continue; }
+    if ("{}[]:,".includes(c)) { tokens.push({ kind: "other", start: i, end: i + 1, escapes: [] }); i++; continue; }
+    if (c === '"') {
+      const escapes: Array<[number, number]> = [];
+      let j = i + 1;
+      for (;;) {
+        if (j >= text.length) return null;
+        if (text[j] === '"') break;
+        if (text[j] === "\\") {
+          const end = j + (text[j + 1] === "u" ? 6 : 2);
+          if (end > text.length) return null;
+          escapes.push([j, end]);
+          j = end;
+        } else j++;
+      }
+      tokens.push({ kind: "string", start: i, end: j + 1, escapes });
+      i = j + 1;
+      continue;
+    }
+    let matched = false;
+    for (const [kind, pattern] of [["number", JSON_NUMBER], ["other", JSON_LITERAL]] as const) {
+      pattern.lastIndex = i;
+      if (!pattern.test(text)) continue;
+      tokens.push({ kind, start: i, end: pattern.lastIndex, escapes: [] });
+      i = pattern.lastIndex;
+      matched = true;
+      break;
+    }
+    if (!matched) return null;
   }
-  return body;
+  return tokens;
 }
 
 function inStructuralToken(body: string, start: number, end: number): boolean {

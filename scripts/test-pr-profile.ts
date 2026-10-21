@@ -5,13 +5,15 @@ import { E2E_TOUCHFILES, E2E_TIERS, GLOBAL_TOUCHFILES, LLM_JUDGE_TOUCHFILES } fr
 import { matchGlob, TOUCHFILES_DATA_PATH } from '../test/helpers/test-selection';
 import { isPaidTestFile } from '../test/helpers/paid-test-set';
 import { FREE_FIXTURES } from '../test/helpers/free-fixtures-data';
-import { derivedDependencies, type DerivedDependencies } from './pr-dependencies';
+import {
+  checkoutExercisedConsumers, derivedDependencies, EXERCISED_MAP_PATH, type DerivedDependencies, type ExercisedConsumers,
+} from './pr-dependencies';
 
 /** Existing short behavioral probes; intersect with changed-input selection. */
 export const PR_PROFILE_CASE_IDS = [
   'hermetic-canary', 'hermetic-sentinel',
   'browse-basic', 'browse-snapshot', 'skillmd-setup-discovery',
-  'qa-bootstrap', 'review-sql-injection', 'review-coverage-audit',
+  'qa-bootstrap', 'review-sql-injection', 'review-gate-integrity', 'review-coverage-audit',
   'qa-functional-cli-report', 'qa-functional-webhook-report',
   'qa-functional-cli-fix', 'qa-functional-webhook-fix',
   'review-exploratory-small-cli', 'ship-exploratory-small-cli', 'ship-exploratory-unavailable',
@@ -46,6 +48,7 @@ export const PR_PROFILE_FILES: Record<string, readonly string[]> = {
   'test/skill-e2e-qa-functional-fix.test.ts': ['qa-functional-cli-fix', 'qa-functional-webhook-fix'],
   'test/skill-e2e-qa-callers.test.ts': ['review-exploratory-small-cli', 'ship-exploratory-small-cli', 'ship-exploratory-unavailable', 'ship-exploratory-plan-checks', 'ship-exploratory-late-input'],
   'test/skill-e2e-review.test.ts': ['review-sql-injection'],
+  'test/skill-e2e-gate-integrity.test.ts': ['review-gate-integrity'],
   'test/skill-e2e-coverage-audit.test.ts': ['review-coverage-audit', 'plan-eng-coverage-audit'],
   'test/skill-e2e-test-value.test.ts': ['ship-coverage-value', 'review-test-value', 'test-audit-report-only'],
   'test/skill-e2e-plan.test.ts': ['plan-review-report'],
@@ -156,6 +159,27 @@ export interface PrProfileSelection {
   missingCoverage: string[];
   needsFullValidation: boolean;
   reasons: string[];
+  /** What the exercised-path map would select (shadow mode: never changes e2e or judges). */
+  shadow?: ShadowSelection;
+}
+
+/** The exercised-path map's selection beside the real one (docs/TESTING_INTERNALS.md#exercised-path-map). */
+export interface ShadowSelection {
+  /** Gate cases the map would select. */
+  e2e: string[];
+  /** Selected gate cases the map would not select. */
+  wouldDrop: string[];
+  /** Gate cases the map would select that today's selection does not. */
+  wouldAdd: string[];
+  /** Per changed file with exercised consumers: how many gate cases it reaches, and through which edge. */
+  provenance: Array<{ file: string; summary: string }>;
+  /** Mean known cost of the dropped cases minus the added ones (the map's per-case costUsd; an unpriced case counts $0): a lower bound. */
+  predictedSavingUsd: number;
+  unpricedCases: number;
+  /** Share of observed case runs whose trials carry no known cost (PTY trials); their spend is missing from every dollar figure. */
+  unknownCostShare: number;
+  /** Why no shadow could be computed (the real selection is unaffected). */
+  error?: string;
 }
 
 /** Reject stale profile registrations and deferred cases with no scheduled home. */
@@ -207,11 +231,23 @@ export const FREE_ONLY_PR_FILES = [
   'test/helpers/auq-parallel-worker.ts',
   'test/helpers/stored-zip.ts', // Read only by the free test-health report tests.
   'scripts/free-test-durations.json',
+  'scripts/free-test-seed-allowlist.json', // Read only by the free seed ratchet (test/free-seed-ratchet.test.ts).
   'scripts/paid-test-durations.json',
   'scripts/ubicloud/**',
+  'capy/skill/**', // The vendored Capy skill (Drive bootstrapper): run by Capy agents, read by no paid case; test/capy-skill-wrapper.test.ts covers it.
   'tsconfig.test.json', // Read only by `tsc -p tsconfig.test.json` (typecheck:test); Bun's runtime reads tsconfig.json.
   '.gitignore', // Changes which untracked files git reports, never tracked content a case reads.
+  '.gstack/generated.json', // gstack's own regen registry: gstack-regen/gstack-pregate read it from origin/<base> of the repo they run in; paid cases run in fixture repos.
+  '.gstack/pregate.json', // gstack's own pre-gate policy: same trust boundary, same reason.
+  '.gstack/ship-policy.json', // gstack's own ship policy: gstack-ship-policy/gstack-restamp read it from origin/<base> of the repo they run in; same reason.
+  '.gstack/ship-policy.example.json', // The example beside it: only .gitignore and docs/ship-policy.md name it.
+  '.github/dependabot.yml', // Dependabot's own config: read by GitHub, and by free test/compare-pr-version.test.ts; dependabot runs skip the paid lane.
+  '.osv-scanner.toml', // Read by .github/workflows/osv-scanner.yml and the free OSV tests (test/osv-*.test.ts).
+  'setup.ps1', // The Windows installer: run only by .github/workflows/windows-setup-e2e.yml; the paid lane is Linux.
+  '.gitlab-ci.yml', // gstack's own GitLab config: skills probe the fixture repo's .gitlab-ci.yml, never this one.
+  '.github/ISSUE_TEMPLATE/**', // Issue templates: read by GitHub and free test/gstack-doctor.test.ts.
   'scripts/retired-command.ts', // One-release stubs for retired package scripts; no paid case imports it.
+  'careful/bin/check-careful.sh', // /careful PreToolUse hook: covered by test/hook-scripts.test.ts; no paid fixture copies or runs it.
   // Reporting and launch tools: they read CI history or start a lane, never run inside a paid case.
   'scripts/test-health-report.ts',
   'scripts/bump-harness-version.ts',
@@ -224,8 +260,11 @@ export const FREE_ONLY_PR_FILES = [
   '.github/workflows/cso-runtime-qualification.yml',
   '.github/workflows/cso-scanner-images.yml',
   '.github/workflows/dependency-review.yml',
+  '.github/workflows/free-durations-record.yml',
   '.github/workflows/free-tests.yml',
   '.github/workflows/make-pdf-gate.yml',
+  '.github/workflows/model-policy-freshness.yml',
+  '.github/workflows/measure-journal-read.yml',
   '.github/workflows/native-qualification.yml',
   '.github/workflows/osv-scanner.yml',
   '.github/workflows/platform-qualification.yml',
@@ -234,8 +273,13 @@ export const FREE_ONLY_PR_FILES = [
   '.github/workflows/scorecard.yml',
   '.github/workflows/skill-docs.yml',
   '.github/workflows/test-health.yml',
+  '.github/workflows/eval-sweep.yml', // The weekly off-ship sweep on main; no PR-gate case reads it, and it never gates a PR.
+  '.github/workflows/evals-main-backstop.yml', // The merge-train backstop on main: it dispatches evals.yml after a push to main; no PR-gate case reads it, and it never gates a PR.
+  '.github/actionlint.yaml', // Runner labels for actionlint only.
+  'scripts/ship-measure-sweep.ts', // The weekly sweep CLI; it launches paid cases, never runs inside one.
   '.github/workflows/version-gate.yml',
   '.github/workflows/windows-free-tests.yml',
+  '.github/workflows/windows-pregate-e2e.yml',
   '.github/workflows/windows-setup-e2e.yml',
 ] as const;
 
@@ -261,9 +305,9 @@ export const PR_FULL_GATE_FILES = [
 export const PERIODIC_ONLY_PR_FILES = ['.github/workflows/evals-periodic.yml', '.github/workflows/evals-marathon.yml'] as const;
 
 /** Directories the reference derivation covers: an unmapped file there with no consumer is consumed by no paid case. */
-export const DERIVABLE_PREFIXES = ['bin/', 'lib/', 'scripts/', 'browse/', 'design/', 'make-pdf/', 'hosts/', 'extension/', 'model-overlays/', 'agents/', 'test/helpers/'] as const;
+export const DERIVABLE_PREFIXES = ['bin/', 'lib/', 'scripts/', 'browse/', 'design/', 'make-pdf/', 'hosts/', 'extension/', 'model-overlays/', 'agents/', 'test/helpers/', 'capy/'] as const;
 
-function knownNonBehaviorFile(file: string): boolean {
+export function knownNonBehaviorFile(file: string): boolean {
   // A mapped dependency still wins over these exemptions. New helper,
   // runtime, dependency, or paid-workflow files are deliberately not exempted.
   return /^(?:docs\/|(?:README|CONTRIBUTING|ARCHITECTURE|CHANGELOG|TODOS)\.md$|VERSION$)/.test(file)
@@ -278,9 +322,13 @@ function knownNonBehaviorFile(file: string): boolean {
 }
 
 export const FALLBACK_FIX_ANCHOR = 'docs/TESTING_INTERNALS.md#pr-paid-lane-fallback';
+export const EXERCISED_MAP_ANCHOR = 'docs/TESTING_INTERNALS.md#exercised-path-map';
 
 /** Why one changed file restored the full gate, and the edit that narrows it next time (DX-6). */
 export function unknownFileLabel(file: string): { label: string; fix: string } {
+  if (matches(file, PR_FULL_GATE_FILES)) {
+    return { label: 'full-gate input', fix: `${file} is in PR_FULL_GATE_FILES (scripts/test-pr-profile.ts): every paid case consumes it, so the full gate is intended and no mapping narrows it` };
+  }
   if (isPaidTestFile(file) || file.startsWith('test/helpers/')) {
     return { label: 'needs touchfile entry', fix: `register ${file} under the cases that consume it in test/helpers/touchfiles-data.ts` };
   }
@@ -304,6 +352,7 @@ export function packageChangeOnlyVersion(before: string, after: string): boolean
 }
 
 function isPromptFile(file: string): boolean {
+  if (FREE_ONLY_PR_FILES.some(pattern => matchGlob(file, pattern))) return false;
   return file.endsWith('.tmpl') || /(?:^|\/)SKILL\.md$/.test(file)
     || /^[^/]+\/sections\/.+\.md$/.test(file);
 }
@@ -325,6 +374,8 @@ export function selectPrProfile(options: {
   readSource?: (file: string) => string;
   /** Derived references; default: derived from the checkout for the real maps, none for fixture maps. */
   derived?: DerivedDependencies | null;
+  /** Exercised-path consumers for the shadow block; default: the checkout's committed map for the real maps, none for fixture maps. */
+  exercised?: ExercisedConsumers | null;
 }): PrProfileSelection {
   const maps = options.maps ?? PR_PROFILE_MAPS;
   const profile = options.profile ?? PR_PROFILE_CASE_IDS;
@@ -338,7 +389,7 @@ export function selectPrProfile(options: {
     ...Object.values(maps.e2eTouchfiles).flat(), ...Object.values(maps.judgeTouchfiles).flat(),
     ...maps.globalTouchfiles,
   ])];
-  const unmapped = files.filter(file => file !== TOUCHFILES_DATA_PATH
+  const unmapped = files.filter(file => file !== TOUCHFILES_DATA_PATH && file !== EXERCISED_MAP_PATH
     && !depends(file, dependencyPatterns) && !knownNonBehaviorFile(file));
   // Unmapped files are placed by derived references where the derivation covers them; the rest restore the full gate.
   const derived = options.derived !== undefined ? options.derived : maps === PR_PROFILE_MAPS ? derivedDependencies(maps, ROOT) : null;
@@ -366,6 +417,12 @@ export function selectPrProfile(options: {
       judges: new Set(referencers.flatMap(referencer => [...derived!.judges.get(referencer) ?? []])) };
     if (found.e2e.size + found.judges.size > 0) consumers.set(file, found);
     else noConsumerFiles.push(file);
+  }
+  // A failed import scan leaves some closure unknown: every unmapped file restores the full gate (fail closed).
+  const scanFailed = derived && unmapped.length ? [...derived.scanErrors.keys()].sort() : [];
+  if (scanFailed.length) {
+    consumers.clear(); derivedGlobal.length = 0; noConsumerFiles.length = 0;
+    for (const file of unmapped) deletedLabels.set(file, { label: 'import scan failed', fix: `scripts/pr-dependencies.ts could not scan the imports of ${scanFailed.slice(0, 3).join(', ')}${scanFailed.length > 3 ? ` and ${scanFailed.length - 3} more` : ''}; fix the parse error so ${file}'s consumers can be derived` });
   }
   const derivedFiles = [...consumers.keys()];
   const unknownFiles = unmapped.filter(file => !derivedGlobal.includes(file) && !consumers.has(file) && !noConsumerFiles.includes(file));
@@ -409,25 +466,80 @@ export function selectPrProfile(options: {
   if (sharedInputs.length) reasons.push(`Shared runtime/build inputs restore every gate case and judge: ${sharedInputs.join(', ')}`);
   if (dependentsMode) reasons.push(`Derived references select every dependent gate case: ${derivedFiles.map(file => `${file} (${consumers.get(file)!.e2e.size} cases)`).join(', ')}`);
   else if (!fallback) reasons.push('Changed-input selection intersected with the fast PR profile; selected judges retained');
+  if (files.includes(EXERCISED_MAP_PATH)) reasons.push(`${EXERCISED_MAP_PATH} is shadow-only data (it changes no selection yet), so it selects no paid case (${EXERCISED_MAP_ANCHOR})`);
   if (derivedGlobal.length) reasons.push(`Paid-runner inputs (global touchfile import closure) select every case: ${derivedGlobal.join(', ')}`);
   if (noConsumerFiles.length) reasons.push(`No paid case's reference closure reaches (or, deleted, still references): ${noConsumerFiles.join(', ')}`);
   if (directCases.length) reasons.push(`Edited paid test files select their own gate cases: ${directCases.join(', ')}`);
   if (deferred.length) reasons.push(`${deferred.length} selected behaviors remain scheduled/release coverage, not PR passes`);
   if (deferredPromptFiles.length) reasons.push(`No quick live coverage; known broad prompt checks deferred: ${deferredPromptFiles.join(', ')}`);
   if (missingCoverage.length) reasons.push(`Full validation required for prompts without a relevant PR check: ${missingCoverage.join(', ')}`);
+  const exercised = options.exercised !== undefined ? options.exercised : maps === PR_PROFILE_MAPS ? checkoutExercised() : null;
+  const shadow = exercised instanceof Error ? emptyShadow(e2e, exercised.message)
+    : exercised ? shadowSelection({ ...options, maps, profile }, { e2e, fallback, derived, exercised, files }) : undefined;
   return {
     mode: fallback ? 'full-fallback' : dependentsMode ? 'dependents' : 'pr', e2e, judges, deferred,
     unknownFiles, unknownFileLabels: unknownFiles.map(file => ({ file, ...(deletedLabels.get(file) ?? unknownFileLabel(file)) })), directCases,
     derivedFiles: derivedFiles.map(file => ({ file, e2e: consumers.get(file)!.e2e.size, judges: consumers.get(file)!.judges.size })), noConsumerFiles,
-    deferredPromptFiles, missingCoverage, needsFullValidation: missingCoverage.length > 0, reasons,
+    deferredPromptFiles, missingCoverage, needsFullValidation: missingCoverage.length > 0, reasons, ...(shadow ? { shadow } : {}),
   };
+}
+
+function checkoutExercised(): ExercisedConsumers | Error {
+  try { return checkoutExercisedConsumers(PR_PROFILE_MAPS, ROOT, PR_FULL_GATE_FILES); }
+  catch (error) { return error instanceof Error ? error : new Error(String(error)); }
+}
+
+function emptyShadow(e2e: string[], error: string): ShadowSelection {
+  return { e2e, wouldDrop: [], wouldAdd: [], provenance: [], predictedSavingUsd: 0, unpricedCases: 0, unknownCostShare: 0, error };
+}
+
+/**
+ * Shadow selection (variant cu of the measured prototype): the same policy
+ * with the exercised map in place of the derived closure, unioned with the
+ * exercised consumers of every changed file that is not global or full-gate.
+ * A full-gate fallback stays full.
+ */
+function shadowSelection(options: Parameters<typeof selectPrProfile>[0] & { maps: PrProfileMaps },
+  today: { e2e: string[]; fallback: boolean; derived: DerivedDependencies | null; exercised: ExercisedConsumers; files: string[] }): ShadowSelection {
+  const { maps } = options;
+  const { exercised } = today;
+  const observedCases = Object.values(exercised.map?.cases ?? {});
+  const observations = observedCases.reduce((sum, entry) => sum + entry.observations, 0);
+  const unknownCostShare = observations ? Math.round(1000 * (1 - observedCases.reduce((sum, entry) => sum + (entry.costRuns ?? 0), 0) / observations)) / 1000 : 0;
+  if (today.fallback) return { e2e: today.e2e, wouldDrop: [], wouldAdd: [], provenance: [], predictedSavingUsd: 0, unpricedCases: 0, unknownCostShare };
+  const gate = (ids: Iterable<string>) => [...ids].filter(id => maps.tiers[id] === 'gate');
+  const reach = new Map<string, string[]>();
+  const inner = selectPrProfile({ ...options, derived: today.derived ? { ...today.derived, e2e: exercised.e2e } : null, exercised: null });
+  const sources = [...new Set([...today.files, ...Object.values(options.sourceAliases ?? {})])];
+  const shadowSet = new Set(inner.e2e);
+  for (const file of sources) {
+    if (today.derived?.global.has(file) || matches(file, PR_FULL_GATE_FILES) || knownNonBehaviorFile(file)) continue;
+    const via = !today.derived || today.derived.tracked.has(file) ? [file] : today.derived.referencers(file);
+    const ids = gate(new Set(via.flatMap(source => [...exercised.e2e.get(source) ?? []])));
+    if (ids.length) reach.set(file, ids);
+    for (const id of ids) shadowSet.add(id);
+  }
+  const e2e = [...shadowSet].sort();
+  const wouldDrop = today.e2e.filter(id => !shadowSet.has(id));
+  const wouldAdd = e2e.filter(id => !today.e2e.includes(id));
+  const cost = (ids: string[]) => ids.reduce((sum, id) => sum + (exercised.map?.cases[id]?.costUsd ?? 0), 0);
+  const provenance = [...reach].map(([file, ids]) => {
+    const groups = new Map<string, number>();
+    for (const id of ids) {
+      const label = exercised.closure(id).get(file) ?? 'referencer';
+      groups.set(label, (groups.get(label) ?? 0) + 1);
+    }
+    return { file, summary: `selects ${ids.length} case(s): ${[...groups].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([label, n]) => `${label} (${n})`).join(', ')}` };
+  });
+  return { e2e, wouldDrop, wouldAdd, provenance, predictedSavingUsd: Math.round((cost(wouldDrop) - cost(wouldAdd)) * 100) / 100,
+    unpricedCases: [...wouldDrop, ...wouldAdd].filter(id => exercised.map?.cases[id]?.costUsd === undefined).length, unknownCostShare };
 }
 
 /** The manifest fields the coverage summary reads (a PaidRunManifest subset). */
 export interface CoverageSummaryInput {
   profile?: string;
   selection?: { e2e: string[] | null; judges: string[] | null };
-  prCoverage?: Pick<PrProfileSelection, 'mode' | 'deferred' | 'unknownFiles'> & Partial<Pick<PrProfileSelection, 'unknownFileLabels' | 'derivedFiles' | 'noConsumerFiles'>>;
+  prCoverage?: Pick<PrProfileSelection, 'mode' | 'deferred' | 'unknownFiles'> & Partial<Pick<PrProfileSelection, 'unknownFileLabels' | 'derivedFiles' | 'noConsumerFiles' | 'shadow'>>;
 }
 
 /**
@@ -448,6 +560,9 @@ export function formatPrCoverageSummary(manifest: CoverageSummaryInput, totals?:
     lines.push(`- Derived dependents (scripts/pr-dependencies.ts) of ${coverage.derivedFiles.length} unmapped file(s):`);
     for (const item of coverage.derivedFiles.slice(0, 40)) lines.push(`  - \`${item.file}\`: ${item.e2e} case(s), ${item.judges} judge(s)`);
   }
+  const shadow = coverage?.shadow;
+  if (shadow) lines.push(shadow.error ? `- Shadow exercised-path map: unavailable (${shadow.error}); selection unaffected`
+    : `- Shadow exercised-path map (not active): would select ${shadow.e2e.length} gate case(s), dropping ${shadow.wouldDrop.length} and adding ${shadow.wouldAdd.length}; predicted saving $${shadow.predictedSavingUsd.toFixed(2)}${shadow.unpricedCases ? ` (${shadow.unpricedCases} unpriced)` : ''}, a lower bound: known cost excludes the ${Math.round(100 * (shadow.unknownCostShare ?? 0))}% of observed case runs with unknown cost (PTY) (${EXERCISED_MAP_ANCHOR})`);
   if (coverage?.noConsumerFiles?.length) lines.push(`- No paid case reaches: ${coverage.noConsumerFiles.slice(0, 40).map(file => `\`${file}\``).join(', ')}`);
   if (coverage?.mode === 'full-fallback' && coverage.unknownFiles.length) {
     lines.push(`- Full gate restored by ${coverage.unknownFiles.length} file(s) (fix: ${FALLBACK_FIX_ANCHOR}):`);

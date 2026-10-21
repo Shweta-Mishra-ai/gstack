@@ -57,6 +57,7 @@ export interface WorkflowRun {
   updated_at?: string;
   head_repository?: { full_name?: string } | null;
   pull_requests?: Array<{ number: number }>;
+  display_title?: string;
 }
 
 /** One `gh` invocation; injectable so free tests drive recovery from recorded responses. */
@@ -102,6 +103,38 @@ export function acceptedRun(run: WorkflowRun, scope: { pr: number; headRepo: str
   return run.id !== scope.selfRunId && run.event === 'pull_request'
     && run.head_repository?.full_name === scope.headRepo
     && (run.pull_requests ?? []).some(pr => pr.number === scope.pr);
+}
+
+/** The PR a dispatched screen names in its run name (evals.yml: `E2E Evals [eval-bg <nonce>] screen #<n>`); null for any other run. */
+export function screenRunPr(run: Pick<WorkflowRun, 'event' | 'display_title'>): number | null {
+  const match = run.event === 'workflow_dispatch' ? /^E2E Evals \[eval-bg [A-Za-z0-9._-]+\] screen #(\d+)$/.exec(run.display_title ?? '') : null;
+  return match ? Number(match[1]) : null;
+}
+
+/** A dispatched screen of this PR from the base repository (same-repository PRs only), never this run. */
+export function acceptedScreenRun(run: WorkflowRun, scope: { pr: number; repo: string; selfRunId: number }): boolean {
+  return run.id !== scope.selfRunId && screenRunPr(run) === scope.pr && run.head_repository?.full_name === scope.repo;
+}
+
+function listRuns(gh: GhRunner, repo: string, filter: string[], timeoutMs: number): WorkflowRun[] | { error: string } {
+  const listed = gh(['api', '-X', 'GET', `repos/${repo}/actions/workflows/evals.yml/runs`, ...filter.flatMap(f => ['-f', f]), '-f', 'per_page=50'], timeoutMs);
+  if (listed.status !== 0) return { error: ghFailureReason(listed.stderr) };
+  try { return (JSON.parse(listed.stdout).workflow_runs ?? []) as WorkflowRun[]; } catch { return { error: 'gh returned an unreadable run list' }; }
+}
+
+/**
+ * The PR's evals.yml runs whose results may carry over: its pull_request runs
+ * and, with `screens`, its dispatched screens (both events, filtered by the PR).
+ */
+export function listGateRuns(gh: GhRunner, o: { repo: string; pr: number; headRepo: string; branch: string; selfRunId: number; screens: boolean },
+  left: () => number): { runs: WorkflowRun[] } | { error: string } {
+  const prRuns = listRuns(gh, o.repo, ['event=pull_request', `branch=${o.branch}`], left());
+  if ('error' in prRuns) return prRuns;
+  const runs = prRuns.filter(run => acceptedRun(run, { pr: o.pr, headRepo: o.headRepo, selfRunId: o.selfRunId }));
+  if (!o.screens) return { runs };
+  const screens = listRuns(gh, o.repo, ['event=workflow_dispatch'], left());
+  if ('error' in screens) return screens;
+  return { runs: [...runs, ...screens.filter(run => acceptedScreenRun(run, { pr: o.pr, repo: o.repo, selfRunId: o.selfRunId }))] };
 }
 
 /**

@@ -14,13 +14,6 @@ triggers:
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
-
-## When to invoke this skill
-
-Use for
-/deslop-shared-libs, $deslop-shared-libs, or requests to find code worth sharing.
-Recommendations only.
-
 # Find code worth sharing
 
 Find up to five new opportunities to share code, then recommend the best three.
@@ -204,7 +197,9 @@ Keep explanations short and plain spoken. Report:
    do not hide test or integration costs in a single optimistic number.
 3. Up to three ranked recommendations. Link both verified callers, describe the
    smallest helper and destination, sketch migration and compatibility tests,
-   explain why it is useful now, and name the main risk or uncertainty. Briefly
+   explain why it is useful now, and name the main risk or uncertainty: a concrete
+   behavior that could differ after migration, or the shared-failure blast radius,
+   never "none". Briefly
    explain why the other candidates rank lower and how recency affected the choice.
    Separately identify work covered by existing PRs. If no worthwhile opportunity
    survives validation, say so and state the evidence limits.

@@ -520,3 +520,11 @@ test('section detection credits complete byte-range prints and still refuses a g
   expect(read(calls.filter((_, i) => i !== 2))).toEqual([]);
   expect(read(calls.slice(0, -1))).toEqual([]);
 });
+
+test('section detection credits abutting chunks whose edge bytes repeat by chance', async () => {
+  const { detectSectionReads } = await import('./helpers/auq-sdk-capture');
+  const sections = new Map([['s.md', 'alpha\nrecurrent line\nomega\n']]);
+  const chunk = (output: string) => ({ tool: 'Bash', input: { command: 'head -c 11 x/sections/s.md' }, output });
+  expect([...detectSectionReads([chunk('alpha\nrecur'), chunk('rent line\nomega\n')], sections)]).toEqual(['s.md']);
+  expect([...detectSectionReads([chunk('alpha\nrecur'), chunk('line\nomega\n')], sections)]).toEqual([]);
+});

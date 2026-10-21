@@ -16,16 +16,6 @@ allowed-tools:
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
-
-## When to invoke this skill
-
-Opens a visible browser window where you can watch every action in real time.
-The sidebar shows a live activity feed and chat. Anti-bot stealth built in.
-Use when asked to "open gstack browser", "launch browser", "connect chrome",
-"open chrome", "real browser", "launch chrome", "side panel", or "control my browser".
-
-Voice triggers (speech-to-text aliases): "show me the browser".
-
 ## Preamble (run first)
 
 ```bash
@@ -65,14 +55,15 @@ If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay
 
 ## Artifacts Sync (skill start)
 
-The skill-start output above already ran artifacts sync. Act on its lines:
-GBrain hint text (if present) tells you when to prefer `gbrain` over Grep;
-`ARTIFACTS_SYNC:` reports sync health (`off`, `mode=... | queue=N`,
-`remote-mode`, or a restore hint naming `gstack-brain-restore`).
+Skill-start already ran artifacts sync. GBrain hint text (if any) says
+when to prefer `gbrain` over Grep. `ARTIFACTS_SYNC:` reports sync health
+(`off`, `mode=... | queue=N`, `remote-mode`, or a `gstack-brain-restore`
+hint). On an `attention:` line, tell the user in one sentence what
+it says and the command it names, then continue.
 
-The one-time privacy stop-gate (artifacts-sync consent) arrives as a
-`GSTACK_INSTRUCTION` block from skill-start when consent is actually pending
-— fire it via AskUserQuestion exactly as the block instructs.
+The one-time privacy stop-gate arrives as a `GSTACK_INSTRUCTION` block
+from skill-start when consent is pending; fire it via AskUserQuestion
+exactly as instructed.
 
 ## Model-Specific Behavioral Patch (claude)
 
@@ -97,14 +88,16 @@ find, grep). The dedicated tools are cheaper and clearer.
 
 Direct, concrete, builder-to-builder. Name the file, function, command, and user-visible impact. No filler.
 
-No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted. Never corporate or academic. Short paragraphs. End with what to do.
+No em dashes. No AI vocabulary: delve, crucial, robust, comprehensive, nuanced, multifaceted, load-bearing. Never corporate or academic. Short paragraphs. End with what to do.
+
+Reply in the language of the user's latest message unless asked otherwise. Code, commands, paths, identifiers and quoted output stay verbatim.
 
 The user has context you do not. Cross-model agreement is a recommendation, not a decision. The user decides.
 
 ## Completion Status Protocol
 
 When completing a skill workflow, report status using one of:
-- **DONE** — completed with evidence.
+- **DONE** — completed with evidence valid for the final consumed inputs; name reuse and anything not independently verified.
 - **DONE_WITH_CONCERNS** — completed, but list concerns.
 - **BLOCKED** — cannot proceed; state blocker and what was tried.
 - **NEEDS_CONTEXT** — missing info; state exactly what is needed.
@@ -163,12 +156,14 @@ _ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 B=""
 [ -n "$_ROOT" ] && [ -x "$_ROOT/.claude/skills/gstack/browse/dist/browse" ] && B="$_ROOT/.claude/skills/gstack/browse/dist/browse"
 [ -z "$B" ] && B="$HOME/.claude/skills/gstack/browse/dist/browse"
-if [ -x "$B" ]; then
+if [ -x "$B" ] && "${B%/browse/*}/bin/gstack-browser-ensure"; then
   echo "READY: $B"
 else
   echo "NEEDS_SETUP"
 fi
 ```
+
+`gstack-browser-ensure` installs Chromium on first use when the install skipped it (lazy browser); it prints `BROWSER_OK` or `BROWSER_UNAVAILABLE <reason>` first.
 
 If `NEEDS_SETUP`:
 1. Tell the user: "gstack browse needs a one-time build (~10 seconds). OK to proceed?" Then STOP and wait.
@@ -176,7 +171,7 @@ If `NEEDS_SETUP`:
 3. If `bun` is not installed:
    ```bash
    if ! command -v bun >/dev/null 2>&1; then
-     BUN_VERSION="1.3.10"
+     BUN_VERSION="1.4.2"
      BUN_INSTALL_SHA="bab8acfb046aac8c72407bdcce903957665d655d7acaa3e11c7c4616beae68dd"
      tmpfile=$(mktemp "${TMPDIR:-/tmp}/bun-install.XXXXXX")
      curl -fsSL "https://bun.sh/install" -o "$tmpfile"
@@ -193,7 +188,7 @@ If `NEEDS_SETUP`:
        echo "  got:      $actual_sha" >&2
        rm "$tmpfile"; exit 1
      fi
-     BUN_VERSION="$BUN_VERSION" bash "$tmpfile"
+     bash "$tmpfile" "bun-v$BUN_VERSION"
      rm "$tmpfile"
    fi
    ```

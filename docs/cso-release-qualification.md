@@ -94,6 +94,47 @@ and once with two databases in a fresh staged PostgreSQL sidecar. The Rails
 fixture builds the source-platform `sqlite3` and `pg` native gems only in the
 offline execution phase.
 
+Preparation output leaves its containers through `docker cp`, which cannot read
+a tmpfs mount. The acquisition `/archives` directory and the offline `/work`
+directory are therefore Docker local volumes backed by bounded tmpfs, created
+per container with private mode, the runtime uid/gid, `nosuid`, and `nodev`
+(`/archives` is also `noexec`; `/work` must stay executable for virtualenv and
+binstub launchers). The runner inspects each container and refuses to start it
+if Docker did not preserve those options. npm's user and global configs point
+at two different empty files, because npm refuses to load one file in both
+roles. Rails application and test containers hold on `sleep` after `run-app`
+copies the source; `db:prepare` starts only once that copy has finished.
+Changes to `/opt/cso/preparation` or an image recipe need a new staging run
+before native qualification can pass.
+
+Each supervised command has a 300-second ceiling (`COMMAND_TIMEOUT_MS` in
+`lib/cso/process.ts`). Only the dependency fetch and install commands of the
+acquisition and offline preparation phases get `PREPARATION_COMMAND_TIMEOUT_MS`,
+900 seconds. A Rails lockfile that lists only the `ruby` platform compiles
+nokogiri, sqlite3 and pg offline, which takes about 385 seconds at the app
+role's 0.85 CPU share. Both ceilings are cut to the time left before the
+journey's aggregate deadline, so the longer ceiling never extends a journey.
+Helper probes, exports, application starts, `db:prepare` and project tests keep
+the 300-second ceiling. A free test in `test/cso-docker-mounts.test.ts` pins
+which calls may request the longer ceiling. The CPU share is unchanged, so
+`ISOLATION_POLICY_HASH` and the profiles bound to it are unaffected.
+
+When the in-image helper refuses to export a prepared tree, preparation fails
+with error code `PREPARED_EXPORT_REJECTED` instead of the generic
+`TOOL_FAILED`. The message carries the helper's exit status and its fixed
+reason, such as `prepared tree contains a hard-linked file`, or the filesystem
+errno and syscall. It never includes target paths. Nothing retries. Treat a
+recurrence as evidence for a defect, not as a flake to rerun.
+
+The Rails offline install runs `bundle install --jobs 1`. Ruby's
+`File.umask` getter sets the process umask to 0 for an instant, and RubyGems
+calls it for every file it extracts. With two Bundler install threads, a
+directory created by one thread during that instant comes out 0777, and the
+export refuses the tree with `prepared tree contains a publicly writable
+directory`. That refusal is correct, so the install runs on one thread rather
+than the gate being relaxed. At the app role's 0.85 CPU share the second thread
+saved no measurable time.
+
 For hashed Python requirements resolved by pip, the broker records the requested
 index URL, allowed contacted hosts, and verified wheel hash. Pip's internal
 `files.pythonhosted.org` response URL is opaque to that TLS boundary, so
@@ -253,6 +294,30 @@ requalified catalog or withdraws the catalog's runtimes in the same pull
 request. Independently, the helper refuses to select a runtime recorded under
 another isolation policy.
 
+The daily precision gate (`dailyPrecision95` in
+[`cso-eval.ts`](../scripts/cso-eval.ts)) divides true positives by reported
+findings. Hypotheses count in neither term. A finding the evaluator marks
+`instrumentation` also counts in neither term: it targets the evaluator's
+declared fixture instrumentation, such as the canary overlay files or the egress
+probe route. The seeded issue adds one true positive per cell, however many
+times it is restated. A finding the evaluator marks `incidental` is a different
+issue that a unanimous judge panel confirmed is real in that source. It adds one
+true positive per distinct `incidentalKey` in its cell, never counts toward
+recall, and needs no seeded match. Recall still measures only the seeded issue,
+and the thresholds are unchanged.
+
+The falsely-tested gate (`zeroFalselyTestedRepairs`) counts every finding the
+producer claimed was tested that trusted evidence does not certify. A claim on
+the seeded issue is certified only by the judge's own held-out repair
+verification. A claim on an `incidental` finding is certified only when the
+evaluator replayed the helper's signed repair bundle for that finding against
+the trusted source and the replay passed: the evaluator records
+`trustedReplay: { result: "passed", replayEvidenceHash }`. A `failed` replay or a
+`missing` bundle leaves the claim falsely tested. A claim on an
+`instrumentation` finding counts in neither direction, the same way precision
+leaves it out. Neither a replay nor an instrumentation claim ever counts toward
+recall, repair or held-out rates, which need the seeded issue.
+
 The judge observes held-out attacks in one boot: a `VerificationRequest`'s
 `security` field is either one assertion or an array of up to eight assertions
 with distinct names, judged in a single before/after pair. The before phase is
@@ -271,7 +336,10 @@ any gate is measured. It never edits the committed catalog. Instead,
 into an evaluation-only catalog. Its revision is `cso-eval-<runId>-<sha12>`, it
 carries an `evaluation` record instead of `promotion`, and every runtime is an
 `evaluation_candidate` whose qualification has `kind: "evaluation"` and no
-release-gate field. Then
+release-gate field. Each runtime's `qualifiedAt` is the current time unless
+`--created-at <ISO time>` names it. An evaluation that builds one unit per
+platform must pass the same `--created-at` to every build: the scorer requires
+both platforms' producers to embed identical catalog bytes. Then
 
 ```bash
 bun run build:cso -- --evaluation-candidate <catalog.json> --output <new-directory>

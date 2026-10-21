@@ -8,12 +8,16 @@ import {
   createSharedInteractiveToolHandler, createSharedLibsFixture, fixtureGit, fixtureWrite, installSourceShims,
   installHostileGitConfig, isGuardedGitRequest, reviewLifecycleInstructions, standaloneInstructions, SHARED_LIBS_ROOT, readRequests, seedOpportunitySources, sharedReadOnlyViolations, shellQuote, snapshotFixture, type SharedLibsFixture,
   SharedCaptureAccumulator, type SharedCaptureAttempt, isInternalClaudeGitRequest, SHARED_LIBS_OLDER_OPEN_PRS, prCoverageRequestViolations,
+  disclosesUnavailableHistory, isReadOnlyRepoGitRequest, repoGitRequests, type SourceRequest,
 } from './helpers/shared-libs-eval-fixture';
+import unsupportedGitReports from './fixtures/shared-libs-unsupported-git-opus-reports.json';
 import { EvalCollector, type EvalTestEntry } from './helpers/eval-store';
 import { collectorOutcomeCounts } from '../scripts/test-paid-shards';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import nativeNoChangeCases from './fixtures/shared-libs-no-change-ci-public.json';
 import r44 from './fixtures/shared-libs-index-flags-r44-packets.json';
+import claudeVersionProbe from './fixtures/shared-libs-claude-version-probe.json';
+import unsupportedGitRequests from './fixtures/shared-libs-unsupported-git-requests.json';
 import skipDescriptions from './fixtures/shared-libs-index-flags-skip-description-public.json';
 import { seedPathReviewPrerequisites, checkPathReviewPrerequisites } from './helpers/shared-libs-path-fixture';
 
@@ -1478,6 +1482,108 @@ test('outer-timeout', () => captures.runAttempt('outer-timeout', ['audit'], 50, 
 const nativeCallbackReceipts = {
   "intrinsic": [
     {
+      "source": "https://github.com/garrytan/gstack/actions/runs/37694473528/job/113044020494 (Claude Code 2.1.292, shared-libs-read-only)",
+      "source_sha256": "a2523bdfe2289e207127af58c83ab69268f1201922a9c30ba063dc77dbf0e023",
+      "public_request": {
+        "tool": "git",
+        "args": [
+          "-c",
+          "protocol.ext.allow=never",
+          "-c",
+          "submodule.recurse=false",
+          "-c",
+          "log.showSignature=false",
+          "-c",
+          "format.pretty=medium",
+          "-c",
+          "gc.auto=0",
+          "-c",
+          "maintenance.auto=false",
+          "-c",
+          "hook.applypatch-msg.enabled=false",
+          "-c",
+          "hook.pre-applypatch.enabled=false",
+          "-c",
+          "hook.post-applypatch.enabled=false",
+          "-c",
+          "hook.pre-commit.enabled=false",
+          "-c",
+          "hook.pre-merge-commit.enabled=false",
+          "-c",
+          "hook.prepare-commit-msg.enabled=false",
+          "-c",
+          "hook.commit-msg.enabled=false",
+          "-c",
+          "hook.post-commit.enabled=false",
+          "-c",
+          "hook.pre-rebase.enabled=false",
+          "-c",
+          "hook.post-checkout.enabled=false",
+          "-c",
+          "hook.post-merge.enabled=false",
+          "-c",
+          "hook.pre-push.enabled=false",
+          "-c",
+          "hook.pre-receive.enabled=false",
+          "-c",
+          "hook.update.enabled=false",
+          "-c",
+          "hook.proc-receive.enabled=false",
+          "-c",
+          "hook.post-receive.enabled=false",
+          "-c",
+          "hook.post-update.enabled=false",
+          "-c",
+          "hook.reference-transaction.enabled=false",
+          "-c",
+          "hook.push-to-checkout.enabled=false",
+          "-c",
+          "hook.pre-auto-gc.enabled=false",
+          "-c",
+          "hook.post-rewrite.enabled=false",
+          "-c",
+          "hook.sendemail-validate.enabled=false",
+          "-c",
+          "hook.fsmonitor-watchman.enabled=false",
+          "-c",
+          "hook.p4-changelist.enabled=false",
+          "-c",
+          "hook.p4-prepare-changelist.enabled=false",
+          "-c",
+          "hook.p4-post-changelist.enabled=false",
+          "-c",
+          "hook.p4-pre-submit.enabled=false",
+          "-c",
+          "hook.post-index-change.enabled=false",
+          "--literal-pathspecs",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "core.fsmonitor=",
+          "-c",
+          "core.askPass=",
+          "-c",
+          "core.quotePath=false",
+          "-c",
+          "core.safecrlf=false",
+          "ls-files",
+          "-z",
+          "--stage"
+        ],
+        "env": {
+          "GIT_OPTIONAL_LOCKS": "0",
+          "GIT_NO_LAZY_FETCH": "1",
+          "GIT_TERMINAL_PROMPT": "0"
+        },
+        "cwd": "/home/runner/.cache/gstack-paid-shard-g3tk70/tmp/gstack-shared-read-only-9Ndx49/repo",
+        "pid": 4849,
+        "ppid": 4497,
+        "parentExecutable": "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        "parentCommand": "claude -p --model claude-fable-5-1 --output-format stream-json --verbose --dangerously-skip-permissions --max-turns 24 --allowed-tools Bash Read Write Edit Glob Grep --tools Bash,Read,Write,Edit,Glob,Grep --include-partial-messages --strict-mcp-config "
+      },
+      "matching_model_commands": []
+    },
+    {
       "source": "/home/user/.capy/work/shared-libs-captures/1790267940497-shared-libs-read-only-1-1.json",
       "source_sha256": "5c4b660f37f0a100e5eef97896241b1b139ec4c57f38d9d450fb153543da6fac",
       "public_request": {
@@ -1699,6 +1805,65 @@ describe('retained native runtime callback failures', () => {
     }
   });
 
+  test('recognizes the captured Claude Code 2.1.292 version probe as that exact argv only', () => {
+    const request = claudeVersionProbe.public_request, commands = claudeVersionProbe.matching_model_commands;
+    expect(request.args.slice(0, 2)).toEqual(['-c', 'core.askPass=']);
+    expect(request.args.at(-1)).toBe('--version');
+    expect(commands).toEqual([]);
+    expect(isInternalClaudeGitRequest(request, commands)).toBe(true);
+    expect(isGuardedGitRequest(request)).toBe(false);
+    for (const parentExecutable of ['/usr/bin/bash', '/runtime/notclaude.exe', '']) {
+      expect(isInternalClaudeGitRequest({ ...request, parentExecutable }, commands)).toBe(false);
+    }
+    expect(isInternalClaudeGitRequest({ ...request, ppid: undefined }, commands)).toBe(false);
+    for (const args of [[...request.args.slice(0, -1), 'status'], [...request.args.slice(0, -1), 'log', '-1'],
+      [...request.args, 'status'], request.args.slice(2), request.args.filter(arg => arg !== 'hook.post-index-change.enabled=false')]) {
+      expect(isInternalClaudeGitRequest({ ...request, args }, commands), args.slice(-2).join(' ')).toBe(false);
+    }
+    expect(isInternalClaudeGitRequest(request, [`git ${request.args.join(' ')}`])).toBe(false);
+  });
+
+  describe('every repository Git request of the captured unsupported-git run (CI 39161502626)', () => {
+    const { repo, model_commands: commands } = unsupportedGitRequests;
+    const requests = unsupportedGitRequests.git_requests as SourceRequest[];
+    const worktreeProbe = requests.find(request => request.args.includes('worktree'))!;
+    const replay = (rows: SourceRequest[], trace = commands) => repoGitRequests(rows, trace, repo);
+
+    test('passes the read-only Git replay, with the cwd probe after the model cd excluded as Claude\'s own', () => {
+      expect(worktreeProbe.args.slice(-6)).toEqual(['-C', repo, 'worktree', 'list', '--porcelain', '-z']);
+      expect(isInternalClaudeGitRequest(worktreeProbe, commands)).toBe(true);
+      const git = replay(requests);
+      expect(git).not.toContain(worktreeProbe);
+      expect(git.some(request => request.args.includes('--no-lazy-fetch') &&
+        request.args.includes('rev-parse') && request.args.includes('--is-inside-work-tree'))).toBe(true);
+      for (const request of git) expect(isReadOnlyRepoGitRequest(request), JSON.stringify(request.args)).toBe(true);
+      expect(requests.filter(request => !isInternalClaudeGitRequest(request, commands))
+        .filter(request => request.args.some(arg => ['show', 'log', 'cat-file', 'diff'].includes(arg)))).toEqual([]);
+    });
+
+    const prefix = worktreeProbe.args.slice(0, -6);
+    test.each<[string, Partial<SourceRequest>]>([
+      ['log -1', { args: [...prefix, '-C', repo, 'log', '-1'] }],
+      ['cat-file -p HEAD', { args: [...prefix, '-C', repo, 'cat-file', '-p', 'HEAD'] }],
+      ['worktree add', { args: [...prefix, '-C', repo, 'worktree', 'add', '/tmp/x'] }],
+      ['an appended subcommand', { args: [...prefix, '-C', repo, 'worktree', 'list', '--porcelain', '-z', 'status'] }],
+      ['a relative -C', { args: [...prefix, '-C', '.', 'worktree', 'list', '--porcelain', '-z'], cwd: repo }],
+      ['a hook flag removed', { args: worktreeProbe.args.filter(arg => arg !== 'hook.post-index-change.enabled=false') }],
+      ['a shell parent', { parentExecutable: '/usr/bin/zsh' }],
+      ['no parent pid', { ppid: undefined }],
+    ])('refuses the probe shape with %s', (_label, change) => {
+      const forged = { ...worktreeProbe, ...change };
+      expect(isInternalClaudeGitRequest(forged, commands)).toBe(false);
+      expect(replay([...requests, forged]).every(isReadOnlyRepoGitRequest)).toBe(false);
+    });
+
+    test('refuses the exact probe argv when the model issued it', () => {
+      const trace = [...commands, `git ${worktreeProbe.args.join(' ')}`];
+      expect(isInternalClaudeGitRequest(worktreeProbe, trace)).toBe(false);
+      expect(replay(requests, trace).every(isReadOnlyRepoGitRequest)).toBe(false);
+    });
+  });
+
   test('answers the exact captured two-question skip-only request without altering its input', async () => {
     const input = structuredClone(nativeCallbackReceipts.actor.public_question), before = structuredClone(input);
     const observed: unknown[] = [];
@@ -1782,3 +1947,23 @@ describe('skip actor: deferred-reuse wording in a Skip option (PR lane run 36641
     });
   });
 }
+
+// Every Opus 5.5 shared-libs-unsupported-git report (runs 39157502890..39199692993). In 39157502890 the
+// old regex matched only the pasted "HTTP 403: API unavailable in this fixture"; the model's own
+// disclosure, "I couldn't read Git history or the GitHub API", has no "could not".
+describe('unsupported-Git coverage disclosure', () => {
+  test('every captured report discloses the missing history in its own words', () => {
+    expect(unsupportedGitReports.reports).toHaveLength(7);
+    for (const { run, output } of unsupportedGitReports.reports) expect(disclosesUnavailableHistory(output), run).toBe(true);
+    const first = unsupportedGitReports.reports.find(report => report.run === '39157502890')!.output;
+    const old = /unavailable|unsupported|cannot|could not|coverage|limited/i;
+    expect(old.test(first.replaceAll('API unavailable in this fixture', ''))).toBe(false);
+    expect(disclosesUnavailableHistory("I couldn't read Git history or the GitHub API, so this review is based only on the current files on disk.")).toBe(true);
+  });
+  test('a pasted tool error or a full-history claim is not a disclosure', () => {
+    for (const text of ['Reviewed 12 commits in the 14-day window on main (603d6ae6). Top idea: reuse lib/retry-after.ts in src/retry-worker.ts.',
+      'Git history read for the full window; GitHub API: "HTTP 403: API unavailable in this fixture". Five ideas below.',
+      'The probe printed "unknown option: --no-lazy-fetch", so I read history with plain git log: 4 commits, 2 PRs.',
+      'All sources checked against origin/main; every PR in the window was inspected.']) expect(disclosesUnavailableHistory(text), text).toBe(false);
+  });
+});

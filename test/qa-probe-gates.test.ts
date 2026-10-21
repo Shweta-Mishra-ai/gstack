@@ -59,6 +59,14 @@ function assertPlanExecution(text: string, shared = generateQAExploratory({ host
 }
 
 describe('QA probe entry and checkpoint gates', () => {
+  test('the caller exposes the response boundary before the first QA instruction read', () => {
+    for (const skillName of ['review', 'ship']) {
+      const text = generateQAReviewPreflight({ host: 'claude', skillName, tmplPath: '', paths: HOST_PATHS.claude });
+      const beforeRead = text.slice(0, text.indexOf('{{QA_RESOURCE:exploratory}}'));
+      expectMentions(beforeRead, [['reads', 'earlier', 'responses'], ['capture', 'probe'], ['never', 'batch', 'read']], 'caller entry gate');
+    }
+  });
+
   test('the native CI preparation excerpt lacks the required acknowledged-read gate', () => {
     const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/qa-functional-ci-36505065023.json'), 'utf8'));
     const output = captured.omittedReadEvents.flatMap(event => event.message.content)
@@ -88,7 +96,9 @@ describe('QA probe entry and checkpoint gates', () => {
         const ctx = { host: host.name, skillName, tmplPath: '', paths: HOST_PATHS[host.name] };
         const preflight = generateQAReviewPreflight(ctx).replace(/\s+/g, ' ');
         const body = generateQAReview(ctx).replace(/\s+/g, ' ');
-        expect(preflight).toMatch(/`sections\/\.\.\.` and `templates\/\.\.\.` paths from that installed QA SKILL\.md directory, not the caller or product directory/i);
+        expect(preflight).toContain('`sections/...`');
+        expect(preflight).toContain('`templates/...`');
+        expectMentions(preflight, [['paths', 'installed qa skill.md', 'not', 'caller', 'product']], 'QA asset resolution');
         expect(body).toContain('Read QA\'s `sections/browser-setup.md`');
         expect(body).toContain('Read QA\'s `templates/functional-report-template.md`');
         if (skillName === 'review') {
@@ -326,6 +336,45 @@ describe('judge-named QA workflow gaps (C2)', () => {
   // with the longer "step 4c reruns plan checks only" variant, which every low
   // sample read as conflicting with Step 5.8's repeat-pass reruns (2026-10-05).
   test('/review and /ship: post-expiry smoke rechecks are not-run, stated once before step 4c', () => {
+    for (const skillName of ['review', 'ship']) {
+      const text = generateQAReview(ctx(skillName));
+      const rule = text.indexOf('Post-expiry smoke rechecks are not-run.');
+      expect(rule).toBeGreaterThan(-1);
+      expect(rule).toBeLessThan(text.indexOf('c. Re-review changed or uncertain coverage and repeat step 3 for affected checks.'));
+    }
+  });
+});
+
+// Lane S C2: gaps the qa-only/review/ship workflow judges named in their rationales.
+describe('judge-named QA workflow gaps (C2)', () => {
+  const ctx = (skillName: string) => ({ host: 'claude' as const, skillName, tmplPath: '', paths: HOST_PATHS.claude });
+
+  test('Browser Quick leaves time for its six page probes, and the method states the same budget', () => {
+    for (const skillName of ['qa', 'qa-only']) {
+      const seconds = Number(/Browser Quick: SECONDS=(\d+)\./.exec(generateQAExploratory(ctx(skillName)))?.[1]);
+      // homepage + top 5 targets, each a checkpoint write plus one guarded command: 30 s left ~5 s per probe.
+      expect(seconds / 6).toBeGreaterThanOrEqual(20);
+      const patterns = fs.readFileSync(path.join(import.meta.dir, '..', 'qa', 'sections', 'qa-patterns.md'), 'utf8');
+      expect(patterns).toContain(`${seconds / 60} minutes: homepage + top 5 navigation targets`);
+    }
+  });
+
+  test('PROBE_DIR names its source line, and stopping goes to the final report steps', () => {
+    for (const skillName of ['qa', 'qa-only']) {
+      const text = generateQAExploratory(ctx(skillName));
+      const layout = text.indexOf('mixed standalone runs use REPORT_DIR/browser and REPORT_DIR/functional');
+      const probeDir = text.indexOf("PROBE_DIR: this surface's owned probe directory per the line above.");
+      expect(layout).toBeGreaterThan(-1);
+      expect(probeDir).toBeGreaterThan(layout);
+      expect(text.slice(layout, probeDir).split('\n')).toHaveLength(3);
+      expect(text).toContain('write the report (§4), not a checkpoint.');
+      const final = text.indexOf('## 4. Final report');
+      expect(final).toBeGreaterThan(-1);
+      expect(text.indexOf('annotations.json', final)).toBeLessThan(text.indexOf('materialize PROBE_DIR', final));
+    }
+  });
+
+  test('/review and /ship: smoke rechecks after smoke expiry are not-run, before step 4c revalidation', () => {
     for (const skillName of ['review', 'ship']) {
       const text = generateQAReview(ctx(skillName));
       const rule = text.indexOf('Post-expiry smoke rechecks are not-run.');

@@ -547,7 +547,7 @@ export function hermeticChildEnv(
   const dirs = getHermeticDirs();
   return buildHermeticEnv(
     process.env,
-    { CLAUDE_CONFIG_DIR: dirs.configDir, GSTACK_HOME: dirs.gstackHome },
+    { CLAUDE_CONFIG_DIR: dirs.configDir, GSTACK_HOME: dirs.gstackHome, GSTACK_LEASE_DIR: path.join(dirs.runRoot, 'gstack-leases') },
     overrides,
     opts,
   );

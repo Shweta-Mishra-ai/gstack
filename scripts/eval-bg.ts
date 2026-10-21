@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * eval-bg — the one entry point for background paid evals (`bun run eval:bg:<lane>`).
  *
@@ -45,7 +45,23 @@ export const UNRECORDED_SHARD_MS = 600_000;
 /** How long the dispatch follower may hold the lock: the longest CI lane plus queueing. */
 export const DISPATCH_FOLLOW_SECONDS = 4 * 60 * 60;
 
-export interface WorkflowDispatch { workflow: 'evals.yml' | 'evals-periodic.yml'; inputs: Record<string, string> }
+export interface WorkflowDispatch { workflow: string; inputs: Record<string, string> }
+
+/**
+ * Every workflow_dispatch input name eval-bg and gstack-ship-queue send, in
+ * one place. The train inputs (cases, prefix_shas) and the screen inputs
+ * (screen_pr, screen_merge_sha, screen_policy) are the interface the
+ * workflow side (plan GSTA-49, lane T1b) adds to evals.yml.
+ */
+export const DISPATCH_INPUTS = {
+  evalsAll: 'evals_all', expectedSha: 'expected_sha', nonce: 'nonce', baseRef: 'base_ref', baseSha: 'base_sha', prReceipts: 'pr_receipts',
+  cases: 'cases', prefixShas: 'prefix_shas', screenPr: 'screen_pr', screenMergeSha: 'screen_merge_sha', screenPolicy: 'screen_policy',
+} as const;
+
+/** What a dispatch is for, beside its lane: the screen policy keeps a broad screen from adopting a narrow run. */
+export type DispatchPurpose = 'screen' | 'train' | 'bisect' | 'backstop';
+export type ScreenPolicy = 'narrow' | 'broad';
+export interface NonceScope { purpose: DispatchPurpose; policy?: ScreenPolicy }
 
 interface LaneSpec {
   /** The package script the local backend runs. */
@@ -65,13 +81,14 @@ export const LANE_SPECS: Record<EvalBgLane, LaneSpec> = {
 
 /** The workflows a lane dispatches and their inputs (names agreed with evals.yml's workflow_dispatch). */
 export function dispatchPlan(lane: EvalBgLane, ids: { sha: string; baseRef: string; baseSha: string; nonce: string; prNumber?: number | null }): WorkflowDispatch[] {
+  const I = DISPATCH_INPUTS;
   const evals = (all: boolean): WorkflowDispatch => ({ workflow: 'evals.yml', inputs: {
-    evals_all: String(all), expected_sha: ids.sha, nonce: ids.nonce,
-    ...(all ? {} : { base_ref: ids.baseRef, base_sha: ids.baseSha }),
+    [I.evalsAll]: String(all), [I.expectedSha]: ids.sha, [I.nonce]: ids.nonce,
+    ...(all ? {} : { [I.baseRef]: ids.baseRef, [I.baseSha]: ids.baseSha }),
     // CEO-29/ENG-8: a PR lane run on a ref with an open same-repo PR reads that PR's receipts read-only.
-    ...(!all && ids.prNumber ? { pr_receipts: String(ids.prNumber) } : {}),
+    ...(!all && ids.prNumber ? { [I.prReceipts]: String(ids.prNumber) } : {}),
   } });
-  const periodic: WorkflowDispatch = { workflow: 'evals-periodic.yml', inputs: { expected_sha: ids.sha, nonce: ids.nonce } };
+  const periodic: WorkflowDispatch = { workflow: 'evals-periodic.yml', inputs: { [I.expectedSha]: ids.sha, [I.nonce]: ids.nonce } };
   if (lane === 'pr') return [evals(false)];
   if (lane === 'gate') return [evals(true)];
   if (lane === 'periodic') return [periodic];
@@ -163,12 +180,25 @@ export function exitStatusWord(code: string): 'passed' | 'failed' | 'cancelled' 
   return code === '130' ? 'cancelled' : 'failed';
 }
 
-/** Nonce: lane, tested revision and base, plus a random suffix; the dedupe key is everything but the suffix. */
-export function makeNonce(lane: EvalBgLane, sha: string, baseSha: string, random = Math.random().toString(36).slice(2, 8)): string {
-  return `${dedupeKey(lane, sha, baseSha)}${random}`;
+/**
+ * Nonce: lane, tested revision and base, plus a random suffix; the dedupe key
+ * is everything but the suffix. A scoped dispatch (a screen, a train, a
+ * bisect, a backstop) adds its purpose and screen policy to the lane field
+ * (`pr.screen.broad-…`), so runs of another purpose or policy never match
+ * its key and the plain lane keys are unchanged.
+ */
+export function makeNonce(lane: EvalBgLane, sha: string, baseSha: string, random = Math.random().toString(36).slice(2, 8), scope?: NonceScope): string {
+  return `${dedupeKey(lane, sha, baseSha, scope)}${random}`;
 }
-export function dedupeKey(lane: EvalBgLane, sha: string, baseSha: string): string {
-  return `${lane}-${sha.slice(0, 12)}-${(baseSha || 'none').slice(0, 12)}-`;
+export function dedupeKey(lane: EvalBgLane, sha: string, baseSha: string, scope?: NonceScope): string {
+  const field = scope ? [lane, scope.purpose, ...(scope.policy ? [scope.policy] : [])].join('.') : lane;
+  return `${field}-${sha.slice(0, 12)}-${(baseSha || 'none').slice(0, 12)}-`;
+}
+
+/** The scope a nonce was minted with (null for a plain lane nonce). */
+export function nonceScope(nonce: string): NonceScope | null {
+  const m = /^(?:pr|gate|periodic|release)\.(screen|train|bisect|backstop)(?:\.(narrow|broad))?-[0-9a-f]{1,12}-/.exec(nonce);
+  return m ? { purpose: m[1] as DispatchPurpose, ...(m[2] ? { policy: m[2] as ScreenPolicy } : {}) } : null;
 }
 
 export interface RunSummary { databaseId: number; displayTitle: string; status: string; conclusion: string | null; url: string; event: string }
@@ -186,7 +216,39 @@ export function findDuplicateRun(runs: readonly RunSummary[], key: string): RunS
 
 // ─── Process plumbing (git / gh / detach) ────────────────────────────────────
 
-type Exec = (command: string, args: string[]) => { status: number | null; stdout: string };
+export type Exec = (command: string, args: string[]) => { status: number | null; stdout: string };
+
+const RUN_FIELDS = 'databaseId,displayTitle,status,conclusion,url,event';
+
+/** Recent workflow_dispatch runs of one workflow; null when gh could not list them (unknown, never "none"). */
+export function listDispatchRuns(workflow: string, run: Exec, repo = CANONICAL_REPO, limit = 30): RunSummary[] | null {
+  const out = run('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--event', 'workflow_dispatch', '--limit', String(limit), '--json', RUN_FIELDS]);
+  if (out.status !== 0) return null;
+  try { const parsed = JSON.parse(out.stdout); return Array.isArray(parsed) ? parsed as RunSummary[] : null; } catch { return null; }
+}
+
+/** The dispatch run whose run-name carries exactly this nonce. */
+export function runForNonce(runs: readonly RunSummary[], nonce: string): RunSummary | null {
+  return runs.find(item => item.event === 'workflow_dispatch' && item.displayTitle.includes(`eval-bg ${nonce}]`)) ?? null;
+}
+
+/** `gh workflow run` with the plan's inputs on `ref`; false when gh refused it. */
+export function dispatchWorkflow(dispatch: WorkflowDispatch, ref: string, run: Exec, repo = CANONICAL_REPO): boolean {
+  const args = ['workflow', 'run', dispatch.workflow, '--repo', repo, '--ref', ref,
+    ...Object.entries(dispatch.inputs).flatMap(([name, value]) => ['-f', `${name}=${value}`])];
+  return run('gh', args).status === 0;
+}
+
+/** Poll for the run a dispatch started, by its nonce, for up to ten poll intervals; null when none appeared. */
+export async function awaitNonceRun(workflow: string, nonce: string, run: Exec, repo = CANONICAL_REPO): Promise<RunSummary | null> {
+  const deadline = Date.now() + 10 * pollMs();
+  while (Date.now() < deadline) {
+    await sleep(Math.min(pollMs(), 10_000));
+    const found = runForNonce(listDispatchRuns(workflow, run, repo) ?? [], nonce);
+    if (found) return found;
+  }
+  return null;
+}
 
 const exec: Exec = (command, args) => {
   const result = spawnSync(command, args, { cwd: ROOT, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
@@ -238,22 +300,11 @@ const pollMs = () => Number(process.env.GSTACK_EVAL_BG_POLL_MS) || 30_000;
 
 /** Dispatch one workflow (or adopt a duplicate) and follow it; returns the mapped exit code. */
 async function followWorkflow(dispatch: WorkflowDispatch, ref: string, key: string, run: Exec): Promise<number> {
-  const list = () => {
-    const out = run('gh', ['run', 'list', '--repo', CANONICAL_REPO, '--workflow', dispatch.workflow, '--event', 'workflow_dispatch',
-      '--limit', '30', '--json', 'databaseId,displayTitle,status,conclusion,url,event']);
-    try { return out.status === 0 ? JSON.parse(out.stdout) as RunSummary[] : []; } catch { return []; }
-  };
-  let target = findDuplicateRun(list(), key);
+  let target = findDuplicateRun(listDispatchRuns(dispatch.workflow, run) ?? [], key);
   if (target) console.log(`[eval-bg] ${dispatch.workflow}: following existing run ${target.url} (same lane, revision and base; no duplicate dispatch)`);
   else {
-    const args = ['workflow', 'run', dispatch.workflow, '--repo', CANONICAL_REPO, '--ref', ref,
-      ...Object.entries(dispatch.inputs).flatMap(([name, value]) => ['-f', `${name}=${value}`])];
-    if (run('gh', args).status !== 0) { console.log(`[eval-bg] ${dispatch.workflow}: gh workflow run failed`); return 2; }
-    const deadline = Date.now() + 10 * pollMs();
-    while (!target && Date.now() < deadline) {
-      await sleep(Math.min(pollMs(), 10_000));
-      target = list().find(item => item.displayTitle.includes(`eval-bg ${dispatch.inputs.nonce}`)) ?? null;
-    }
+    if (!dispatchWorkflow(dispatch, ref, run)) { console.log(`[eval-bg] ${dispatch.workflow}: gh workflow run failed`); return 2; }
+    target = await awaitNonceRun(dispatch.workflow, dispatch.inputs[DISPATCH_INPUTS.nonce]!, run);
     if (!target) { console.log(`[eval-bg] ${dispatch.workflow}: dispatched, but no run named ${dispatch.inputs.nonce} appeared`); return 2; }
   }
   console.log(`[eval-bg] ${dispatch.workflow}: run ${target.databaseId} ${target.url}`);

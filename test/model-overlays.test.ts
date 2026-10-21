@@ -10,7 +10,7 @@ import type { TemplateContext } from '../scripts/resolvers/types';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { generateModelOverlay } from '../scripts/resolvers/model-overlay';
 import { resolveModel, type Model } from '../scripts/models';
-import { CLAUDE_FRONTIER_EVAL_MODEL } from '../lib/eval-model';
+import { CLAUDE_JUDGE_EVAL_MODEL } from '../lib/eval-model';
 import { readOverlay } from '../scripts/resolvers/model-overlay';
 import { generateCompletenessSection } from '../scripts/resolvers/preamble/generate-completeness-section';
 import { generateSetupCommand } from '../scripts/resolvers/utility';
@@ -407,9 +407,9 @@ describe('model-routing-claude', () => {
     expect(resolveModel('sonnet-5')).toBe('sonnet-5');
   });
 
-  test('Fable prefix exception holds only while the frontier eval model is a Fable 5 point release', () => {
+  test('Fable prefix exception holds only while the judge eval model is a Fable 5 point release', () => {
     if (resolveModel('claude-fable-5-99') === 'fable-5') {
-      expect(CLAUDE_FRONTIER_EVAL_MODEL.startsWith('claude-fable-5-')).toBe(true);
+      expect(CLAUDE_JUDGE_EVAL_MODEL.startsWith('claude-fable-5-')).toBe(true);
     }
   });
 });

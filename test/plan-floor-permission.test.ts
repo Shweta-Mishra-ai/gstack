@@ -17,6 +17,7 @@ import {readPlanFloorTarget} from './helpers/plan-floor-target';
 import {createFilePermissionRecorder, recordFilePermission, currentFilePermissionBinding, readPendingWriteInput, isCroppedEditPermissionVisible} from './helpers/plan-count-file-permission';
 import captured from './fixtures/plan-floor-permission-fb10.json';
 import croppedEdit from './fixtures/plan-edit-cropped-permission-1579.json';
+import toolOnlyCreate from './fixtures/plan-ceo-floor-toolonly-create.json';
 import {FORCING_FLOOR_CEO, FORCING_FLOOR_ENG, FORCING_FLOOR_DESIGN, FORCING_FLOOR_DEVEX} from './fixtures/forcing-finding-seeds';
 
 const ROOT = path.resolve(import.meta.dir, '..');
@@ -41,7 +42,7 @@ const render = (question: typeof QUESTIONS.ceo) => ['☐ '+question.header,quest
   ...question.options.flatMap((o,i)=>[`${i?' ':'❯'} ${i+1}. ${o.label}`,o.description]),
   'Enter to select · ↑/↓ to navigate · Esc to cancel'].join('\n');
 const FINDING = render(QUESTIONS.ceo);
-type Mode = 'planning-owned' | 'planning-foreign' | 'cropped-edit' | 'cropped-edit-missing' | 'cropped-edit-changed' | 'cropped-edit-completed' | 'captured' | 'owned' | 'owned-no-question' | 'foreign' | 'wrong-session' | 'missing-native' | 'linked-target' |
+type Mode = 'captured-unbound-create' | 'planning-owned' | 'planning-foreign' | 'cropped-edit' | 'cropped-edit-missing' | 'cropped-edit-changed' | 'cropped-edit-completed' | 'captured' | 'owned' | 'owned-no-question' | 'foreign' | 'wrong-session' | 'missing-native' | 'linked-target' |
   'native-question' | 'scope' | 'prose' | 'finding' | 'routing' | 'unrelated' | 'partial' | 'quoted' | 'foreign-question' |
   'stale-question' | 'answered-question' | 'failed-question' | 'mismatched-use' | 'duplicate-use' | 'judge-error' | 'mode' | 'pending-hook' | 'failed-hook' | 'packet' | 'prose-quoted' | 'prose-partial' | 'prose-foreign' | 'prose-stale' | 'product-type' | 'product-type-undeclared' |
   'unmatched-hook' | 'invalid-hook' | 'missing-hook' | 'idle-hook' | 'transition-hook' | 'unmatched-native' | 'dx-setup' | 'dx-editor-hint' | 'dx-no-finding' | 'dx-undeclared' | 'dx-cropped' | 'dx-unrelated' | 'dx-uncertain' | 'dx-changing-call';
@@ -131,7 +132,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
       const pendingFilePermissionFiles = expected ? [(() => {
         const recorder = createFilePermissionRecorder(opts.cwd, config, expected)!;
         recorders.push(recorder);
-        if (mode !== 'missing-native' && mode !== 'cropped-edit-missing') recordFilePermission(JSON.stringify({
+        if (mode !== 'missing-native' && mode !== 'cropped-edit-missing' && mode !== 'captured-unbound-create') recordFilePermission(JSON.stringify({
           hook_event_name:'PreToolUse', tool_name:crop?'Edit':'Write', session_id:mode === 'wrong-session' ? 'foreign' : sid,
           tool_use_id:'write1', cwd:opts.cwd,
           transcript_path:mode === 'wrong-session' ? path.join(config,'projects','owned','foreign.jsonl') : journal,
@@ -144,6 +145,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
       const permissionPath = mode === 'foreign' ? path.join(dir, 'foreign', path.basename(expected ?? 'report.md')) : expected;
       const permission = crop ? croppedEdit.screen.replaceAll(path.basename(croppedEdit.hook.expected),path.basename(expected))
         .replace('empathy narrative',mode==='cropped-edit-changed'?'different narrative':'empathy narrative') : mode === 'captured' ? captured.rawPermission :
+        mode === 'captured-unbound-create' ? toolOnlyCreate.screen.replaceAll(toolOnlyCreate.basename, path.basename(expected)) :
         `Create file\n${permissionPath}\n────────────────\n 1 # Working review\n────────────────\nDo you want to create ${path.basename(permissionPath ?? 'report.md')}?\n❯ 1. Yes\n  2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session\n  3. No\nEsc to cancel · Tab to amend`;
       return {
         hermeticConfigDir: config, pendingFilePermissionFiles, pendingQuestionFile:hookRecorder?.file,
@@ -278,7 +280,19 @@ test('captured file permission never satisfies the floor through a waiting judge
   expect(captured.originalOutcome).toBe('auq_observed');
   expect(runner.isPermissionDialogVisible(captured.rawPermission)).toBe(true);
   const e = await exercise('captured');
-  expect(e.result.outcome).toBe('timeout'); expect(e.result.auqObserved).toBe(false);
+  expect(e.result.outcome).toBe('permission_unanswered'); expect(e.result.auqObserved).toBe(false);
+  // gstack-timing-ok: injected exercise clock; failing within the 20 s bound instead of the timeout is the contract
+  expect(e.result.summary).toStartWith('PERMISSION_DIALOG_UNANSWERED: '); expect(e.result.elapsedMs).toBeLessThan(50_000);
+  expect(e.sent).toEqual(['/plan-ceo-review PLAN.md\r']); expect(e.judgments).toHaveLength(0);
+});
+test('the captured CI 39161502626 Create left without an owned grant fails fast with a named cause', async () => {
+  expect(toolOnlyCreate.recorded.outcome).toBe('timeout');
+  expect(runner.isPermissionDialogVisible(toolOnlyCreate.screen)).toBe(true);
+  const e = await exercise('captured-unbound-create');
+  expect(e.result).toMatchObject({outcome:'permission_unanswered', auqObserved:false});
+  expect(e.result.summary).toStartWith('PERMISSION_DIALOG_UNANSWERED: ');
+  // gstack-timing-ok: injected exercise clock; failing within the 20 s bound instead of the timeout is the contract
+  expect(e.result.elapsedMs).toBeLessThan(50_000);
   expect(e.sent).toEqual(['/plan-ceo-review PLAN.md\r']); expect(e.judgments).toHaveLength(0);
 });
 test('one owned native Write grant enables the actual later question without answering it', async () => {
@@ -298,12 +312,12 @@ for (const mode of ['planning-owned','planning-foreign'] as const) test(`actual 
 test.each(['cropped-edit','cropped-edit-missing','cropped-edit-changed','cropped-edit-completed'] as Mode[])('%s routes through the actual floor only after exact ownership',async mode=>{
   const e=await exercise(mode,'devex');
   expect(e.sent).toEqual(mode==='cropped-edit'?['/plan-devex-review PLAN.md\r','1\r']:['/plan-devex-review PLAN.md\r']);
-  expect(e.result.outcome).toBe(mode==='cropped-edit'?'auq_observed':'timeout');
+  expect(e.result.outcome).toBe(mode==='cropped-edit'?'auq_observed':'permission_unanswered');
   expect(e.judgments).toHaveLength(mode==='cropped-edit'?1:0);
   if(mode==='cropped-edit')expect(e.saved.observation.pendingQuestion.answered).toBe(false);
 });
 test.each(['owned-no-question','foreign','wrong-session','missing-native','linked-target'] as Mode[])('%s cannot supply finding credit', async mode => {
-  const e = await exercise(mode); expect(e.result.outcome).toBe('timeout');
+  const e = await exercise(mode); expect(e.result.outcome).toBe(mode === 'owned-no-question' ? 'timeout' : 'permission_unanswered');
   expect(e.sent).toEqual(mode === 'owned-no-question' ? ['/plan-ceo-review PLAN.md\r','1\r'] : ['/plan-ceo-review PLAN.md\r']);
   expect(e.judgments).toHaveLength(0);
 });

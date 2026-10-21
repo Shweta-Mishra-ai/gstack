@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import * as fs from 'fs';
+import * as path from 'path';
+import { CASE_TEST_NAMES, fileCaseRegistration } from '../scripts/lib/paid-cases';
 import {
-  PR_PROFILE_CASE_IDS, PR_PROFILE_MAPS, caseNameAddressable, formatPrCoverageSummary, packageChangeOnlyVersion, selectPrProfile, validatePrProfileInventory,
+  PR_PROFILE_CASE_IDS, PR_PROFILE_FILES, PR_PROFILE_MAPS, caseNameAddressable, formatPrCoverageSummary, packageChangeOnlyVersion, selectPrProfile, validatePrProfileInventory,
   type PrProfileMaps,
 } from '../scripts/test-pr-profile';
 
@@ -46,6 +49,16 @@ describe('fast PR coverage policy', () => {
       { id: 'ceo-full', tier: 'gate' }, { id: 'ceo-periodic', tier: 'periodic' },
     ]);
     expect(result.needsFullValidation).toBe(false);
+  });
+
+  test('the vendored Capy skill (capy/skill/**) is free-only: no paid case reads it, so it needs no full validation', () => {
+    const result = select({ selectedE2E: [], selectedJudges: [], changedFiles: ['capy/skill/gstack/SKILL.md', 'capy/skill/gstack/scripts/install.sh'], derived: null });
+    expect(result.needsFullValidation).toBe(false);
+    expect(result.missingCoverage).toEqual([]);
+    expect(result.mode).toBe('pr');
+    expect(result.e2e).toEqual([]);
+    const prompt = select({ selectedE2E: [], selectedJudges: [], changedFiles: ['plan-ceo-review/SKILL.md.tmpl'], derived: null });
+    expect(prompt.needsFullValidation || prompt.deferredPromptFiles.length > 0 || prompt.e2e.length > 0).toBe(true);
   });
 
   test('does not add unrelated short probes or drop selected quality judges', () => {
@@ -159,6 +172,20 @@ describe('fast PR coverage policy', () => {
         reason: 'Full end-to-end marathon coverage; non-blocking lane, not executed by the PR gate' });
     }
     expect(() => select({ maps: marathon, profile: ['ceo-full'] })).toThrow('broad gate census');
+  });
+
+  test('every audited PR-profile case is addressable by its Bun test name', () => {
+    // The PR lane runs each audited file with -t built from CASE_TEST_NAMES[id] ?? id;
+    // office-hours-auto-mode's test is named differently and matched 0 tests (#3077 eval-slices run 37741434771).
+    const unaddressable = Object.entries(PR_PROFILE_FILES).flatMap(([file, ids]) => {
+      const source = fs.readFileSync(path.join(import.meta.dir, '..', file), 'utf8');
+      const computed = fileCaseRegistration(file, source).computed;
+      return ids.filter((id) => {
+        const name = CASE_TEST_NAMES[id] ?? id;
+        return !caseNameAddressable(name, source) && !(computed && source.includes(`'${name}'`));
+      }).map(id => `${file}: ${id}`);
+    });
+    expect(unaddressable).toEqual([]);
   });
 
   test('rejects stale profile IDs, incorrect tiers, missing cadence, and unknown selections', () => {

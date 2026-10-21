@@ -3,6 +3,13 @@ import { createHash } from 'node:crypto';
 
 export const ABI = 3;
 export const MAX_OUTPUT = 1024 * 1024;
+/**
+ * Longest bounded verification attempt, used by Rails: one attempt prepares two dependency trees, and an
+ * offline Rails preparation that compiles native gems takes about 3.5 minutes on amd64 and 8.5 on arm64.
+ * It equals the longest comprehensive run budget, and every attempt is still cut to the run's reporting
+ * deadline. Other stacks use 300 s.
+ */
+export const MAX_VERIFICATION_ATTEMPT_MS = 1_800_000;
 const UNSAFE_STRING_CONTROLS =
   /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
 const UNSAFE_PROPERTY_CONTROLS = /[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
@@ -24,7 +31,8 @@ export type ErrorCode =
   | 'CANCELLED'
   | 'PREREQUISITE'
   | 'INCOMPATIBLE_INPUT'
-  | 'ASSERTION_FAILED';
+  | 'ASSERTION_FAILED'
+  | 'PREPARED_EXPORT_REJECTED';
 export class CsoError extends Error {
   constructor(
     public code: ErrorCode,
@@ -114,6 +122,7 @@ export interface RunPolicy {
   budgetSeconds: number;
   maxWorkers: 3;
   maxRepairs: 3;
+  paths?: string[];
 }
 export interface RunReportV3 {
   schemaVersion: 3;
@@ -171,7 +180,7 @@ export interface HttpAssertion {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   headers?: Record<string, string>;
   body?: string;
-  expected: { status: number; includes?: string; excludes?: string };
+  expected: { status: number | number[]; includes?: string; excludes?: string };
   vulnerable?: { status: number; includes?: string; excludes?: string };
 }
 export interface Command {
@@ -639,16 +648,34 @@ export function validateVerificationObservation(value: unknown): VerificationObs
     inputHash: v.inputHash,
   };
 }
-function assertion(value: unknown, name: string): HttpAssertion {
+const MAX_SAFE_STATUSES = 8;
+function assertion(value: unknown, name: string, safeStatusSet = false): HttpAssertion {
   const v = object(value, name),
     expected = object(v.expected, `${name}.expected`);
   exact(v, ['name', 'path', 'method', 'headers', 'body', 'expected', 'vulnerable'], name);
-  const oracle = (x: Record<string, any>, n: string) => {
+  const httpStatus = (s: unknown) => Number.isInteger(s) && (s as number) >= 100 && (s as number) <= 599;
+  const oracle = (x: Record<string, any>, n: string, statusSet = false) => {
     exact(x, ['status', 'includes', 'excludes'], n);
-    if (!Number.isInteger(x.status) || x.status < 100 || x.status > 599)
-      throw new CsoError('INVALID_SCHEMA', `${n}.status must be an HTTP status`);
+    if (!Array.isArray(x.status)) {
+      if (!httpStatus(x.status)) throw new CsoError('INVALID_SCHEMA', `${n}.status must be an HTTP status`);
+    } else if (!statusSet) throw new CsoError('INVALID_SCHEMA', `${n}.status must be an HTTP status`);
+    else if (
+      !x.status.length ||
+      x.status.length > MAX_SAFE_STATUSES ||
+      !x.status.every(httpStatus) ||
+      new Set(x.status).size !== x.status.length
+    )
+      throw new CsoError(
+        'INVALID_SCHEMA',
+        `${n}.status must be 1..${MAX_SAFE_STATUSES} distinct HTTP statuses`,
+      );
+    else if (typeof x.excludes !== 'string' || !x.excludes)
+      throw new CsoError(
+        'INVALID_SCHEMA',
+        `${n} with a set of safe statuses must exclude the vulnerable marker`,
+      );
     return {
-      status: x.status,
+      status: Array.isArray(x.status) ? [...x.status] : x.status,
       ...(x.includes === undefined ? {} : { includes: string(x.includes, `${n}.includes`) }),
       ...(x.excludes === undefined ? {} : { excludes: string(x.excludes, `${n}.excludes`) }),
     };
@@ -674,7 +701,7 @@ function assertion(value: unknown, name: string): HttpAssertion {
     method: oneOf(v.method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], `${name}.method`),
     ...(Object.keys(headers).length ? { headers } : {}),
     ...(v.body === undefined ? {} : { body: string(v.body, `${name}.body`, 65536) }),
-    expected: oracle(expected, `${name}.expected`),
+    expected: oracle(expected, `${name}.expected`, safeStatusSet && v.vulnerable !== undefined),
     ...(v.vulnerable === undefined ? {} : { vulnerable: oracle(object(v.vulnerable), `${name}.vulnerable`) }),
   };
 }
@@ -683,13 +710,13 @@ export function securityAssertions(security: VerificationRequest['security']): H
   return Array.isArray(security) ? security : [security];
 }
 function securityAssertion(value: unknown): VerificationRequest['security'] {
-  if (!Array.isArray(value)) return assertion(value, 'security');
+  if (!Array.isArray(value)) return assertion(value, 'security', true);
   if (!value.length || value.length > MAX_SECURITY_ASSERTIONS)
     throw new CsoError(
       'INVALID_SCHEMA',
       `security must be one assertion or 1..${MAX_SECURITY_ASSERTIONS} assertions`,
     );
-  const assertions = value.map((x, i) => assertion(x, `security[${i}]`));
+  const assertions = value.map((x, i) => assertion(x, `security[${i}]`, true));
   if (new Set(assertions.map((x) => x.name)).size !== assertions.length)
     throw new CsoError('INVALID_SCHEMA', 'security assertion names must be distinct');
   return assertions;
@@ -796,7 +823,9 @@ export function validateVerificationRequest(input: unknown): VerificationRequest
       'Verification needs a legitimate control, distinct before/fixed security oracles, existing tests, immutable test files, and boundary files',
     );
   const mutuallyExclusive = ({ expected: secure, vulnerable }: HttpAssertion) =>
-    secure.status !== vulnerable!.status ||
+    (Array.isArray(secure.status)
+      ? !secure.status.includes(vulnerable!.status)
+      : secure.status !== vulnerable!.status) ||
     (secure.includes !== undefined &&
       vulnerable!.excludes !== undefined &&
       secure.includes.includes(vulnerable!.excludes)) ||

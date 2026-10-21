@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 // gstack-egress-receipt — bun script that BRIDGES shell callers (the bash
 // egress sinks: gstack-telemetry-sync, gstack-update-check, gstack-brain-sync,
 // and the sourced helpers in gstack-egress-lib.sh) into lib/egress-receipt.ts.

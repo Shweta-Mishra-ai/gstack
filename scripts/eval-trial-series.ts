@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Stamp `series_identity`, `series_fingerprint` and `harness_version` on a
  * report's trial-outcomes JSONL (the pass-rates history key). A separate step

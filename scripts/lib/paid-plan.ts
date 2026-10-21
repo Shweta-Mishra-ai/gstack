@@ -10,7 +10,8 @@ import { evalEntryOutcome, type EvalCaseKind } from '../../test/helpers/eval-sto
 import { E2E_KINDS } from '../../test/helpers/touchfiles-data';
 import { prProfileCaseAllowed, prProfileFileMap, type PrProfileSelection } from '../test-pr-profile';
 import { E2E_TOUCHFILES, E2E_TIERS, LLM_JUDGE_TOUCHFILES } from '../../test/helpers/touchfiles';
-import { CASE_KEY_SEPARATOR, CASE_SHARDED_FILES, type CaseTrialPlan, caseTrialPlan, codexShardAccess, expandCaseShards, expandTrialShards, isIsolatedCase, partitionCaseExclusions, sameTrialPlan, shardCaseId, shardFile, shardTrial } from './paid-cases';
+import { CASE_KEY_SEPARATOR, CASE_SHARDED_FILES, type CaseTrialPlan, caseTrialPlan, codexShardAccess, expandCaseShards, expandTrialShards, isIsolatedCase, partitionCaseExclusions, partitionHostExclusions, sameTrialPlan, shardCaseId, shardFile, shardTrial } from './paid-cases';
+import { EVAL_HOSTS, type EvalHost, resolveEvalHost } from '../../test/helpers/e2e-hosts';
 import { DEFAULT_JOBS, OVERLAY_MAX_ACTIVE_SHARDS, PAID_TIERS, SLICE_UPLOAD_RESERVE_MS, type PaidCaseSelection, type PaidProfile, type PaidShardBudget, type PaidTier, ROOT, type ShardOutcome, type ShardStatus, type ShardTrialRecord, isOverlayTestFile } from './paid-types';
 import { collectPaidTestFiles, computePaidCaseSelection, expectedPrCaseCount, isAllSkippedPass, paidShardWallUpperBoundMs, partitionShardsByDiffSelection, planPaidShards, prProfileFileSelected, resolvePaidShardBudget, resolvePaidShardTimeoutMs, sameBudget, selectPaidTestFiles, shardSlug, validatedProfile } from './paid-select';
 
@@ -58,19 +59,24 @@ export interface PaidRunManifest {
   evalsAll: boolean;
   sliceCount: number;
   selectionReason: string;
+  /** The agent host every session runs on (EVALS_HOST); absent means claude. */
+  host?: EvalHost;
   /** Legacy v1 manifests omit these; new plans bind case-level execution. */
   profile?: PaidProfile;
   selection?: PaidCaseSelection;
   prCoverage?: PrProfileSelection;
   plan?: PaidSlicePlan;
+  /** A rule-16 rerun manifest (scripts/lib/paid-rerun.ts): the run attempt whose reds it reruns once, and those cases. */
+  rerun?: { attempt: number; cases: string[] };
   entries: ManifestEntry[];
 }
 
 /**
- * Paid evals never retry (approved 2026-09-29): a failed verdict is final for
- * its run, and trials are fixed by kind before the run (EVAL_POLICY). The
- * function stays the single statement of that policy for the Bun arguments
- * and the reuse identity.
+ * Bun never retries a paid case inside a shard (approved 2026-09-29): trials
+ * are fixed by kind before the run (EVAL_POLICY). The one rule-16 rerun of a
+ * red case (CREW rule 16, scripts/lib/paid-rerun.ts) is a separate,
+ * reported execution, never a Bun retry. The function stays the single
+ * statement of that policy for the Bun arguments and the reuse identity.
  */
 export function retriesForFiles(_files: string[]): number {
   return 0;
@@ -314,9 +320,11 @@ export function buildRunManifest(opts: {
   const quarantine = opts.quarantine ?? CASE_QUARANTINE;
   const notLive = [...Object.keys(kinds).filter(id => kinds[id] === 'behavior'), ...Object.keys(quarantine)].filter(id => !Object.hasOwn(E2E_TIERS, id));
   if (notLive.length) throw new Error(`Only live E2E cases can be behavior or quarantined (judges sample their panel inside the case): ${notLive.join(', ')}`);
-  const caseKeys = partitionCaseExclusions(expandCaseShards(selected, opts.tier, rootDir));
+  const host = resolveEvalHost(env);
+  const ciKeys = partitionCaseExclusions(expandCaseShards(selected, opts.tier, rootDir));
+  const caseKeys = partitionHostExclusions(ciKeys.runnable, opts.tier, host, rootDir);
   const excluded = [...tierSelection.excluded, ...(opts.skipJudges ? tierSelection.selected.filter(judge)
-    .map(file => ({ file, reason: 'skipped: LLM judges run in the periodic census and PR gate lanes' })) : []), ...caseKeys.excluded];
+    .map(file => ({ file, reason: 'skipped: LLM judges run in the periodic census and PR gate lanes' })) : []), ...ciKeys.excluded, ...caseKeys.excluded];
   const expansion = expandTrialShards(caseKeys.runnable, opts.tier, rootDir, { kinds, quarantine });
   const excludeOf = (key: string) => expansion.excludeCases[normalizeRelativePath(key)] ?? [];
   const shards = planPaidShards(expansion.keys, { maxFilesPerShard: 1 });
@@ -346,7 +354,7 @@ export function buildRunManifest(opts: {
     entries.sort((a, b) => (a.file < b.file ? -1 : 1));
     return parseRunManifest(JSON.stringify({
       version: 1, tier: opts.tier, evalsAll: opts.evalsAll, sliceCount: plan.slices.length,
-      selectionReason: cases.reason, profile, selection: cases.selection,
+      selectionReason: cases.reason, ...(host !== 'claude' ? { host } : {}), profile, selection: cases.selection,
       ...(cases.coverage ? { prCoverage: cases.coverage } : {}),
       plan: { sliceBudgetMs: opts.sliceBudgetMs!, jobs: opts.jobs!, estimatedSliceMs: plan.estimatedSliceMs, ciTimeoutMinutes: plan.ciTimeoutMinutes,
         sliceCiTimeoutMinutes: plan.sliceCiTimeoutMinutes, codexSlices: codexSlicesOf(opts.tier, entries) },
@@ -466,6 +474,7 @@ export function buildRunManifest(opts: {
     evalsAll: opts.evalsAll,
     sliceCount,
     selectionReason: cases.reason,
+    ...(host !== 'claude' ? { host } : {}),
     profile,
     selection: cases.selection,
     ...(cases.coverage ? { prCoverage: cases.coverage } : {}),
@@ -479,6 +488,7 @@ export function parseRunManifest(raw: string): PaidRunManifest {
   if (parsed.version !== 1) throw new Error(`unsupported manifest version: ${(parsed as { version?: unknown }).version}`);
   if (!PAID_TIERS.includes(parsed.tier)) throw new Error(`manifest tier invalid: ${parsed.tier}`);
   if (parsed.profile !== undefined && parsed.profile !== 'pr' && parsed.profile !== 'full') throw new Error('manifest profile invalid');
+  if (parsed.host !== undefined && (parsed.host === 'claude' || !EVAL_HOSTS.includes(parsed.host))) throw new Error(`manifest host invalid: ${parsed.host}`);
   if (parsed.selection !== undefined) {
     for (const [key, inventory] of [['e2e', E2E_TOUCHFILES], ['judges', LLM_JUDGE_TOUCHFILES]] as const) {
       const ids = parsed.selection?.[key];
@@ -506,6 +516,10 @@ export function parseRunManifest(raw: string): PaidRunManifest {
     if (coverage.deferred.some(item => !Object.hasOwn(E2E_TOUCHFILES, item.id) || E2E_TIERS[item.id] !== item.tier || typeof item.reason !== 'string')) {
       throw new Error('manifest deferred case is outside the broad census');
     }
+  }
+  if (parsed.rerun !== undefined && (!Number.isSafeInteger(parsed.rerun?.attempt) || parsed.rerun.attempt < 1 || !Array.isArray(parsed.rerun.cases)
+    || parsed.rerun.cases.length === 0 || parsed.rerun.cases.some(id => typeof id !== 'string') || new Set(parsed.rerun.cases).size !== parsed.rerun.cases.length)) {
+    throw new Error('manifest rerun block invalid');
   }
   if (!Number.isInteger(parsed.sliceCount) || parsed.sliceCount <= 0) throw new Error('manifest sliceCount invalid');
   if (!Array.isArray(parsed.entries)) throw new Error('manifest entries missing');
@@ -658,6 +672,8 @@ export interface SliceResult {
   finishedAt?: number;
   /** A progress checkpoint the executor never replaced: the job ended (ceiling or cancellation) before its final result. */
   checkpoint?: true;
+  /** Produced from a rule-16 rerun manifest (`manifest.rerun`), never a first-attempt slice. */
+  rerun?: true;
   outcomes: Array<Pick<ShardOutcome, 'files' | 'status' | 'exitCode' | 'elapsedMs' | 'executedTests' | 'skippedTests' | 'budget' | 'reused' | 'runnerError' | 'trial' | 'inputKey' | 'sliceDeadline'>>;
 }
 
@@ -667,11 +683,18 @@ export interface SliceResult {
  * isolated trial shard fails it only when the harness produced no trial
  * record. Failed, timed-out or crashed trials are verdict input for the
  * report's panelVerdict(), so a 2/3 PASS panel never reds its runner.
+ * `caseVerdicts` (the gate lane's CI slices, rule 16): a rule shard that ran
+ * to completion and reported executed cases is verdict input too, so its red
+ * cases stay in the report (which still fails closed on them) and the run's
+ * conclusion follows the report, where a flaky case can resolve green.
  */
-export function sliceExitCode(outcomes: ReadonlyArray<Pick<ShardOutcome, 'status' | 'trial'>>): number {
+export function sliceExitCode(outcomes: ReadonlyArray<Pick<ShardOutcome, 'status' | 'trial'> & Partial<Pick<ShardOutcome, 'exitCode' | 'executedTests' | 'skippedTests' | 'runnerError' | 'sliceDeadline'>>>,
+  options: { caseVerdicts?: boolean } = {}): number {
+  const completedRed = (o: (typeof outcomes)[number]) => !!options.caseVerdicts && o.status === 'failed' && o.exitCode !== null && o.exitCode !== undefined
+    && typeof o.executedTests === 'number' && o.executedTests - (o.skippedTests ?? 0) > 0 && o.runnerError === undefined && !o.sliceDeadline;
   return outcomes.every(outcome => outcome.trial !== undefined
     ? outcome.trial.outcome !== null
-    : outcome.status === 'passed' || outcome.status === 'skipped-by-diff') ? 0 : 1;
+    : outcome.status === 'passed' || outcome.status === 'skipped-by-diff' || completedRed(outcome)) ? 0 : 1;
 }
 
 /** A hollow-guarded trial shard has no trial record: the guard's verdict is a harness problem. */
@@ -690,8 +713,16 @@ export function guardTrialRecords<T extends Pick<ShardOutcome, 'status' | 'trial
 export function verifySliceResults(
   manifest: PaidRunManifest,
   results: SliceResult[],
+  /**
+   * `flaky`: non-trial shards whose every failed case passed its one rule-16
+   * rerun (scripts/lib/paid-rerun.ts); their non-zero exit and failed status
+   * are not problems. `partial`: a later run attempt that re-ran only some
+   * slices, so a slice it did not re-run is no problem.
+   */
+  options: { flaky?: ReadonlySet<string>; partial?: boolean } = {},
 ): { ok: boolean; problems: string[] } {
   const problems: string[] = [];
+  const exitOk = (file: string, exitCode: number | null) => exitCode === 0 || !!options.flaky?.has(file);
   try { parseRunManifest(JSON.stringify(manifest)); }
   catch (error) { problems.push(`Invalid run manifest: ${error instanceof Error ? error.message : String(error)}`); }
   const byIndex = new Map<number, SliceResult>();
@@ -706,7 +737,7 @@ export function verifySliceResults(
     byIndex.set(result.sliceIndex, result);
   }
   for (let index = 1; index <= manifest.sliceCount; index += 1) {
-    if (!byIndex.has(index)) problems.push(`slice ${index}/${manifest.sliceCount} reported NO result — cancelled/crashed executor, not a pass`);
+    if (!byIndex.has(index) && !options.partial) problems.push(`slice ${index}/${manifest.sliceCount} reported NO result — cancelled/crashed executor, not a pass`);
   }
 
   const reported = new Map<string, { slice: number; status: ShardStatus; trial?: ShardTrialRecord; sliceDeadline?: ShardOutcome['sliceDeadline'] }>();
@@ -724,7 +755,7 @@ export function verifySliceResults(
           ? -1 : outcome.executedTests - outcome.skippedTests;
         // A trial's exit status is its verdict (panelVerdict decides); its
         // completeness is the trial record checked below.
-        if ((!trialPlan && outcome.exitCode !== 0) || expected < 1 || (!trialPlan && executed !== expected)) {
+        if ((!trialPlan && !exitOk(file, outcome.exitCode)) || expected < 1 || (!trialPlan && executed !== expected)) {
           problems.push(`PR profile expected ${expected} executed cases in ${file}, received ${executed}`);
         }
       }
@@ -760,7 +791,7 @@ export function verifySliceResults(
       if (finding) {
         // Full-census runs must account for every registered case. A manifest
         // explicitly marked selective may report its executed subset.
-        if (outcome.exitCode !== 0 || !Number.isInteger(outcome.executedTests) ||
+        if (!exitOk(file, outcome.exitCode) || !Number.isInteger(outcome.executedTests) ||
             outcome.executedTests! < 1 || outcome.executedTests! > finding.cases ||
             (manifest.evalsAll !== false && outcome.executedTests !== finding.cases) || outcome.skippedTests !== 0) {
           problems.push(`Finding workflow must execute real unskipped cases with exit zero: ${file}`);
@@ -787,7 +818,7 @@ export function verifySliceResults(
     // Isolated trial shards: harness health only; the panel verdict gates.
     if (entry.trial) {
       if (got.trial?.outcome === null) problems.push(`${entry.file}: no trial record (${got.trial.harness ?? 'unknown'})`);
-    } else if (got.status !== 'passed') {
+    } else if (got.status !== 'passed' && !(got.status === 'failed' && options.flaky?.has(normalizeRelativePath(entry.file)))) {
       // The slice deadline distinguishes work that never started (INFRA) from work killed in flight (TIMEOUT).
       const why = got.sliceDeadline === 'not_run' ? ' (not_run: the slice deadline passed before it started)'
         : got.sliceDeadline === 'hung' ? ' (hung: killed at the slice deadline)' : '';

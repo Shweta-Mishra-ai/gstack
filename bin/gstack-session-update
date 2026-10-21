@@ -5,6 +5,25 @@
 # The entire update runs in background (forked). The hook itself exits
 # immediately so session startup is never delayed.
 #
+# Before the live checkout moves, the updater fetches, reads the incoming
+# release's Bun floor (bin/gstack-bun-version.sh) and checks the `bun` setup
+# will run; below it the update is held with reason bun-too-old and nothing
+# changes (E1). Then it parse-checks every hook the incoming revision registers
+# (bin/gstack-hook-check on that revision, extracted through a private index
+# with symlinks as plain files, never tar: MSYS tar cannot create a link
+# before its target, #3184): Claude Code runs
+# hooks straight from this checkout, so an unparseable hook would block tool
+# calls the moment the checkout moved. The incoming revision's own checker
+# decides; the installed one decides only when that gives no verified report.
+# A failure holds the update with reason hook-does-not-parse and its
+# file:line; no verified report from either holds it as
+# hook-check-unavailable. Updaters older than a check cannot protect their
+# first pull.
+#
+# The fast-forward itself is bin/gstack-ff-update: edits that conflict with
+# the release are shelved in refs/gstack/rescue/<oid>, never left as conflict
+# markers, and the next session start names them (at most once a day).
+#
 # Stages (B11): pull, setup and migrations are tracked separately. The
 # "just upgraded" marker is written only when every stage succeeded. A failed
 # stage is persisted in $STATE_DIR/session-update-pending and retried even
@@ -25,15 +44,122 @@ STATE_DIR="$(gstack_state_root; printf x)"; STATE_DIR="${STATE_DIR%x}"
 # Egress receipt helpers (_receipted_git): fail-open — an update pull must
 # never block a session over a receipt hiccup.
 . "$(cd "$(dirname "$0")" && pwd)/gstack-egress-lib.sh"
+# Bun floor comparison (E1): the incoming release's floor is applied before
+# the live checkout moves. Missing helper fails open, like every error here.
+. "$(cd "$(dirname "$0")" && pwd)/gstack-bun-version.sh" 2>/dev/null
 THROTTLE_FILE="$STATE_DIR/.last-session-update"
 LOCK_DIR="$STATE_DIR/.setup-lock"
 LOG_FILE="$STATE_DIR/analytics/session-update.log"
 PENDING_FILE="$STATE_DIR/session-update-pending"
+HOOK_CHECK="$(cd "$(dirname "$0")" && pwd)/gstack-hook-check"
+FF_UPDATE="$(cd "$(dirname "$0")" && pwd)/gstack-ff-update"
+RESCUE_FILE="$STATE_DIR/session-update-rescues"
+# Path spelling (Git Bash /c/x vs native C:/x) for the held-reason prefix strip.
+. "$(cd "$(dirname "$0")" && pwd)/gstack-path-spelling.sh" 2>/dev/null || { gstack_path_shell() { printf '%s\n' "$1"; }; gstack_path_native() { printf '%s\n' "$1"; }; }
 THROTTLE_SECONDS=3600  # 1 hour
 
 log_entry() {
   mkdir -p "$(dirname "$LOG_FILE")"
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$LOG_FILE" 2>/dev/null || true  # best-effort: logging never blocks a session
+}
+# Twin: ff_flatten in bin/gstack-ff-update (test-pinned). One line, no
+# control characters or escape sequences, at most <max> bytes.
+ff_flatten() {
+  _ff_esc=$(printf '\033')
+  printf '%s' "$1" | tr '\n\r\t' '   ' | sed "s/${_ff_esc}\[[0-9;?]*[ -\/]*[@-~]//g" | tr -d '\000-\037\177' | head -c "${2:-200}"
+}
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# hook_report <checker> <tree> — sets _hr_out to the checker's report on
+# <tree> and returns 0 only when the report is verified and complete: exit 0
+# with no fail line or exit 1 with one, every line `ok|missing <hook>` or
+# `fail <hook> <where>: <why>`, and a line for each hook its own --list names. An empty list counts only from the
+# installed checker (a tree without hooks). A crash, empty output or an
+# unparseable report returns 1 with the reason in _hr_why. (No command
+# substitution around it: the variables must reach the caller.)
+hook_report() {
+  _hr_why="" _hr_rc=0
+  _hr_list=$(bash "$1" --list "$2" 2>/dev/null) || { _hr_why="--list exited $?"; return 1; }
+  if [ -z "$_hr_list" ] && [ "$1" != "$HOOK_CHECK" ]; then _hr_why="empty hook list"; return 1; fi
+  _hr_out=$(bash "$1" "$2" 2>"$_hc_dir.err") || _hr_rc=$?
+  case "$_hr_rc" in
+    0|1) ;;
+    *) _hr_why="exited $_hr_rc$(head -1 "$_hc_dir.err" 2>/dev/null | head -c 160 | sed 's/^/: /')"; rm -f "$_hc_dir.err"; return 1 ;;
+  esac
+  rm -f "$_hc_dir.err"
+  if ! printf '%s\n' "$_hr_out" | HR_LIST="$_hr_list" HR_RC="$_hr_rc" awk '
+    BEGIN { n = split(ENVIRON["HR_LIST"], h, "\n"); for (i = 1; i <= n; i++) if (h[i] != "") want[h[i]] = 1 }
+    $0 == "" { next }
+    /^fail [^ ]+ .+: / { if (!($2 in want)) bad = 1; failed[$2] = 1; any = 1; next }
+    /^(ok|missing) [^ ]+$/ { if (!($2 in want) || passed[$2]++) bad = 1; next }
+    { bad = 1 }
+    END {
+      for (k in want) if ((k in passed) == (k in failed)) bad = 1
+      if (bad || (ENVIRON["HR_RC"] == 1) != (any == 1)) exit 1
+    }'; then
+    _hr_why="unparseable or incomplete report"
+    return 1
+  fi
+}
+# hook_incoming_hold <rev> — parse-check the hooks of <rev> before the live
+# checkout moves. <rev> is extracted without tar and without symlinks: a
+# private index (the real one is never touched) and checkout-index with
+# core.symlinks=false, so a link becomes a plain file holding its target
+# path, which the hook check never reads (test/session-update-hook-hold.test.ts
+# keeps hooked paths and their imports free of symlinks). The incoming revision's own
+# bin/gstack-hook-check decides, so one checker bug in this install cannot hold
+# every later release; when it gives no verified report (crash, empty output,
+# unparseable), the installed checker decides. Prints the held reason and
+# returns 0 when a hook does not parse or neither checker gave a verified
+# report; otherwise prints nothing and returns 1. A pass from the incoming
+# checker that the installed one disputes is logged.
+hook_incoming_hold() {
+  _hc_dir=$(mktemp -d "${TMPDIR:-/tmp}/gstack-session-hooks-XXXXXX" 2>/dev/null) \
+    || { echo "hook-check-unavailable: cannot create a temp directory under ${TMPDIR:-/tmp}"; return 0; }
+  _hc_out="" _hc_why=""
+  if ! ( export GIT_INDEX_FILE="$_hc_dir.index"
+         git -C "$GSTACK_DIR" read-tree "$1" && git -C "$GSTACK_DIR" -c core.symlinks=false checkout-index -a --prefix="$_hc_dir/" ) 2>"$_hc_dir.err"; then
+    _hc_why="cannot extract the incoming revision: $(ff_flatten "$(head -c 200 "$_hc_dir.err" 2>/dev/null)" 200)"
+  elif [ -f "$_hc_dir/bin/gstack-hook-check" ] && hook_report "$_hc_dir/bin/gstack-hook-check" "$_hc_dir"; then
+    _hc_out=$_hr_out
+    if ! printf '%s\n' "$_hc_out" | grep -q '^fail '; then
+      if hook_report "$HOOK_CHECK" "$_hc_dir"; then
+        _hc_inst=$(printf '%s\n' "$_hr_out" | sed -n 's/^fail [^ ]* //p' | head -1)
+      else
+        _hc_inst="no verified report ($_hr_why)"
+      fi
+      [ -z "$_hc_inst" ] || log_entry "HOOK_CHECK_DISAGREE incoming=pass installed=$(hook_hold_path "$_hc_inst" | head -c 200) rev=$1"
+    fi
+  else
+    [ -f "$_hc_dir/bin/gstack-hook-check" ] && log_entry "HOOK_CHECK_FALLBACK incoming checker gave no verified report ($_hr_why); the installed checker decides rev=$1"
+    if hook_report "$HOOK_CHECK" "$_hc_dir"; then
+      _hc_out=$_hr_out
+    else
+      _hc_why="the installed bin/gstack-hook-check gave no verified report either ($_hr_why)"
+    fi
+  fi
+  _hc_fail=$(hook_hold_path "$(printf '%s\n' "$_hc_out" | sed -n 's/^fail [^ ]* //p' | head -1)")
+  rm -rf "$_hc_dir" "$_hc_dir.err" "$_hc_dir.index"
+  if [ -n "$_hc_why" ]; then
+    printf 'hook-check-unavailable: %s\n' "$_hc_why" | head -c 300
+    return 0
+  fi
+  [ -n "$_hc_fail" ] || return 1
+  printf 'hook-does-not-parse: %s\n' "$_hc_fail" | head -c 300
+}
+# hook_hold_path <text> — <text> without the archive directory's prefix, in
+# each spelling a checker reports it (/tmp/x, /c/…/x or C:/…/x).
+hook_hold_path() {
+  _hp=$1
+  for _hp_dir in "$_hc_dir" "$(gstack_path_shell "$_hc_dir")" "$(gstack_path_native "$_hc_dir")"; do
+    _hp=${_hp#"$_hp_dir"/}
+  done
+  printf '%s\n' "$_hp"
+}
+# rescue_note <ref> <unmerged> — remember a rescue for the session-start
+# banner (shown at most once a day until the ref is deleted).
+rescue_note() {
+  grep -q "^$1 " "$RESCUE_FILE" 2>/dev/null && return 0
+  printf '%s %s -\n' "$1" "$2" >> "$RESCUE_FILE" 2>/dev/null
 }
 pending_get() { sed -n "s/^$1=//p" "$PENDING_FILE" 2>/dev/null | head -1; }
 # pending_save — persist the P_* stage state; nothing pending removes the file.
@@ -55,16 +181,64 @@ if [ "$AUTO" != "true" ]; then
   exit 0
 fi
 
-# ── A stage that did not finish: one line per session start, with the fix ──
+# ── Session-start lines: a held update first, then a stage that did not
+# finish, then edits a recovery shelved (daily). Each names its fix; every
+# path in a printed command is shell-quoted. ──
+_Q=$(sq "$GSTACK_DIR")
+_WHERE="in a terminal; Git Bash on Windows"
+# A printed instruction (the egress tripwire skips printf lines): nothing runs it here.
+_FF_FIX=$(
+  printf "cd %s && git fetch origin && bash bin/gstack-ff-update . '@{upstream}' && ./setup" "$_Q")
+_P_PULL="" _P_STAGES=""
 if [ -f "$PENDING_FILE" ]; then
   _P_STAGES="$(pending_get stages)"; _P_REASON="$(pending_get reason)"; _P_PULL="$(pending_get pull)"
-  if [ -n "$_P_STAGES" ]; then
-    _P_FIX="cd $GSTACK_DIR && ./setup"
-    case "$_P_REASON" in bun*) _P_FIX="install Bun (https://bun.sh), then $_P_FIX" ;; esac
-    echo "gstack auto-update: ${_P_STAGES} did not finish (${_P_REASON:-unknown reason}); installed skills may be out of date. gstack retries automatically. Fix now: $_P_FIX"
-  elif [ -n "$_P_PULL" ]; then
-    echo "gstack auto-update: git pull did not finish ($_P_PULL); gstack is not updating. Fix now: cd $GSTACK_DIR && git pull --ff-only && ./setup"
-  fi
+fi
+# Unmerged files in the install: no stage fix, only the rescue-first recovery.
+_UNM=$(git -C "$GSTACK_DIR" ls-files -u 2>/dev/null | head -1 | cut -f2-)
+if [ -n "$_UNM" ]; then
+  _P_STAGES=""
+  case "$_P_PULL" in unmerged-files*) ;; *) _P_PULL="unmerged-files: the install has unmerged files (first: $_UNM)" ;; esac
+fi
+case "$_P_PULL" in
+  "") ;;
+  bun-too-old*)
+    echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed. Fix now ($_WHERE): bun upgrade && $_FF_FIX" ;;
+  bun-version-unreadable*)
+    echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed. Fix now: reinstall Bun (curl -fsSL https://bun.sh/install | bash), check that bun --version prints a version, then cd $GSTACK_DIR && git pull --ff-only && ./setup. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#bun-version-unreadable" ;;
+  hook-does-not-parse*)
+    echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed, and your current hooks keep running. This is a gstack bug; report ${_P_PULL#hook-does-not-parse: } at https://github.com/garrytan/gstack/issues. gstack retries at the next check. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-hook-does-not-parse" ;;
+  hook-check-unavailable*)
+    echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed, and your current hooks keep running. gstack retries at the next check. Fix now ($_WHERE): $_FF_FIX (setup checks every hook it registers). https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-hook-check-unavailable" ;;
+  unmerged-files*)
+    echo "gstack auto-update: update held ($_P_PULL); an earlier merge, rebase or stash pop left conflicts in the install, and an update would bury them. Fix now ($_WHERE): $_FF_FIX (saves every edit, the unmerged files included, in a rescue ref before it updates). https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-unmerged-files" ;;
+  autostash-unrecoverable*)
+    echo "gstack auto-update: update held ($_P_PULL); your local edits are where they were and nothing was installed. Look first: git -C $_Q status --short. Fix now ($_WHERE): $_FF_FIX (once the cause above is gone). https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-autostash-unrecoverable" ;;
+  *)
+    echo "gstack auto-update: git pull did not finish ($_P_PULL); gstack is not updating. Fix now ($_WHERE): $_FF_FIX" ;;
+esac
+if [ -n "$_P_STAGES" ]; then
+  _P_FIX="cd $_Q && ./setup"
+  case "$_P_REASON" in bun*) _P_FIX="install Bun (https://bun.sh), then $_P_FIX" ;; esac
+  echo "gstack auto-update: ${_P_STAGES} did not finish (${_P_REASON:-unknown reason}); installed skills may be out of date. gstack retries automatically. Fix now: $_P_FIX"
+fi
+if [ -s "$RESCUE_FILE" ]; then
+  _TODAY=$(date -u +%Y-%m-%d)
+  : > "$RESCUE_FILE.tmp.$$"
+  while read -r _R_REF _R_UNM _R_SHOWN; do
+    [ -n "$_R_REF" ] && git -C "$GSTACK_DIR" rev-parse -q --verify "$_R_REF^{commit}" >/dev/null 2>&1 || continue
+    if [ "$_R_SHOWN" != "$_TODAY" ]; then
+      _R_FILES=$(git -C "$GSTACK_DIR" diff --name-only "$_R_REF^" "$_R_REF" 2>/dev/null)
+      _R_N=$(printf '%s\n' "$_R_FILES" | grep -c .)
+      _R_LIST=$(printf '%s\n' "$_R_FILES" | head -3 | paste -sd, - | sed 's/,/, /g')
+      [ "$_R_N" -gt 3 ] && _R_LIST="$_R_LIST and $((_R_N - 3)) more"
+      _R_NOTE=""
+      [ "$_R_UNM" = 1 ] && _R_NOTE=" It includes files that were already unmerged: it needs manual resolution."
+      echo "gstack auto-update: your local edits in the install ($(ff_flatten "$_R_LIST" 300)) conflicted with an update, so they were saved in $_R_REF and the install runs the update.$_R_NOTE Inspect ($_WHERE): git -C $_Q show --stat '$_R_REF'. To keep them, export only your changes and apply them in a scratch checkout, not in the install: git -C $_Q diff '$_R_REF^' '$_R_REF' > ~/gstack-local-edits.patch, then git apply -3 ~/gstack-local-edits.patch. Delete when done: git -C $_Q update-ref -d '$_R_REF'. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-rescued-edits"
+      _R_SHOWN=$_TODAY
+    fi
+    printf '%s %s %s\n' "$_R_REF" "$_R_UNM" "$_R_SHOWN" >> "$RESCUE_FILE.tmp.$$"
+  done < "$RESCUE_FILE"
+  if [ -s "$RESCUE_FILE.tmp.$$" ]; then mv -f "$RESCUE_FILE.tmp.$$" "$RESCUE_FILE"; else rm -f "$RESCUE_FILE.tmp.$$" "$RESCUE_FILE"; fi
 fi
 
 # ── Throttle: skip if checked recently ──
@@ -148,30 +322,106 @@ fi
   # freshens the pidfile mtime every 5 minutes for as long as we still own
   # the lock (ownership re-checked each beat: if another updater reclaimed
   # and wrote its own pid, the loop exits instead of touching THEIR file).
-  ( while :; do sleep 300; [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] || exit 0; touch "$LOCK_DIR/pid" 2>/dev/null; done ) &
-  HB_PID=$!
-
   # Clean up lock on exit — ownership-checked: after a TTL reclaim by another
   # updater, $LOCK_DIR belongs to the NEW holder, and an unconditional rm -rf
   # here would delete the live holder's lock (cascading reclaims). Remove the
   # lock ONLY while $LOCK_DIR/pid still contains MYPID; always stop the
-  # heartbeat.
-  trap 'kill "$HB_PID" 2>/dev/null; [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
+  # heartbeat, including its sleeping child, and reap it before returning.
+  HB_PID=""
+  cleanup_session_update() {
+    # The job-table fallback covers a signal between fork and HB_PID=$!.
+    # This holder has no other background jobs at that point.
+    for heartbeat in ${HB_PID:-$(jobs -p)}; do
+      kill "$heartbeat" 2>/dev/null
+      wait "$heartbeat" 2>/dev/null
+    done
+    [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR" 2>/dev/null
+  }
+  trap cleanup_session_update EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  # ── Pull latest ──
+  (
+    cleanup_heartbeat() {
+      # Only this heartbeat's own background sleep belongs to this job table.
+      # Listing jobs also covers interruption before $! could be recorded.
+      for sleeper in $(jobs -p); do
+        kill "$sleeper" 2>/dev/null
+        wait "$sleeper" 2>/dev/null
+      done
+    }
+    trap cleanup_heartbeat EXIT
+    trap 'exit 0' HUP INT TERM
+    while :; do
+      sleep 300 &
+      wait "$!" || exit 0
+      [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] || exit 0
+      touch "$LOCK_DIR/pid" 2>/dev/null
+    done
+  ) &
+  HB_PID=$!
+
+  # ── Fetch, check the incoming release's Bun floor, then fast-forward (E1) ──
   OLD_HEAD=$(git -C "$GSTACK_DIR" rev-parse HEAD 2>/dev/null)
   UPDATE_URL=$(git -C "$GSTACK_DIR" remote get-url origin 2>/dev/null || echo "")
   UPDATE_HOST="${UPDATE_URL#*://}"; UPDATE_HOST="${UPDATE_HOST#*@}"; UPDATE_HOST="${UPDATE_HOST%%[/:]*}"
-  # --autostash: locally-patched TRACKED files are the NORM on installs, not
-  # the exception — skill-prefix mode rewrites frontmatter names and
+  # Locally-patched TRACKED files are the NORM on installs, not the
+  # exception — skill-prefix mode rewrites frontmatter names and
   # `gstack-config gbrain-refresh` renders brain blocks into SKILL.md. A bare
   # --ff-only refuses over those edits, so auto-upgrade wedged permanently
-  # (observed: 308 consecutive PULL_FAILED with the reason discarded, #2566).
+  # (observed: 308 consecutive PULL_FAILED with the reason discarded, #2566);
+  # bin/gstack-ff-update carries them over the release instead.
   # Capture stderr: the log must carry WHY a pull failed, never just the code.
   PULL_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gstack-session-pull-XXXXXX" 2>/dev/null || echo "")
   GSTACK_HOME="$STATE_DIR" _receipted_git open session-update "${UPDATE_HOST:-unknown}" gstack-self-update-pull "auto_upgrade=true" \
-    bash -c 'git -C "$1" pull --ff-only --autostash -q 2>"${2:-/dev/null}"' _ "$GSTACK_DIR" "$PULL_ERR_FILE"
+    bash -c 'git -C "$1" fetch -q 2>"${2:-/dev/null}"' _ "$GSTACK_DIR" "$PULL_ERR_FILE"
   PULL_EXIT=$?
+  # The fast-forward targets the exact revision whose requirement was read.
+  # Setup runs `bun` from this PATH, so that is the binary checked; a
+  # version it cannot read holds too (bun-version-unreadable, #3195).
+  INCOMING="" HELD=""
+  if [ "$PULL_EXIT" -eq 0 ]; then
+    INCOMING=$(git -C "$GSTACK_DIR" rev-parse --verify '@{upstream}^{commit}' 2>"${PULL_ERR_FILE:-/dev/null}") || PULL_EXIT=1
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ "$INCOMING" != "$OLD_HEAD" ]; then
+    HELD=$(gstack_bun_incoming_hold "$GSTACK_DIR" "$INCOMING" 2>/dev/null) || HELD=""
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ -z "$HELD" ] && [ "$INCOMING" != "$OLD_HEAD" ]; then
+    HELD=$(hook_incoming_hold "$INCOMING") || HELD=""
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ -z "$HELD" ] && [ -z "$PULL_ERR_FILE" ] && [ "$INCOMING" != "$OLD_HEAD" ]; then
+    # Recovering a conflicting autostash needs git's own messages; without a
+    # file to keep them in, hold rather than merge blind.
+    HELD="temp-file-unavailable: cannot create a temp file under ${TMPDIR:-/tmp}"
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ -z "$HELD" ]; then
+    # An index that cannot be read is never "no conflicts".
+    if ! _UNMERGED=$(git -C "$GSTACK_DIR" ls-files -u 2>/dev/null); then
+      echo "cannot read the index of $GSTACK_DIR; nothing was moved" > "${PULL_ERR_FILE:-/dev/null}"
+      PULL_EXIT=1
+    elif [ -n "$_UNMERGED" ]; then
+      # Someone's own merge, rebase or stash pop (or an older updater's
+      # conflicting autostash) left conflicts here. A background update never
+      # buries them; the banner gives the command that rescues them first.
+      HELD="unmerged-files: $(printf '%s\n' "$_UNMERGED" | cut -f2- | sort -u | wc -l | tr -d ' ') unmerged file(s) in the install (first: $(printf '%s\n' "$_UNMERGED" | head -1 | cut -f2-))"
+    else
+      # gstack-ff-update moves the tree to the revision the checks passed:
+      # conflicting edits are shelved in a rescue ref, never left as markers.
+      FF_OUT=$(bash "$FF_UPDATE" "$GSTACK_DIR" "$INCOMING" 2>/dev/null)
+      PULL_EXIT=$?
+      case "$PULL_EXIT:$FF_OUT" in
+        0:rescued\ *)
+          set -- $FF_OUT
+          log_entry "AUTOSTASH_CONFLICT_RECOVERED tree_reset=1 kept_stash=${4##*/} kept_ref=$4 $5"
+          rescue_note "$4" "${5#unmerged=}" ;;
+        0:*) ;;
+        3:*) HELD=$FF_OUT PULL_EXIT=0 ;;
+        75:*) log_entry "SKIP ff_busy $(ff_flatten "$FF_OUT" 200)"; rm -f "$PULL_ERR_FILE" 2>/dev/null; exit 0 ;;
+        *) printf '%s\n' "${FF_OUT:-bin/gstack-ff-update exited $PULL_EXIT}" > "${PULL_ERR_FILE:-/dev/null}" ;;
+      esac
+    fi
+  fi
   NEW_HEAD=$(git -C "$GSTACK_DIR" rev-parse HEAD 2>/dev/null)
 
   # Heartbeat: pull done — keep the TTL clock fresh for the setup step.
@@ -185,30 +435,34 @@ fi
   case "$P_FAILURES" in ''|*[!0-9]*) P_FAILURES=0 ;; esac
   case "$P_NEXT" in ''|*[!0-9]*) P_NEXT=0 ;; esac
 
+  if [ -n "$HELD" ]; then
+    HELD=$(ff_flatten "$HELD" 300)
+    log_entry "HELD $HELD incoming=$INCOMING"
+    P_PULL="$HELD"
+    pending_save
+    rm -f "$PULL_ERR_FILE" 2>/dev/null
+    exit 0
+  fi
   if [ "$PULL_EXIT" -ne 0 ]; then
-    PULL_REASON=$(head -c 300 "$PULL_ERR_FILE" 2>/dev/null | tr '\n' ' ' | tr -s ' ')
+    PULL_REASON=$(ff_flatten "$(head -c 300 "$PULL_ERR_FILE" 2>/dev/null)" 300 | tr -s ' ')
     log_entry "PULL_FAILED exit=$PULL_EXIT reason=${PULL_REASON:-unknown}"
     P_PULL="exit $PULL_EXIT: $(printf '%s' "${PULL_REASON:-no error output}" | head -c 160)"
-    pending_save
-    # Autostash pop conflict leaves the stash behind and the tree half-merged.
-    # The local patches are REGENERABLE (prefix renames, gbrain blocks), so
-    # recover to a clean upstream tree and re-render them below rather than
-    # leaving conflict markers in a live install.
-    if grep -qi "autostash" "$PULL_ERR_FILE" 2>/dev/null; then
-      git -C "$GSTACK_DIR" checkout -q -- . 2>/dev/null
-      git -C "$GSTACK_DIR" stash drop -q 2>/dev/null
-      log_entry "AUTOSTASH_CONFLICT_RECOVERED tree_reset=1"
-      _PREFIX_CFG=$("$GSTACK_DIR/bin/gstack-config" get skill_prefix 2>/dev/null || echo false)
-      "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true  # best-effort: regenerable prefix rewrite
-      "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true  # best-effort: regenerable gbrain blocks
+    if [ -n "$NEW_HEAD" ] && [ "$NEW_HEAD" != "$OLD_HEAD" ]; then
+      # The checkout moved but setup did not run. Owe it, or once the person
+      # resolves the conflict the next check sees nothing new and never sets
+      # up this revision. The unmerged-files check holds it until then.
+      [ -n "$P_FROM" ] || P_FROM=$(git -C "$GSTACK_DIR" show "$OLD_HEAD:VERSION" 2>/dev/null || echo "unknown")
+      P_STAGES="${P_STAGES:-setup}" P_NEXT=0 P_REASON="$P_PULL"
+      log_entry "PENDING stages=$P_STAGES after a moved checkout"
     fi
+    pending_save
     rm -f "$PULL_ERR_FILE" 2>/dev/null
     exit 0
   fi
   rm -f "$PULL_ERR_FILE" 2>/dev/null
   # Re-render local patches over the fresh tree (both tools are idempotent
-  # no-ops when the feature is unconfigured); the autostash pop usually
-  # preserves them, but a clean re-render costs nothing and self-heals.
+  # no-ops when the feature is unconfigured); gstack-ff-update usually
+  # carries them, but a clean re-render costs nothing and self-heals.
   _PREFIX_CFG=$("$GSTACK_DIR/bin/gstack-config" get skill_prefix 2>/dev/null || echo false)
   "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true  # best-effort: regenerable prefix rewrite
   "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true  # best-effort: regenerable gbrain blocks

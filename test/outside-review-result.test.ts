@@ -9,6 +9,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { classifyOutsideReview, validateOutsideReview, type OutsideGate } from '../lib/outside-review-result';
+import { gateOutcomeLine, type GateReason } from '../lib/gate-outcomes';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const LIB = path.join(ROOT, 'lib', 'outside-review-result.ts');
@@ -26,11 +27,14 @@ function cli(args: string[]) {
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
-const RECOMMEND = 'Recommendation: fix the guard because changed.ts loses data.';
+// A clean review states that it found nothing; an untagged finding is unverified (DX-11).
+const RECOMMEND = 'No issues found in changed.ts.\nRecommendation: approve because changed.ts keeps its data.';
+const UNTAGGED = 'Recommendation: fix the guard because changed.ts loses data.';
 
 describe('classifyOutsideReview: separate execution, findings and verdict', () => {
   const cases: Array<[string, { text: string; gate: OutsideGate; stderr?: string; exit?: number }, string, string | null, string | undefined]> = [
     ['clean review', { text: RECOMMEND, gate: 'review' }, 'clean', null, undefined],
+    ['review with an untagged finding', { text: UNTAGGED, gate: 'review' }, 'unverified', null, 'untagged_review'],
     ['review with P1', { text: `[P1] data loss\n${RECOMMEND}`, gate: 'review' }, 'findings', 'P1', undefined],
     ['review with only P2', { text: `[P2] naming\n${RECOMMEND}`, gate: 'review' }, 'clean', 'P2', undefined],
     ['review missing recommendation', { text: 'A few observations.', gate: 'review' }, 'unavailable', null, 'missing_markers'],
@@ -58,6 +62,67 @@ describe('classifyOutsideReview: separate execution, findings and verdict', () =
   test('a non-zero exit names the exit code and the first stderr line', () => {
     const result = classifyOutsideReview({ text: '', gate: 'review', exit: 1, stderr: '\nerror: 401 Unauthorized\nmore' });
     expect(result.detail).toBe('exit 1: error: 401 Unauthorized');
+  });
+});
+
+// #3294: "clean" comes only from a no-findings statement that concludes the reply,
+// never from a "no X" phrase among untagged findings anywhere in it.
+describe('a no-findings statement counts only as the reply\'s conclusion (#3294)', () => {
+  const REPORTER = 'I found no actionable regressions in the staged, unstaged, or untracked changes.';
+  const FINDING = 'The fallback path now swallows ENOENT and returns an empty config.';
+
+  test("the reporter's exact codex review reply reads clean through the reporter's CLI invocation", () => {
+    expect(classifyOutsideReview({ text: REPORTER, gate: 'structured' }).verdict).toBe('clean');
+    const r = cli(['--label', 'probe', '--exit', '0', '--stderr', file(''), 'structured', file(REPORTER)]);
+    expect([r.status, r.stdout]).toEqual([0, 'VERDICT: clean\nFINDINGS: none\n']);
+  });
+
+  test('clean conclusions, with the added regressions/defects vocabulary and the requested marker formatted', () => {
+    for (const text of ['No regressions found.', 'I did not find any defects.', 'There are no actionable regressions.',
+      'NO_FINDINGS', '**NO_FINDINGS**', '`NO_FINDINGS`', '- NO_FINDINGS',
+      `The change adds a retry cap and its tests.\n${REPORTER}`, 'Reviewed the retry helper.\n\nNo issues found in this change.',
+      'After reviewing the patch, I found no issues.', 'I found no issues in this read-only change.',
+      'Summary of the retry helper\nNo issues found.', 'I found no actionable regressions in the staged\nchanges.',
+      // Clean `codex review --uncommitted` replies captured from codex-cli 0.160.0 with gpt-6-sol.
+      'The change validates the retry limit before execution. No actionable regression was found.',
+      'The change validates `max` before retrying. No affected callers or tests are present in the repository, and no actionable regression is evident.']) {
+      expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'clean' });
+    }
+  });
+
+  test('mixed replies: untagged findings beside a "no X" phrase are unverified, never clean', () => {
+    for (const text of [
+      'The parser change has no new issues. However, db/002_drop_idx.sql drops users_email_idx, which will regress login latency under load.',
+      'Renaming the flag is no problem for callers, but the fallback path now swallows ENOENT and returns an empty config.',
+      `No issues in the parser.\n\n${FINDING}`,
+      `${FINDING}\n\nNo issues in the parser.`,
+      `${FINDING} No regressions in the existing tests.`,
+      'No regressions in the existing tests, but the fallback path now swallows ENOENT.',
+      `${FINDING}\nI found no issues other than the fallback path.`,
+      `${FINDING}\nNo other issues.`,
+      'No issues found, except that the fallback path now swallows ENOENT.',
+      'No issues in the parser, and the fallback path now swallows ENOENT.',
+      'Missing configuration now silently disables authentication. No regressions were found by the existing tests.',
+      'Missing configuration now silently disables authentication. No issues are apparent in the parser.',
+      'The fallback path now swallows ENOENT, and no issues elsewhere.',
+      'The diff adds a NO_FINDINGS check, but the regex misses lowercase input.',
+      `${FINDING}\n\`\`\`\nNo issues found.\n\`\`\``,
+    ]) {
+      for (const gate of ['structured', 'review'] as const) {
+        const r = classifyOutsideReview({ text: gate === 'review' ? `${text}\nRecommendation: ship because it looks fine.` : text, gate });
+        expect({ text, gate, verdict: r.verdict, reason: r.reason }).toEqual({ text, gate, verdict: 'unverified', reason: 'untagged_review' });
+      }
+    }
+  });
+
+  test("a review's Recommendation because-clause concludes under the same rules", () => {
+    const verdict = (text: string) => classifyOutsideReview({ text, gate: 'review' }).verdict;
+    expect(verdict('Recommendation: ship because I found no regressions in this change.')).toBe('clean');
+    expect(verdict(`The change adds a retry cap.\nRecommendation: ship because no issues remain.`)).toBe('clean');
+    expect(verdict('No issues in the parser.\nRecommendation: fix the fallback because it swallows ENOENT.')).toBe('unverified');
+    expect(verdict(`${FINDING}\nRecommendation: ship because no regressions in the existing tests.`)).toBe('unverified');
+    expect(verdict(`${FINDING}\nRecommendation: ship because no issues remain, but the fallback needs a follow-up.`)).toBe('unverified');
+    expect(verdict('Recommendation: address the migration because no regressions were found in the parser change,\nbut the migration drops users_email_idx.')).toBe('unverified');
   });
 });
 
@@ -194,5 +259,79 @@ describe('B1: a review whose sandbox could not start is unavailable, not clean',
     expect(r.status).toBe(1);
     expect(r.stdout).toContain('REASON: sandbox_unavailable');
     expect(r.stderr).toStartWith(`Codex outside review unavailable: Codex's sandbox could not start here (${BWRAP}`);
+  });
+});
+
+describe('a mid-run Codex usage limit is unavailable (quota_exhausted); a mid-run 429 is unavailable (rate_limited)', () => {
+  const LINE = "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 10th, 2026 2:55 AM.";
+  const RATE_429 = 'ERROR: {"type":"error","status":429,"error":{"type":"rate_limit_exceeded","message":"Rate limit reached"}}';
+  const QUOTA_429 = 'ERROR: {"type":"error","status":429,"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}';
+  const ECHOED = 'user\nCheck the usage limit banner and the insufficient_quota (429) retry path in this diff\n';
+
+  test('failed call with the usage-limit line -> unavailable, reason quota_exhausted, detail is the line', () => {
+    const result = classifyOutsideReview({ text: '', stderr: `Reading prompt from stdin...\n${LINE}\n`, exit: 1, gate: 'review' });
+    expect([result.verdict, result.reason]).toEqual(['unavailable', 'quota_exhausted']);
+    expect(result.detail).toBe(LINE);
+  });
+
+  test('failed call with a bare 429 -> unavailable, reason rate_limited, detail is the line', () => {
+    const result = classifyOutsideReview({ text: '', stderr: `${ECHOED}${RATE_429}\n`, exit: 1, gate: 'review' });
+    expect([result.verdict, result.reason, result.detail]).toEqual(['unavailable', 'rate_limited', RATE_429]);
+    expect(gateOutcomeLine('Codex outside review', 'rate_limited', result.detail)).toContain('https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#codex-rate-limited');
+  });
+
+  test('a 429 body that also names insufficient_quota is the quota (quota wins over rate limit)', () => {
+    const stderr = `stream error: exceeded retry limit, last status: 429 Too Many Requests; retrying 1/5\n${QUOTA_429}\n`;
+    expect(classifyOutsideReview({ text: '', stderr, exit: 1, gate: 'review' }).reason).toBe('quota_exhausted');
+  });
+
+  test('an echoed prompt that names usage limit, insufficient_quota and 429 stays execution_failed', () => {
+    const stderr = `${ECHOED}ERROR: unexpected status 500 Internal Server Error\n`;
+    expect(classifyOutsideReview({ text: '', stderr, exit: 1, gate: 'review' }).reason).toBe('execution_failed');
+    expect(classifyOutsideReview({ text: '', stderr: `ERROR: ${LINE.slice(7)}\nthen the session continued and failed\n`, exit: 1, gate: 'review' }).reason).toBe('execution_failed');
+  });
+
+  test('a timeout whose partial stderr has a usage-limit or rate-limit line keeps the timeout reason', () => {
+    for (const line of [LINE, RATE_429]) {
+      expect(classifyOutsideReview({ text: '', stderr: `${line}\n`, exit: 124, gate: 'review' }).reason).toBe('timeout');
+    }
+  });
+
+  test('a completed review that discusses rate limits is not unavailable', () => {
+    const text = '[P2] the client ignores the API rate limit header\nRecommendation: fix the retry loop because it ignores Retry-After';
+    const result = classifyOutsideReview({ text, stderr: `${ECHOED}${RATE_429}\n`, exit: 0, gate: 'review' });
+    expect(result.execution.state).toBe('ran');
+  });
+
+  test('the probe and the classifier give the same outcome for the same Codex error output', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-quota-parity-'));
+    try {
+      const stubDir = path.join(home, 'bin');
+      const codexHome = path.join(home, '.codex');
+      fs.mkdirSync(stubDir);
+      fs.mkdirSync(codexHome);
+      fs.writeFileSync(path.join(codexHome, 'auth.json'), '{}');
+      fs.writeFileSync(path.join(stubDir, 'codex'), '#!/usr/bin/env bash\nprintf \'%s\' "$STUB_STDERR" >&2\nexit 1\n', { mode: 0o755 });
+      const cases: Array<[string, GateReason]> = [
+        [`${LINE}\n`, 'quota_exhausted'],
+        ['ERROR: Quota exceeded. Check your plan and billing details.\n', 'quota_exhausted'],
+        [`${QUOTA_429}\n`, 'quota_exhausted'],
+        [`${RATE_429}\n`, 'rate_limited'],
+        ['stream error: exceeded retry limit, last status: 429 Too Many Requests\n', 'rate_limited'],
+        [`${ECHOED}ERROR: unexpected status 500 Internal Server Error\n`, 'execution_failed'],
+      ];
+      for (const [stderr, reason] of cases) {
+        fs.rmSync(path.join(home, '.gstack'), { recursive: true, force: true });
+        const probe = spawnSync('bash', ['-c', `source "${path.join(ROOT, 'bin', 'gstack-codex-probe')}" && _gstack_codex_model_probe`], {
+          encoding: 'utf8', timeout: 20_000,
+          env: { PATH: `${stubDir}:${process.env.PATH ?? ''}`, HOME: home, CODEX_HOME: codexHome, GSTACK_HOME: path.join(home, '.gstack'), STUB_STDERR: stderr, _TEL: 'off' },
+        });
+        const probeReason = probe.stdout.includes('MODEL_QUOTA_EXHAUSTED') ? 'quota_exhausted'
+          : probe.stdout.includes('MODEL_PROBE_RATE_LIMITED') ? 'rate_limited'
+          : probe.stdout.includes('MODEL_PROBE_INCONCLUSIVE') ? 'execution_failed' : `other: ${probe.stdout}`;
+        expect({ stderr, probe: probeReason }).toEqual({ stderr, probe: reason });
+        expect({ stderr, classifier: classifyOutsideReview({ text: '', stderr, exit: 1, gate: 'review' }).reason }).toEqual({ stderr, classifier: reason });
+      }
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 });

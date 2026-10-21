@@ -5,7 +5,8 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
-export type CsoStack = 'node' | 'bun' | 'python' | 'rails';
+/** 'java' (Maven or Gradle) is detected so it is reported as itself; no runtime prepares it. */
+export type CsoStack = 'node' | 'bun' | 'python' | 'rails' | 'java';
 export interface PreparationPrerequisite {
   code: string;
   message: string;
@@ -336,7 +337,7 @@ function inspectNode(root: string, plan: PreparationPlan) {
     '--userconfig',
     '/opt/cso/empty-config',
     '--globalconfig',
-    '/opt/cso/empty-config',
+    '/opt/cso/empty-globalconfig',
   ];
   const offline = [
     'ci',
@@ -348,7 +349,7 @@ function inspectNode(root: string, plan: PreparationPlan) {
     '--userconfig',
     '/opt/cso/empty-config',
     '--globalconfig',
-    '/opt/cso/empty-config',
+    '/opt/cso/empty-globalconfig',
   ];
   plan.acquisition.push(
     command('/usr/local/bin/npm', [...acquisition, '--registry', 'https://registry.npmjs.org'], '/metadata', {
@@ -369,7 +370,7 @@ function inspectNode(root: string, plan: PreparationPlan) {
         '--userconfig',
         '/opt/cso/empty-config',
         '--globalconfig',
-        '/opt/cso/empty-config',
+        '/opt/cso/empty-globalconfig',
       ],
       '/work',
     ),
@@ -538,7 +539,15 @@ function inspectPython(root: string, plan: PreparationPlan) {
     PIP_DISABLE_PIP_VERSION_CHECK: '1',
     PIP_NO_CACHE_DIR: '1',
   };
-  const offlineEnv = { ...acquisitionEnv, UV_CACHE_DIR: '/work/.cso-uv-cache', UV_LINK_MODE: 'copy' };
+  // py_compile reads SOURCE_DATE_EPOCH from os.environ even under `python -I` and then writes
+  // checked-hash .pyc files. venv/ensurepip and pip compile bytecode during offline preparation; with
+  // timestamp .pyc files every preparation differed, so a replay could never match its verification.
+  const offlineEnv = {
+    ...acquisitionEnv,
+    UV_CACHE_DIR: '/work/.cso-uv-cache',
+    UV_LINK_MODE: 'copy',
+    SOURCE_DATE_EPOCH: '315532800',
+  };
   let requirementsPath = 'requirements.txt';
   let publicRequirements = '/metadata/requirements.txt';
   const localBuildPaths: string[] = [];
@@ -988,17 +997,22 @@ function inspectRails(root: string, plan: PreparationPlan) {
       input.integrity = hash;
       input.integritySource = 'lock';
     }
-    // gem fetch downloads without evaluating a Gemfile/gemspec or building extensions.
+  }
+  // gem fetch downloads without evaluating a Gemfile/gemspec or building extensions.
+  // Each process loads the full RubyGems index (~11 s at the app role's CPU share),
+  // so all exact NAME:VERSION gems of one platform are fetched in one process.
+  const platforms = [...new Set(plan.inputs.map((input) => input.platform!))];
+  for (const platform of platforms) {
     plan.acquisition.push(
       command(
         '/usr/local/bin/gem',
         [
           'fetch',
-          input.name,
-          '--version',
-          input.version,
+          ...plan.inputs
+            .filter((input) => input.platform === platform)
+            .map((input) => `${input.name}:${input.version}`),
           '--platform',
-          input.platform!,
+          platform,
           '--clear-sources',
           '--source',
           'https://rubygems.org',
@@ -1022,8 +1036,12 @@ function inspectRails(root: string, plan: PreparationPlan) {
     BUNDLE_CACHE_PATH: '/archives',
     BUNDLE_USER_HOME: '/work/.cso-bundle',
   };
+  // One install thread. Ruby's File.umask getter sets the process umask to 0
+  // for an instant, and RubyGems calls it for every extracted file, so a second
+  // Bundler thread creating a directory in that window leaves it 0777 and the
+  // prepared-tree export correctly refuses it.
   plan.offline.push(
-    command('/usr/local/bin/bundle', ['install', '--local', '--jobs', '2', '--retry', '0'], '/work', env),
+    command('/usr/local/bin/bundle', ['install', '--local', '--jobs', '1', '--retry', '0'], '/work', env),
   );
   plan.registryHosts = ['rubygems.org', 'index.rubygems.org'];
   const declared = railsDatabaseConfiguration(read(root, 'config/database.yml', true));
@@ -1187,7 +1205,13 @@ export function inspectPreparation(snapshotPath: string, stack?: CsoStack): Prep
       detectedStacks.push('node');
     if (read(root, 'Gemfile.lock', true) !== undefined || read(root, 'Gemfile', true) !== undefined)
       detectedStacks.push('rails');
-    if (
+    // A root Maven or Gradle build names the repository's language; Python
+    // metadata beside it is helper tooling, not a second application stack.
+    const jvmBuild = ['pom.xml', 'build.gradle', 'build.gradle.kts'].find(
+      (file) => read(root, file, true) !== undefined,
+    );
+    if (jvmBuild) detectedStacks.push('java');
+    else if (
       read(root, 'uv.lock', true) !== undefined ||
       read(root, 'requirements.txt', true) !== undefined ||
       read(root, 'pyproject.toml', true) !== undefined
@@ -1201,12 +1225,17 @@ export function inspectPreparation(snapshotPath: string, stack?: CsoStack): Prep
     const detected = stack ?? detectedStacks[0] ?? 'python';
     plan.stack = detected;
     plan.runtimeProfile = detected;
+    if (detected === 'java')
+      fail(
+        'UNSUPPORTED_STACK',
+        `Java (${jvmBuild ?? 'Maven or Gradle'}) is not a supported runtime stack yet; supported runtime stacks are Node, Bun, Python, and Rails.`,
+        jvmBuild,
+      );
     if (!['node', 'bun', 'python', 'rails'].includes(detected))
       fail('UNSUPPORTED_STACK', 'Supported runtime stacks are Node, Bun, Python, and Rails.');
-    ({ node: inspectNode, bun: inspectBun, python: inspectPython, rails: inspectRails })[detected](
-      root,
-      plan,
-    );
+    ({ node: inspectNode, bun: inspectBun, python: inspectPython, rails: inspectRails })[
+      detected as Exclude<CsoStack, 'java'>
+    ](root, plan);
   } catch (error) {
     plan.status = 'prerequisites';
     plan.prerequisites.push(

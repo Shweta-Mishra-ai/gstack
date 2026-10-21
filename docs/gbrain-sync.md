@@ -90,11 +90,18 @@ On machine B:
 gstack-brain-sync --status
 ```
 
-Shows: last successful push, pending queue depth, any sync blocks, and the
-current privacy mode.
+Shows: the status (`ok`, `idle`, `held`, `collision`, `blocked`,
+`push_failed`, `error`), files held back by the secret scan with their
+fixes, files held because their path differs only by letter case from
+another path (`case_held`, `case_names`; see
+[troubleshooting](troubleshooting.md#artifact-case-collision)), the
+`drainable` count, the last sync and push times, pending queue depth, and
+the current privacy mode.
 
-Every skill run prints a `BRAIN_SYNC:` line near the top of the preamble
-output. Scan it for problems.
+Every skill run prints an `ARTIFACTS_SYNC:` line near the top of the
+preamble output. When the sync is stuck it adds an
+`ARTIFACTS_SYNC: attention:` line; the table of those lines and their fixes
+is in [gbrain-sync-errors.md](gbrain-sync-errors.md#artifacts_sync-attention--at-skill-start).
 
 ## Privacy modes in detail
 
@@ -110,6 +117,28 @@ gstack-config set artifacts_sync_mode full
 gstack-config set artifacts_sync_mode off
 ```
 
+## Removed and moved files
+
+By default the sync never publishes a removal: delete a synced design doc,
+or move a project directory (a project slug migration does), and the old
+path stays on the remote, where the brain keeps indexing it next to the new
+copy. To publish removals too:
+
+```bash
+gstack-config set artifacts_sync_removals on
+```
+
+Each sync then commits the removal of synced files that are gone from disk.
+Transcript pages are left alone, and a decision log and its active snapshot
+go only together. A sync that would remove more than 20 files at once
+publishes none of them: that looks like a loss, not a cleanup. Review and
+publish those yourself, whatever the setting:
+
+```bash
+gstack-brain-sync --publish-removals        # list them
+gstack-brain-sync --publish-removals --yes  # commit and push their removal
+```
+
 ## Secret protection
 
 Every commit is scanned for credential-shaped content before it leaves
@@ -122,20 +151,22 @@ your machine. Blocked patterns include:
 - JWTs (`eyJ…`)
 - Bearer tokens in JSON (`"authorization": "…"`, `"api_key": "…"`, etc.)
 
-If a scan hits, sync stops, the queue is preserved, and your preamble
-prints:
+If a scan hits, only the flagged file is held back (with any file coupled
+to it); everything else syncs. The held file stays queued and is re-scanned
+at every sync, and skill start prints:
 
 ```
-BRAIN_SYNC: blocked: <pattern-family>:<snippet>
+ARTIFACTS_SYNC: attention: status=held held=1. The secret scan is holding back 1 file(s); everything else still syncs. See which files and how to fix them: <bin> --status
 ```
 
 To remediate:
 
-1. Review the offending file.
-2. If the match is a false positive on content you explicitly want to
-   sync, run `gstack-brain-sync --skip-file <path>` to permanently
-   exclude that path.
-3. Otherwise, edit the file to remove the secret and re-run any skill.
+1. Run `gstack-brain-sync --status` (the line prints its absolute path). Each
+   entry under `held` names the file, the scanner rule and both fixes.
+2. If the match is a false positive on content you never want synced, run
+   `gstack-brain-sync --skip-file <path>` to permanently exclude that path;
+   `gstack-brain-sync --unskip-file <path>` undoes it.
+3. Otherwise, edit the file to remove the secret; the next skill run syncs it.
 
 There's a defense-in-depth hook at `~/.gstack/.git/hooks/pre-commit` that
 runs the same scan if you manually `git commit` against the repo.

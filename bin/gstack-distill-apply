@@ -57,7 +57,7 @@ if [ ! -f "$PROPOSAL_FILE" ]; then
 fi
 
 if [ "$ACTION" = "list" ]; then
-  PROPOSAL_FILE_PATH="$PROPOSAL_FILE" bun -e '
+  PROPOSAL_FILE_PATH="$PROPOSAL_FILE" bun --no-env-file --config=/dev/null -e '
     const fs = require("fs");
     const p = JSON.parse(fs.readFileSync(process.env.PROPOSAL_FILE_PATH, "utf-8"));
     const proposals = p.proposals || [];
@@ -100,7 +100,7 @@ MEMORY_FILE_PATH="$MEMORY_FILE" \
 PROFILE_FILE_PATH="$PROFILE_FILE" \
 PREF_BIN="$SCRIPT_DIR/gstack-question-preference" \
 GBRAIN_PUBLISHED="$GBRAIN_PUBLISHED" \
-bun -e '
+bun --no-env-file --config=/dev/null -e '
   const fs = require("fs");
   const { spawnSync } = require("child_process");
   const idx = parseInt(process.env.PROPOSAL_IDX, 10);

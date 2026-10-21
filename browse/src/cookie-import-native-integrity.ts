@@ -12,6 +12,7 @@ export const NATIVE_CODE_INPUTS = Object.freeze([
   'browse/src/cookie-import-native-integrity.ts',
   'browse/src/cookie-import-native-job.ts',
   'browse/src/cookie-import-native-worker.ts',
+  'browse/src/bun-child-config.ts',
   'browse/src/bun-polyfill.cjs',
   'browse/scripts/build-node-server.sh',
   '.github/scripts/run-cookie-native-qualification.ps1',

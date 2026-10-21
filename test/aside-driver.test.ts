@@ -17,7 +17,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { generateAsideSetup, generateAsideCookbook, generateAsideResearch, asideExecPrelude, ASIDE_LOCAL_HOST_RULE } from '../scripts/resolvers/aside';
+import { generateAsideSetup, generateAsideCookbook, generateAsideResearch, asideExecPrelude, asideResearchSend, ASIDE_LOCAL_HOST_RULE } from '../scripts/resolvers/aside';
 import { generateTestBootstrap } from '../scripts/resolvers/testing';
 import { generateBrowseFallback, generateBrowseSetup, generateUntrustedContentWarning } from '../scripts/resolvers/browse';
 import { RESOLVERS } from '../scripts/resolvers/index';
@@ -71,10 +71,31 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
     expect(section).toContain('listBrowserTabs()` output is private user data');
   });
 
+  test('signed-in tabs (#3063): offer only target-origin tabs, attach after one confirmation, no second sign-in loop', () => {
+    const rules = setup.slice(setup.indexOf('### Rules for driving a real browser'));
+    const rule = (n: number) => rules.match(new RegExp(`\\n${n}\\. \\*\\*[\\s\\S]*?(?=\\n\\d+\\. \\*\\*|\\n\\n)`))![0];
+    expect(rule(1)).toContain("Before the first `openTab`, offer that list's tabs on the target origin (title and origin only)");
+    expect(rule(1)).toContain('attach only after the user confirms one');
+    expect(rule(4)).toContain('a second wall means the session is tab- or URL-bound: offer their tab (rule 1), never another sign-in');
+    expect(rule(4)).not.toContain('the browser\'s cookies now apply');
+    // Rule 6 no longer suggests an early `return`; rule 7 names the fast-[ok abort.
+    expect(rule(6)).not.toContain('`return`');
+    expect(rule(7)).toContain('a fast `[ok` without it is an abort');
+  });
+
   test('consent boundary: look freely, act on non-local targets only after one AskUserQuestion', () => {
     expect(section).toContain('Invocation is consent to LOOK, not to ACT');
     expect(section).toContain(ASIDE_LOCAL_HOST_RULE);
     expect(section).toContain('AskUserQuestion ONCE per run');
+  });
+
+  test('consent boundary covers the writes a label hides: wizard steps and saves after a silent no-op set (#3216)', () => {
+    const rule3 = setup.match(/\n3\. \*\*Invocation is consent[^\n]*/)![0];
+    expect(rule3).toContain('before the first one. There, a wizard or dialog step');
+    expectMentions(rule3, [['wizard', 'step', 'mutating', 'until its handler', 'cancel proves nothing']], 'rule 3');
+    expectMentions(rule3, [['before any save', 'read back', '`setvalue`', 'stop on a mismatch', '`throw`']], 'rule 3');
+    expect(fallback).toContain('Rule 3 (mutating actions on a NON-LOCAL target need one AskUserQuestion per run) applies unchanged');
+    expectMentions(cookbook, [['skip path'], ['probe', 'precondition']], 'cookbook');
   });
 
   test('credential boundary: the user signs in, the agent never handles secrets', () => {
@@ -98,6 +119,20 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
     expect(section).toContain('ASIDE_DIR=');
     expect(section).toContain('never print image data');
     expect(section).toContain('use the Read tool on the copied file');
+  });
+
+  test('cookbook names the silent failure modes of aside repl scripts (#3064)', () => {
+    expect(cookbook).toContain('`evaluate` returns only JSON-serializable values');
+    expect(cookbook).toContain('End such calls with `; return true` or return `JSON.stringify(...)`');
+    expect(cookbook).toContain('No top-level `return`');
+    expect(cookbook).toContain('Write abort paths as `if`/`else`');
+    expect(cookbook).toContain('`pg.locator(sel).press("Enter")`');
+    expect(cookbook).toContain('An empty DOM read after an action says something about the selector, not the app');
+    expect(cookbook).toContain('read the state before clicking');
+    // The attach recipe keeps the tab list private and never closes the user's tab.
+    expect(cookbook).toContain('print only those tabs\' title and origin, never the rest');
+    expect(cookbook).toContain('never `closeTab` it');
+    expect(setup).not.toContain('Silent failures');
   });
 
   test('cookbook uses only the verified Aside APIs', () => {
@@ -263,10 +298,12 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
     expect(prelude).toContain('--no-payload aside exec "$@"');
     // Fail-open: without the lib the wrapper still runs the send.
     expect(prelude).toContain('else aside exec "$@"; fi');
-    const reading = cookbook.match(/\*\*Open-ended reading through Aside's own agent\*\*[\s\S]*?```bash\n([\s\S]*?)```/)![1];
+    const [, promptFile, reading] = cookbook.match(/\*\*Open-ended reading through Aside's own agent\*\*[\s\S]*?```bash\n([\s\S]*?)```[\s\S]*?```bash\n([\s\S]*?)```/)!;
+    // CEO-12: the question travels in an agent-written file, never in the command.
+    expect(promptFile).toContain('PROMPT_FILE=$(mktemp "${_GT:?}/aside-prompt.XXXXXX")');
     // Prelude and call share ONE bash block (blocks are separate shells).
     expect(reading.startsWith(prelude + '\n')).toBe(true);
-    expect(reading).toContain('\n_aside_exec "Open <url>. Read-only, do not submit or change anything.');
+    expect(reading).toContain('\n_aside_exec "Open <url>. Read-only, do not submit or change anything. $(cat "$PROMPT_FILE") Then stop."');
     expect(cookbook).not.toMatch(BARE_ASIDE_EXEC);
     expect(setup).not.toMatch(BARE_ASIDE_EXEC);
   });
@@ -404,21 +441,27 @@ describe('web research ({{ASIDE_RESEARCH}})', () => {
 
   test('the research send goes through _aside_exec with the cookbook\'s exact prelude (never bare aside exec)', () => {
     expect(research).not.toMatch(BARE_ASIDE_EXEC);
-    expect(research).toContain('_aside_exec "Search the web for <query>. Read-only: do not sign in, submit, or change anything.');
+    // CEO-12: the query travels in an agent-written file; the read-only rule stays in the shell.
+    expect(research).toContain('_aside_exec "Search the web for $(cat "$PROMPT_FILE") Read-only: do not sign in, submit, or change anything.');
     // The READY block is a nested list item, so the prelude renders indented by two spaces — same bytes otherwise.
     const prelude = asideExecPrelude(ctx);
-    expect(research).toContain('  ```bash\n  ' + prelude.replace(/\n/g, '\n  ') + '\n  _aside_exec "Search the web');
+    expect(research).toContain('  ```bash\n  ' + prelude.replace(/\n/g, '\n  ') + '\n  PROMPT_FILE="');
     const dedent = (s: string) => s.split('\n').map(l => l.replace(/^  /, '')).join('\n');
-    const researchBlock = research.match(/  ```bash\n([\s\S]*?)\n  _aside_exec "Search the web/)![1];
-    const cookbookBlock = cookbook.match(/\*\*Open-ended reading through Aside's own agent\*\*[\s\S]*?```bash\n([\s\S]*?)\n_aside_exec "Open <url>/)![1];
-    expect(dedent(researchBlock)).toBe(cookbookBlock);
-    expect(cookbookBlock).toBe(prelude);
+    const researchBlock = research.match(/  ```bash\n  (_EG=[\s\S]*?)\n  _aside_exec "Search the web/)![1];
+    const cookbookBlock = cookbook.match(/```bash\n(_EG=[\s\S]*?)\n_aside_exec "Open <url>/)![1];
+    // Same prelude and same prompt-file rebuild; only the by-hand command in the refusal differs.
+    const head = (b: string) => b.split('\n').slice(0, 2).join('\n');
+    expect(head(dedent(researchBlock))).toBe(head(cookbookBlock));
+    expect(cookbookBlock.split('\n')[0]).toBe(prelude);
   });
 
   test('the test-bootstrap research step (B2) routes through the same _aside_exec prelude', () => {
     const bootstrap = generateTestBootstrap(ctx);
-    expect(bootstrap).toContain(asideExecPrelude(ctx) + '\n_aside_exec "Search the web for the best');
-    expect(bootstrap).toContain('_aside_exec "Search the web for the best [runtime] test framework');
+    // CEO-12: the query travels in an agent-written file and goes out through the shared research send block.
+    expect(bootstrap).toContain('PROMPT_FILE=$(mktemp "${_GT:?}/aside-prompt.XXXXXX")');
+    expect(bootstrap).toContain('Prompt file text: `the best [runtime] test framework');
+    expect(bootstrap).toContain('```bash\n' + asideResearchSend(ctx) + '\n```');
+    expect(asideResearchSend(ctx).startsWith(asideExecPrelude(ctx) + '\n')).toBe(true);
     expect(bootstrap).not.toMatch(BARE_ASIDE_EXEC);
     // Same degradation ladder: WebSearch when the host has it, built-in table last.
   });

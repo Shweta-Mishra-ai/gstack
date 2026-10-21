@@ -345,6 +345,16 @@ describe('gstack-gbrain-source-wireup — wireup mode', () => {
     expect(r.status).toBe(0);
   });
 
+  test('--strict with no .git: exits 2 and names the current init command (#1675)', () => {
+    fs.mkdirSync(tmpHome, { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.gstack-brain-remote.txt'), 'git@github.com:user/gstack-brain-bob.git\n');
+    makeFakeGbrain({});
+    const r = run(['--strict']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('run /setup-gbrain Step 7 (gstack-artifacts-init) first');
+    expect(r.stderr).not.toContain('brain-init');
+  });
+
   test('source-id from --source-id flag overrides everything', () => {
     setupGstackRepo('git@github.com:user/gstack-brain-different.git');
     makeFakeGbrain({});

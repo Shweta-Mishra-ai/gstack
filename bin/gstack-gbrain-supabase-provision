@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bun run
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-gbrain-supabase-provision — Supabase Management API wrapper for
  * /setup-gbrain path 2a (auto-provision). Thin entry: all logic lives in

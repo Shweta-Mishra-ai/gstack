@@ -70,7 +70,7 @@ describe('setup-gbrain templates (skeleton + sections) — bin invocation paths'
 
   test('the probe step uses bun run + .ts (R1, transcript-gate section)', () => {
     expect(transcriptGate).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe'
+      'bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --probe'
     );
   });
 
@@ -80,7 +80,7 @@ describe('setup-gbrain templates (skeleton + sections) — bin invocation paths'
 
   test('the post-answer full-sync step uses bun run + .ts (R3, transcript-gate section)', () => {
     expect(transcriptGate).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync'
+      'bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --full --no-brain-sync'
     );
   });
 

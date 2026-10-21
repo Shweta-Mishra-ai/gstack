@@ -147,7 +147,7 @@ if [ -f "$LEARN_FILE" ]; then
   TOTAL=$(wc -l < "$LEARN_FILE" | tr -d ' ')
   echo "TOTAL: $TOTAL entries"
   # Count by type (after dedup)
-  cat "$LEARN_FILE" | bun -e "
+  cat "$LEARN_FILE" | bun --no-env-file --config=/dev/null -e "
     const lines = (await Bun.stdin.text()).trim().split('\n').filter(Boolean);
     const seen = new Map();
     for (const line of lines) {

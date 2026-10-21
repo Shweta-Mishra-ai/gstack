@@ -6,6 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { assertQaBrowserDeadline, assertQaBrowserPreparation, assertQaBrowserCheckpoints, qaDeadlineShellPolicy } from './helpers/qa-browser-deadline-evidence';
 import capturedPreparation from './fixtures/qa-only-charter-public.json';
 import capturedObservation from './fixtures/qa-only-observation-public.json';
+import capturedStop from './fixtures/qa-only-stop-cleanup-public.json';
+import capturedBookkeeping from './fixtures/qa-only-bookkeeping-joins-public.json';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const guard = path.join(ROOT, 'bin/gstack-qa-deadline');
@@ -89,6 +91,50 @@ test.each(['cleanup-after-last-probe', 'cleanup-direct-argv', 'probe-after-clean
     else expect(check).toThrow(scenario === 'probe-after-cleanup' ? 'browser cleanup preceded a probe' : 'follow-up lacks one acknowledged preceding checkpoint');
   });
 
+// PR #3272 Opus gate 39217387697 slice 8 (qa-only-no-fix, head 3986ac5): two guarded probes with one
+// checkpoint, then the browser stopped inside the guard. stop is cleanup like closetab; a disguised probe is not.
+test.each(['captured', 'unquoted-variable', 'direct-argv', 'closetab-then-stop', 'stop-before-probe', 'disguised-probe', 'other-verb'])
+  ('guarded "$B" stop after the last probe is cleanup: %s', scenario => {
+    const f = fixture();
+    const events = JSON.parse(JSON.stringify(capturedStop.events)
+      .replaceAll('__QA_FIXTURE__', f.directory).replaceAll('__QA_GUARD__', guard).replaceAll('__QA_BROWSE__', browse));
+    const write = events[2].message.content[0];
+    fs.writeFileSync(write.input.file_path, write.input.content);
+    const stop = events[6].message.content[0];
+    const prefix = `bun ${quote(guard)} run ${quote(path.join(f.directory, 'qa-reports/deadline.json'))} -- `;
+    expect(stop.input.command).toBe(prefix + `bash -c 'B="${browse}"; "$B" stop'`);
+    const child = ({
+      'unquoted-variable': `bash -c 'B="${browse}"; $B stop'`,
+      'direct-argv': quote(browse) + ' stop',
+      'disguised-probe': `bash -c 'B="${browse}"; "$B" goto http://127.0.0.1:1/; "$B" stop'`,
+      'other-verb': `bash -c 'B="${browse}"; "$B" stop --all'`,
+    } as Record<string, string>)[scenario];
+    if (child) stop.input.command = prefix + child;
+    if (scenario === 'closetab-then-stop') {
+      const closetab = structuredClone(events.slice(6, 8));
+      closetab[0].message.content[0].id = closetab[1].message.content[0].tool_use_id = 'toolu_closetab';
+      closetab[0].message.content[0].input.command = prefix + `bash -c 'B="${browse}"; "$B" closetab'`;
+      events.splice(6, 0, ...closetab);
+    }
+    if (scenario === 'stop-before-probe') events.splice(4, 0, ...events.splice(6, 2));
+    const check = () => assertQaBrowserCheckpoints(events, { directory: f.directory, guard, browse });
+    if (['captured', 'unquoted-variable', 'direct-argv', 'closetab-then-stop'].includes(scenario)) expect(check).not.toThrow();
+    else expect(check).toThrow(scenario === 'stop-before-probe' ? 'browser cleanup preceded a probe' : 'follow-up lacks one acknowledged preceding checkpoint');
+  });
+
+test.each([['direct', (b: string) => `${quote(b)} stop`], ['shell variable', (b: string) => `B=${quote(b)}; "$B" stop`]])
+  ('browser stop outside the guard is not cleanup: %s', (_, command) => {
+    const f = fixture();
+    f.run();
+    f.calls.push({ tool: 'Bash', input: { command: command(browse) }, output: '' });
+    expect(() => f.check()).toThrow('QA deadline: ');
+  });
+
+test('the deadline prompt names both accepted cleanup children', () => {
+  const { policy } = fixture();
+  expect(policy.prompt).toContain('exactly "$B" closetab or "$B" stop');
+});
+
 test('R70 retained public ordering has no completed report Write before its clock/baseline', () => {
   const f = fixture();
   const events = JSON.parse(JSON.stringify(capturedPreparation.events)
@@ -96,6 +142,15 @@ test('R70 retained public ordering has no completed report Write before its cloc
   expect(capturedPreparation.sourceEventIndices).toEqual([461, 465, 546, 550, 1041, 1045, 1965, 1969]);
   expect(events[5].message.content[0].content[0]).toMatchObject({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg' } });
   expect(() => assertQaBrowserPreparation(events, { directory: f.directory, guard })).toThrow('report Write must complete before guard start/baseline');
+});
+
+test('the deadline prompt orders the charter Write before the one 30-second start', () => {
+  const { policy } = fixture();
+  const report = path.join(path.dirname(policy.file), 'qa-only-report.md');
+  const start = policy.prompt.split('\n').find(line => line.startsWith('Start exactly once'))!;
+  expect(start).toContain(`your Write of the initial charter to ${report} has completed`);
+  expect(start.endsWith(`bun ${quote(guard)} start ${quote(policy.file)} 30`)).toBe(true);
+  expect(start.indexOf('Write of the initial charter')).toBeLessThan(start.indexOf(' start '));
 });
 
 test.each(['early', 'failed', 'unacknowledged', 'wrong-path', 'after-start', 'delayed-ack', 'subagent',
@@ -137,6 +192,30 @@ test('native literal argv, status, scripts, readiness and artifact bookkeeping a
   expect(f.check()).toEqual({ launchedRuns: 2, completedRuns: 2, refusedRuns: 0, timedOutRuns: 0 });
 });
 
+// PR gate run 38969924945 (qa-only-no-fix): after saving fallback screenshots into the owned
+// directory the prompt names, the agent listed it with this exact spelling.
+// GSTA-49: qa-only-no-fix opts into the shared read-only grammar, so pure reads inside the fixture root
+// (parent-escape stays inside it, other-subdirectory, extra-option) are accepted; leaving the root or
+// composing with a non-read tool is not.
+test.each(['captured-screenshots-listing', 'parent-escape', 'other-subdirectory', 'operator', 'extra-option', 'root-escape', 'absolute-outside'])
+  ('listing the owned screenshots directory is bookkeeping; nothing wider is: %s', scenario => {
+    const f = fixture();
+    f.run();
+    const screenshots = path.join(f.directory, 'qa-reports/screenshots');
+    const commands = {
+      'captured-screenshots-listing': `ls -la ${quote(screenshots)}`,
+      'parent-escape': `ls -la ${quote(screenshots + '/../..')}`,
+      'other-subdirectory': `ls -la ${quote(path.join(f.directory, 'qa/sections'))}`,
+      operator: `ls -la ${quote(screenshots)}; ${quote(browse)} --version`,
+      'extra-option': `ls -laR ${quote(screenshots)}`,
+      'root-escape': `ls -la ${quote(screenshots + '/../../..')}`,
+      'absolute-outside': 'ls -la /etc',
+    };
+    f.calls.push({ tool: 'Bash', input: { command: commands[scenario as keyof typeof commands] }, output: 'total 0' });
+    if (['captured-screenshots-listing', 'parent-escape', 'other-subdirectory', 'extra-option'].includes(scenario)) expect(f.check()).toEqual({ launchedRuns: 1, completedRuns: 1, refusedRuns: 0, timedOutRuns: 0 });
+    else expect(() => f.check()).toThrow(scenario === 'operator' ? 'QA deadline: unsupported outer shell composition' : 'QA deadline: untrusted runtime or unguarded command');
+  });
+
 test.each(['extra-option', 'suffix-option', 'operator', 'newline', 'foreign-cwd', 'missing-cwd'])
   ('metadata exception stays exact, fixture-bound and unbatched: %s', scenario => {
     const f = fixture();
@@ -145,7 +224,7 @@ test.each(['extra-option', 'suffix-option', 'operator', 'newline', 'foreign-cwd'
     const commands = {
       'extra-option': `git -C ${quote(f.directory)} -c color.ui=false rev-parse HEAD`,
       'suffix-option': metadata + ' --git-dir',
-      operator: metadata + '; ' + metadata,
+      operator: metadata + '; ' + quote(browse) + ' --version',
       newline: metadata + '\n' + metadata,
       'foreign-cwd': `git -C ${quote(path.dirname(f.directory))} rev-parse HEAD`,
       'missing-cwd': 'git rev-parse HEAD',
@@ -153,6 +232,76 @@ test.each(['extra-option', 'suffix-option', 'operator', 'newline', 'foreign-cwd'
     f.calls.push({ tool: 'Bash', input: { command: commands[scenario as keyof typeof commands] }, output: 'metadata' });
     expect(() => f.check()).toThrow('QA deadline:');
   });
+
+// Opus gates 39313931713, 39332134395 and 39336730429 (slice 8, attempt 1) failed qa-only-no-fix with
+// "unsupported outer shell composition" after joining reads with an exact bookkeeping call, as in
+// `ls -la; git -C <fixture> branch --show-current`. Every non-guard Bash command from those three
+// attempts and from the eight passing attempts beside them replays inside a real guarded attempt.
+const bookkeepingReplay = (f: ReturnType<typeof fixture>, command: string) => command
+  .replaceAll('__QA_FIXTURE__', f.directory).replaceAll('__QA_GUARD__', guard).replaceAll('__QA_BROWSE__', browse);
+test.each(capturedBookkeeping.attempts.map(attempt => [attempt.source, attempt.passed, attempt.commands] as const))
+  ('captured non-guard Bash commands replay as bookkeeping: %s (passed %p)', (_, __, commands) => {
+    const f = fixture();
+    const start = f.calls.shift()!;
+    for (const command of commands) f.calls.push({ tool: 'Bash', input: { command: bookkeepingReplay(f, command) }, output: 'bookkeeping' });
+    f.calls.push(start);
+    f.run();
+    expect(f.check()).toEqual({ launchedRuns: 1, completedRuns: 1, refusedRuns: 0, timedOutRuns: 0 });
+  });
+
+test('the captured joins are the three failing attempts\' only unaccepted commands', () => {
+  const failing = capturedBookkeeping.attempts.filter(attempt => !attempt.passed);
+  expect(failing.map(attempt => attempt.source.split(' ')[1])).toEqual(['39313931713', '39332134395', '39336730429']);
+  expect(failing.flatMap(attempt => attempt.commands.filter(command => /^ls -la; /.test(command)))).toEqual([
+    "ls -la; cat TODOS.md 2>/dev/null; git -C '__QA_FIXTURE__' rev-parse --short HEAD",
+    "ls -la; git -C '__QA_FIXTURE__' branch --show-current",
+    "ls -la; git -C '__QA_FIXTURE__' branch --show-current",
+  ]);
+});
+
+test.each(['captured', 'two-bookkeeping', 'and-or', 'readiness-check-joined', 'trailing-semicolon',
+  'browser-after', 'browser-before', 'guard-joined', 'guard-tail', 'git-option', 'git-other-subcommand', 'pipe-to-shell', 'background',
+  'substitution', 'newline', 'cd-then-read', 'read-outside-root', 'dangling-and', 'escaped-semicolon', 'quoted-operator', 'receipt-in-output', 'readiness-block-joined'])
+  ('bookkeeping joins accept exact calls and grammar reads only: %s', scenario => {
+    const f = fixture();
+    f.run();
+    const status = `git -C ${quote(f.directory)} status --short`;
+    const branch = `git -C ${quote(f.directory)} branch --show-current`;
+    const guarded = ['bun', guard, 'run', f.policy.file, '--', browse, '--version'].map(quote).join(' ');
+    const commands: Record<string, string> = {
+      captured: `ls -la; ${branch}`,
+      'two-bookkeeping': `${status}; ${branch}`,
+      'and-or': `ls -la qa-reports && ${status} || echo none`,
+      'readiness-check-joined': `${f.policy.allowed[3]}; ${branch}`,
+      'trailing-semicolon': `ls -la; ${branch};`,
+      'browser-after': `ls -la; ${branch}; ${quote(browse)} goto http://127.0.0.1:1/`,
+      'browser-before': `${quote(browse)} --version && ${status}`,
+      'guard-joined': `${status} && ${guarded}`,
+      'guard-tail': `${guarded}; ${status}`,
+      'git-option': `ls -la; git -C ${quote(f.directory)} -c core.pager=cat log -1`,
+      'git-other-subcommand': `ls -la; git -C ${quote(f.directory)} config --list`,
+      'pipe-to-shell': `${status} | sh`,
+      background: `${status} & ${quote(browse)} --version`,
+      substitution: `ls -la "$(${quote(browse)} --version)"; ${status}`,
+      newline: `ls -la\n${status}`,
+      'cd-then-read': `cd qa-reports; cat deadline.json; ${status}`,
+      'read-outside-root': `cat /etc/hostname; ${status}`,
+      'dangling-and': `ls -la; ${status} &&`,
+      'escaped-semicolon': `ls -la \\; ${quote(browse)} --version; ${status}`,
+      'quoted-operator': `echo 'a; b'; ${status}`,
+      'receipt-in-output': `ls -la; ${status}`,
+      'readiness-block-joined': `${f.policy.allowed[0]}; ${status}`,
+    };
+    f.calls.push({ tool: 'Bash', input: { command: commands[scenario] }, output: scenario === 'receipt-in-output' ? 'QA_DEADLINE {"guard":"qa-deadline"}' : 'bookkeeping' });
+    if (['captured', 'two-bookkeeping', 'and-or', 'readiness-check-joined', 'trailing-semicolon', 'quoted-operator'].includes(scenario)) expect(f.check()).toEqual({ launchedRuns: 1, completedRuns: 1, refusedRuns: 0, timedOutRuns: 0 });
+    else expect(() => f.check()).toThrow(scenario === 'receipt-in-output' ? 'receipt outside trusted guard invocation' : 'QA deadline:');
+  });
+
+test('the deadline prompt declares the bookkeeping join it accepts', () => {
+  const { policy } = fixture();
+  expect(policy.prompt).toContain('join several of them and the shared-grammar reads below with ;, && or || (no cd in such a join)');
+  expect(policy.prompt).toContain('as its own Bash call (no appended commands)');
+});
 
 test('quoted question marks stay literal but bare glob expansion is rejected', () => {
   const f = fixture();

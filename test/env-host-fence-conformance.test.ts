@@ -16,13 +16,15 @@ import * as os from 'os';
 import * as path from 'path';
 import { ALL_HOST_CONFIGS } from '../hosts';
 import { runGeneration } from '../scripts/gen-skill-docs';
-import { binaryAssignment, fencePrelude, insertRuntimePreludes, PRELUDE_BYTE_BUDGET, runtimeRootPrelude } from '../scripts/resolvers/runtime-root';
+import { generateMakePdfSetup } from '../scripts/resolvers/make-pdf';
+import { binaryAssignment, fencePrelude, insertRuntimePreludes, MAKE_PDF_OVERRIDE, PRELUDE_BYTE_BUDGET, runtimeRootPrelude } from '../scripts/resolvers/runtime-root';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
-import { lintFence, normalizePlaceholders } from './helpers/generated-bash-lint';
+import { IDENTIFIER_PLACEHOLDERS, lintFence, normalizePlaceholders } from './helpers/generated-bash-lint';
 
+const ROOT = path.resolve(import.meta.dir, '..');
 const ENV_HOSTS = ALL_HOST_CONFIGS.filter(h => h.usesEnvVars);
 const FORBIDDEN = /^(?:\/bin\/|\/browse|\/design|\/gstack-)/;
-const PRELUDE_LINE = /^\[ -d "\$\{GSTACK_ROOT:-\/-\}\/bin" \]|^(?:GSTACK_(?:BIN|BROWSE|DESIGN|MAKE_PDF)=\$GSTACK_ROOT\/\S+ ?)+$|^[BD]=\$GSTACK_ROOT\//;
+const PRELUDE_LINE = /^\[ -d "\$\{GSTACK_ROOT:-\/-\}\/bin" \]|^(?:GSTACK_(?:BIN|BROWSE|DESIGN|MAKE_PDF)=\$GSTACK_ROOT\/\S+ ?)+$|^[BDP]=\$GSTACK_ROOT\//;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-env-fences-'));
 const renderDir = path.join(tmp, 'render');
 
@@ -70,8 +72,10 @@ function fenceProblems(fence: Fence): string[] {
   if (/\$\{?GSTACK_(?:ROOT|BIN|BROWSE|DESIGN|MAKE_PDF)\b/.test(fence.body) && !assigned('GSTACK_ROOT')) problems.push(`${where} uses GSTACK_* without resolving GSTACK_ROOT`);
   if (/\$\{?B\b/.test(fence.body) && !assigned('B')) problems.push(`${where} uses $B without deriving it`);
   if (/\$\{?D\b/.test(fence.body) && !assigned('D')) problems.push(`${where} uses $D without deriving it`);
+  if (/\$\{?P\b/.test(fence.body) && !/(?:^|[\s;&|(])P=/m.test(fence.body)) problems.push(`${where} uses $P without deriving it`);
   if (fence.body.includes('gstack: no install found')) {
-    const bytes = Buffer.byteLength(fence.body.split('\n').filter(l => PRELUDE_LINE.test(l)).join('\n') + '\n');
+    // MAKE_PDF_OVERRIDE is the one fixed segment outside the budget (E2).
+    const bytes = Buffer.byteLength(fence.body.split('\n').filter(l => PRELUDE_LINE.test(l)).join('\n').replace(MAKE_PDF_OVERRIDE, '') + '\n');
     if (bytes > PRELUDE_BYTE_BUDGET) problems.push(`${where} prelude is ${bytes} bytes (budget ${PRELUDE_BYTE_BUDGET})`);
     if (fence.body.split('gstack: no install found').length !== 2) problems.push(`${where} carries the prelude more than once`);
   }
@@ -84,7 +88,7 @@ function sh(script: string, cwd: string, env: Record<string, string>) {
   return spawnSync('bash', ['-uc', script], { cwd, encoding: 'utf8', timeout: 10_000, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env } });
 }
 function mkroot(dir: string) {
-  for (const sub of ['bin', 'lib', 'browse/dist', 'design/dist']) fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  for (const sub of ['bin', 'lib', 'browse/dist', 'design/dist', 'make-pdf/dist']) fs.mkdirSync(path.join(dir, sub), { recursive: true });
   return dir;
 }
 
@@ -95,13 +99,13 @@ beforeAll(async () => {
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 describe('C1: every env-var host fence resolves its own runtime paths', () => {
-  test('each fence that uses $GSTACK_*, $B or $D assigns them in the same fence, within the byte budget', () => {
+  test('each fence that uses $GSTACK_*, $B, $D or $P assigns them in the same fence, within the byte budget', () => {
     const problems: string[] = [];
     let checked = 0;
     for (const host of ENV_HOSTS) {
       for (const file of renderedDocs(renderDir, host.hostSubdir)) {
         for (const fence of bashFences(fs.readFileSync(file, 'utf8'), path.relative(renderDir, file))) {
-          if (!/\$\{?(?:GSTACK_(?:ROOT|BIN|BROWSE|DESIGN|MAKE_PDF)|B|D)\b/.test(fence.body)) continue;
+          if (!/\$\{?(?:GSTACK_(?:ROOT|BIN|BROWSE|DESIGN|MAKE_PDF)|B|D|P)\b/.test(fence.body)) continue;
           checked++;
           problems.push(...fenceProblems(fence));
         }
@@ -234,6 +238,7 @@ describe('INV-3: every rendered fence parses, runs its prelude and passes the li
     for (const host of ENV_HOSTS) {
       const root = mkroot(path.join(home, host.name === 'codex' ? '.codex/skills/gstack' : host.globalRoot));
       for (const tool of ['browse', 'design']) fs.writeFileSync(path.join(root, tool, 'dist', tool), `#!/bin/sh\necho "STUB_${tool}"\n`, { mode: 0o755 });
+      fs.writeFileSync(path.join(root, 'make-pdf', 'dist', 'pdf'), '#!/bin/sh\necho "STUB_pdf"\n', { mode: 0o755 });
       const preludes = new Set<string>();
       for (const file of renderedDocs(renderDir, host.hostSubdir)) {
         for (const fence of bashFences(fs.readFileSync(file, 'utf8'))) {
@@ -244,8 +249,8 @@ describe('INV-3: every rendered fence parses, runs its prelude and passes the li
       expect(preludes.size).toBeGreaterThan(0);
       for (const prelude of preludes) {
         ran++;
-        const vars = [...new Set([...prelude.matchAll(/(?:^|\s)(GSTACK_[A-Z_]+|[BD])=/gm)].map(m => m[1]))];
-        const consumers = vars.filter(v => v === 'B' || v === 'D').map(v => `"$${v}"`).join('\n');
+        const vars = [...new Set([...prelude.matchAll(/(?:^|\s)(GSTACK_[A-Z_]+|[BDP])=/gm)].map(m => m[1]))];
+        const consumers = vars.filter(v => v === 'B' || v === 'D' || v === 'P').map(v => `"$${v}"`).join('\n');
         const script = `${prelude}\n${vars.map(v => `printf '%s=%s\\n' ${v} "$${v}"`).join('\n')}\n${consumers}`;
         const r = spawnSync('env', ['-i', `HOME=${home}`, 'PATH=/usr/bin:/bin', 'bash', '-uc', script], { cwd: w, encoding: 'utf8', timeout: 10_000 });
         if (r.status !== 0) { problems.push(`${host.name}: exit ${r.status}: ${r.stderr.trim()}\n${prelude}`); continue; }
@@ -253,8 +258,8 @@ describe('INV-3: every rendered fence parses, runs its prelude and passes the li
           const value = line.slice(line.indexOf('=') + 1);
           if (!value || FORBIDDEN.test(value)) problems.push(`${host.name}: ${line}`);
         }
-        for (const v of vars.filter(x => x === 'B' || x === 'D')) {
-          if (!r.stdout.includes(`STUB_${v === 'B' ? 'browse' : 'design'}`)) problems.push(`${host.name}: $${v} did not run the stub binary`);
+        for (const v of vars.filter(x => x === 'B' || x === 'D' || x === 'P')) {
+          if (!r.stdout.includes(`STUB_${{ B: 'browse', D: 'design', P: 'pdf' }[v]}`)) problems.push(`${host.name}: $${v} did not run the stub binary`);
         }
       }
     }
@@ -265,6 +270,31 @@ describe('INV-3: every rendered fence parses, runs its prelude and passes the li
   test('the generated-bash lint passes on every host, Claude included', () => {
     const findings = allFences().flatMap(f => lintFence(f.body).map(x => `${f.file}:${f.line + x.line} ${x.rule}: ${x.detail}`));
     expect(findings).toEqual([]);
+  });
+});
+
+describe('#3046: runtime reference docs that skills execute pass the lint', () => {
+  test('every non-generated markdown file in a skill directory (review/greptile-triage.md and friends)', () => {
+    const skillDirs = fs.readdirSync(ROOT, { withFileTypes: true })
+      .filter(e => e.isDirectory() && fs.existsSync(path.join(ROOT, e.name, 'SKILL.md.tmpl')))
+      .map(e => path.join(ROOT, e.name));
+    const docs = skillDirs.flatMap(dir => fs.readdirSync(dir)
+      .filter(f => f.endsWith('.md') && f !== 'SKILL.md')
+      .map(f => path.join(dir, f)));
+    expect(docs.map(d => path.relative(ROOT, d))).toContain('review/greptile-triage.md');
+    const findings = docs.flatMap(file => bashFences(fs.readFileSync(file, 'utf8'), path.relative(ROOT, file))
+      .flatMap(f => lintFence(f.body).map(x => `${f.file}:${f.line + x.line} ${x.rule}: ${x.detail}`)));
+    expect(findings).toEqual([]);
+  });
+});
+
+describe('CEO-12: the identifier allowlist matches what the skills use', () => {
+  test('every allowlisted placeholder appears in some rendered fence or runtime doc fence', () => {
+    const docs = fs.readdirSync(ROOT, { withFileTypes: true })
+      .filter(e => e.isDirectory() && fs.existsSync(path.join(ROOT, e.name, 'SKILL.md.tmpl')))
+      .flatMap(e => fs.readdirSync(path.join(ROOT, e.name)).filter(f => f.endsWith('.md') && f !== 'SKILL.md').map(f => path.join(ROOT, e.name, f)));
+    const text = allFences().map(f => f.body).concat(docs.flatMap(d => bashFences(fs.readFileSync(d, 'utf8')).map(f => f.body))).join('\n');
+    expect(Object.keys(IDENTIFIER_PLACEHOLDERS).filter(p => !text.includes(p))).toEqual([]);
   });
 });
 
@@ -286,6 +316,26 @@ describe('INV-3: negative controls (planted bad fences fail each check)', () => 
     expect(rules('ls | while IFS= read -r d; do rm -rf "$d"; done')).toEqual([]);
     expect(rules('cat <<EOF\ncd "$NOT_CODE"\nEOF\necho ok')).toEqual([]);
     expect(rules("echo 'cd \"$QUOTED\"'")).toEqual([]);
+    // CEO-12: free text may not appear in any command, in any quoting shape.
+    expect(rules('gh api repos/o/r/issues/1/comments -f body="<reply text>"')).toEqual(['free-text-placeholder']);
+    expect(rules('gh issue create --title "Failure: <test-name>" --body-file "$F"')).toEqual(['free-text-placeholder']);
+    expect(rules('glab issue create -t "$T" -d "Error: <first 10 lines>"')).toEqual(['free-text-placeholder']);
+    expect(rules("tool --write '{\"free_text\":\"<user words>\"}'")).toEqual(['free-text-placeholder']);
+    expect(rules('echo <user words> | tee out')).toEqual(['free-text-placeholder']);
+    expect(rules('$D generate --brief "$(printf %s "<brief text>")"')).toEqual(['free-text-placeholder']);
+    expect(rules('cat > "$F" <<EOF\nFixed in <reply text>\nEOF')).toEqual(['free-text-placeholder']);
+    expect(rules("B=$(cat <<'GSTACK_REPLY'\n**Fixed** in `<sha>`.\nGSTACK_REPLY\n)\ngh api x -f body=\"$B\"")).toEqual(['free-text-placeholder']);
+    // A continuation line is part of the same command.
+    expect(rules('gh issue create \\\n  --title "$T" \\\n  --body "<body text>"')).toEqual(['free-text-placeholder']);
+    // Commit trailers with a mail address are literal text, not placeholders.
+    expect(rules("git commit -m \"$(cat <<'EOF'\nfix: tidy\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\"")).toEqual([]);
+    // Allowlisted identifiers pass; quoted-only identifiers must sit inside quotes.
+    expect(rules('git diff origin/<base>...HEAD --name-only; kill <PID>')).toEqual([]);
+    expect(rules('aside repl \'openTab("<url>")\'; $B goto "<url>"')).toEqual([]);
+    expect(rules('$B goto <url>')).toEqual(['free-text-placeholder']);
+    expect(lintFence('$B goto <url>')[0].detail).toContain('<url> (unquoted)');
+    // Files the agent wrote are passed, never expanded.
+    expect(rules('F="$(git rev-parse --show-toplevel)/.gstack/tmp/<reply-file-name>"\ngh api x -F "body=@$F"')).toEqual([]);
   });
 
   test('placeholder normalization keeps real syntax errors', () => {
@@ -300,5 +350,51 @@ describe('INV-3: negative controls (planted bad fences fail each check)', () => 
     expect(fenceProblems({ file: 'x', line: 1, body: '$B goto https://example.com' })).toEqual(['x:1 uses $B without deriving it']);
     const twice = `${runtimeRootPrelude(ctx('codex'))}\n${runtimeRootPrelude(ctx('codex'))}\n"$GSTACK_BIN/x"`;
     expect(fenceProblems({ file: 'x', line: 1, body: twice })).toContain('x:1 carries the prelude more than once');
+  });
+});
+
+// E2: make-pdf's $P comes from one resolver (binaryAssignment 'make-pdf') for
+// the readiness check and every later block, honoring MAKE_PDF_BIN.
+describe('E2: make-pdf $P on env-var hosts', () => {
+  const pdfStub = (file: string, label: string) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `#!/bin/sh\necho "${label} $*"\n`, { mode: 0o755 });
+  };
+
+  test('readiness and a later block resolve the same binary, MAKE_PDF_BIN wins, paths with spaces work', () => {
+    const w = fs.mkdtempSync(path.join(tmp, 'pdf with spaces-'));
+    const home = path.join(w, 'home dir');
+    const root = mkroot(path.join(w, 'gstack root'));
+    pdfStub(path.join(root, 'make-pdf', 'dist', 'pdf'), 'ROOT_PDF');
+    const dev = path.join(w, 'dev build', 'pdf');
+    pdfStub(dev, 'DEV_PDF');
+    const c = { ...ctx('codex'), skillName: 'make-pdf' };
+    const readiness = bashFences(insertRuntimePreludes(generateMakePdfSetup(c), c))[0].body;
+    const later = fencePrelude(c, '"$P" generate letter.md') + '\n"$P" generate letter.md';
+    const env = (extra: Record<string, string> = {}) =>
+      ['-i', `HOME=${home}`, 'PATH=/usr/bin:/bin', `GSTACK_ROOT=${root}`, ...Object.entries(extra).map(([k, v]) => `${k}=${v}`)];
+    const run = (script: string, extra?: Record<string, string>) =>
+      spawnSync('env', [...env(extra), 'bash', '-uc', script], { cwd: w, encoding: 'utf8', timeout: 10_000 });
+
+    let r = run(readiness);
+    expect(r.stdout, r.stderr).toContain(`MAKE_PDF_READY: ${root}/make-pdf/dist/pdf`);
+    r = run(later);
+    expect(r.stdout.trim(), r.stderr).toBe('ROOT_PDF generate letter.md');
+
+    r = run(readiness, { MAKE_PDF_BIN: dev });
+    expect(r.stdout, r.stderr).toContain(`MAKE_PDF_READY: ${dev}`);
+    r = run(later, { MAKE_PDF_BIN: dev });
+    expect(r.stdout.trim(), r.stderr).toBe('DEV_PDF generate letter.md');
+
+    // A MAKE_PDF_BIN that is not executable falls back to the install, in both places.
+    r = run(later, { MAKE_PDF_BIN: path.join(w, 'missing pdf') });
+    expect(r.stdout.trim(), r.stderr).toBe('ROOT_PDF generate letter.md');
+  });
+
+  test('Claude keeps its repo-local-first probe with MAKE_PDF_BIN first; only the comment changed', () => {
+    const block = bashFences(generateMakePdfSetup({ ...ctx('claude'), skillName: 'make-pdf' }))[0].body;
+    expect(block).toContain(binaryAssignment(ctx('claude'), 'make-pdf'));
+    expect(block.indexOf('MAKE_PDF_BIN')).toBeLessThan(block.indexOf('_ROOT/'));
+    expect(block).not.toContain('available as $P in subsequent blocks');
   });
 });

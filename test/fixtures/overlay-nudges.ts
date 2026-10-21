@@ -202,7 +202,7 @@ export const OVERLAY_FIXTURES: OverlayFixture[] = [
   {
     id: 'claude-dedicated-tools-vs-bash',
     overlayPath: 'model-overlays/claude.md',
-    model: 'claude-opus-4-7',
+    model: 'claude-opus-5-5',
     trials: 10,
     concurrency: 3,
     direction: 'lower_is_better',
@@ -241,7 +241,7 @@ export const OVERLAY_FIXTURES: OverlayFixture[] = [
   {
     id: 'opus-4-7-effort-match-trivial',
     overlayPath: 'model-overlays/opus-4-7.md',
-    model: 'claude-opus-4-7',
+    model: 'claude-opus-5-5',
     trials: 10,
     concurrency: 3,
     direction: 'lower_is_better',
@@ -269,7 +269,7 @@ export const OVERLAY_FIXTURES: OverlayFixture[] = [
   {
     id: 'opus-4-7-literal-interpretation',
     overlayPath: 'model-overlays/opus-4-7.md',
-    model: 'claude-opus-4-7',
+    model: 'claude-opus-5-5',
     trials: 10,
     concurrency: 3,
     direction: 'higher_is_better',
@@ -290,16 +290,16 @@ export const OVERLAY_FIXTURES: OverlayFixture[] = [
   },
 
   // =========================================================================
-  // Sonnet 4.6 variants of the Opus-4.7 fixtures.
+  // Sonnet 5.5 variant of the Opus 5.5 dedicated-tools fixture.
   //
-  // Same overlays, prompts, metrics and trial counts; different pinned model.
+  // Same overlay, prompt, metric and trial count; different pinned model.
   // Model effects remain separate instead of pooling their observations.
   // =========================================================================
 
   {
     id: 'claude-dedicated-tools-vs-bash-sonnet',
     overlayPath: 'model-overlays/claude.md',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5-5',
     trials: 10,
     concurrency: 3,
     direction: 'lower_is_better',

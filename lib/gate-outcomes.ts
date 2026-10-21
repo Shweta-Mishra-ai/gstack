@@ -58,10 +58,30 @@ export const GATE_OUTCOMES = {
     summary: 'the review completed without severity tags or an explicit no-findings line',
     fix: 'read the output above and decide; it is not a pass',
   },
+  unparsed_severity: {
+    state: 'ran', anchor: 'outside-review-unparsed-severity',
+    summary: 'the review labels a finding with a P0-P3 severity in a form the parser cannot read',
+    fix: 'read the quoted line and the full reply above and decide; it is not a pass. Re-run the review asking for [P0]-[P3] or "P1:" labels, or re-check a corrected reply with bun lib/outside-review-result.ts --verdict <gate> <reply-file> from your gstack checkout (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-unparsed-severity)',
+  },
   model_unusable: {
     state: 'unavailable', anchor: 'codex-model-unusable',
     summary: 'Codex could not use the selected model',
     fix: 'set GSTACK_CODEX_MODEL=<supported-model> or fix model (and base_url for a custom provider) in your Codex config.toml',
+  },
+  quota_exhausted: {
+    state: 'unavailable', anchor: 'codex-quota-exhausted',
+    summary: "Codex refused the call for this account's usage limit",
+    fix: "wait for the reset time in Codex's message above, or add credits or a higher plan for that account; the model choice is fine. To re-check before gstack's 15-minute cache expires, set GSTACK_CODEX_PROBE_RETRY=1 (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#codex-quota-exhausted)",
+  },
+  rate_limited: {
+    state: 'unavailable', anchor: 'codex-rate-limited',
+    summary: 'Codex rate-limited the review (HTTP 429), so it did not complete',
+    fix: 're-run the review in a minute; if 429s persist, check the account rate limits on the provider dashboard (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#codex-rate-limited)',
+  },
+  helper_unavailable: {
+    state: 'unavailable', anchor: 'sourced-helper-location',
+    summary: 'the gstack Codex helper could not be loaded into this shell',
+    fix: 'run the skill from bash or zsh, or export GSTACK_ROOT=<install dir>; if the helper file is missing, re-run ./setup (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#sourced-helper-location)',
   },
   probe_inconclusive: {
     state: 'ran', anchor: 'codex-mode-unverified',
@@ -77,6 +97,11 @@ export const GATE_OUTCOMES = {
     state: 'not_run', anchor: 'outside-review-disabled',
     summary: 'outside reviews are turned off (codex_reviews=disabled)',
     fix: 'gstack-config set codex_reviews enabled',
+  },
+  consent_missing: {
+    state: 'not_run', anchor: 'outside-review-consent-missing',
+    summary: 'outside reviews are turned off (codex_reviews=disabled) or the gstack config could not be read, so no repository content was sent',
+    fix: 'gstack-config set codex_reviews enabled (or make config.yaml readable), then re-run; /codex and /claude-code still run when you ask for them (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-consent-missing)',
   },
   no_version_source: {
     state: 'not_run', anchor: 'ship-no-version-source',

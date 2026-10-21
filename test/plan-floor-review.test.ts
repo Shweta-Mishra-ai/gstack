@@ -5,6 +5,7 @@ import capturedQuotes from './fixtures/plan-floor-quote-70b.json';
 import productTypes from './fixtures/plan-floor-product-type-70b.json';
 import narrativeConfirmation from './fixtures/devex-narrative-confirmation-36641820398.json';
 import partlyWrongNarrative from './fixtures/devex-narrative-confirmation-36794871032.json';
+import sdkCallTarget from './fixtures/devex-tthw-sdk-call-opus.json';
 import { expectMentions } from './helpers/prompt-structure';
 const review = ():PlanFloorReview=>({seed:FORCING_FLOOR_CEO,candidate:{transport:'native',identity:'owned:call:question:0',question:{
   header:'Evidence',question:'Pricing is assumed to block adoption without developer interviews. Should we test that premise before launch?',multiSelect:false,
@@ -149,6 +150,21 @@ test('DX TTHW target question is a seeded finding without launching the assessor
  expect(actual.optionQuote).toMatch(/< 10 min|Champion|Competitive|Current trajectory/);
  expect(calls).toBe(0);
  }
+});
+test('captured Opus "time-to-first-SDK-call target" questions and the template wording are seeded findings without the assessor',()=>{
+ const noLaunch=(input:PlanFloorReview)=>{let calls=0;const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Assessor launched.'}),stderr:''};}) as any});return {actual,calls};};
+ expect(sdkCallTarget.captures).toHaveLength(2);
+ for (const capture of sdkCallTarget.captures) {
+  const {actual,calls}=noLaunch(structuredClone(capture.review) as PlanFloorReview);
+  expect(calls,capture.source).toBe(0);expect(actual.kind).toBe('finding');expect(actual.questionQuote).toMatch(/time-to-first-SDK-call target/);
+ }
+ const retitle=(title:string)=>{const input=structuredClone(sdkCallTarget.captures[0].review) as PlanFloorReview;const q=(input.candidate as any).question;
+  q.question=q.question.replace(/^[^\n]*/,`D2 — ${title}`);return input;};
+ expect(noLaunch(retitle('Which target fits this journey?')).calls).toBe(0);
+ for (const title of ['Does this empathy narrative match the first-call journey?','Which target should the docs link to?','Which target audience should this SDK serve?',
+  'Which time-to-first-SDK-call target did you measure?','Which review mode should I use?','Which onboarding step should we cut first?'])
+  expect(noLaunch(retitle(title)).calls,title).toBe(1);
 });
 test('an exhausted deadline starts no assessment process',()=>{
  let calls=0;expect(()=>judgePlanFloorReview(review(),{binary:'fake',model:'warmup',deadlineAt:Date.now()-1,invoke:(()=>{calls++;}) as any})).toThrow('deadline');expect(calls).toBe(0);

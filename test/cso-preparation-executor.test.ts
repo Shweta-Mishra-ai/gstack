@@ -10,8 +10,7 @@ import { inspectPreparation, type CsoStack } from '../lib/cso/preparation';
 import {
   admitPreparationRuntime, admitPreparationSidecar, PreparationExecutor,
   type AcquisitionReceipt, type OfflinePreparationReceipt, type PreparationAcquireRequest,
-  type PreparationSandboxRunner, type OfflinePreparationRequest,
-} from '../lib/cso/preparation-executor';
+  type PreparationSandboxRunner, type OfflinePreparationRequest, preparedIdentityEntry } from '../lib/cso/preparation-executor';
 import { CSO_HELPER_ABI } from '../lib/cso/runtime-catalog';
 import { DockerPreparationSandboxRunner, isBlockedRegistryAddress, RegistryEgressBroker } from '../lib/cso/preparation-docker';
 import { completeRuntimeCatalogFixture, qualifiedRuntimeFixture } from './helpers/cso-runtime-catalog';
@@ -50,7 +49,7 @@ function snapshot(stack: CsoStack): string {
   return base;
 }
 
-function runtime(stack: CsoStack | 'postgresql') { return qualifiedRuntimeFixture(stack); }
+function runtime(stack: Parameters<typeof qualifiedRuntimeFixture>[0]) { return qualifiedRuntimeFixture(stack); }
 function catalog(..._stacks: Array<CsoStack | 'postgresql'>) { return completeRuntimeCatalogFixture('executor-test-v1'); }
 function cacheFixture() {
   const base = root('cso-executor-cache-'), staging = path.join(base, 'staging'); fs.mkdirSync(staging, { mode: 0o700 });
@@ -189,6 +188,22 @@ describe('CSO constrained dependency preparation executor', () => {
   test('prepared dependency identity detects offline test-toolchain mutation',async()=>{
     const source=snapshot('node'),plan=inspectPreparation(source,'node'),admission=admitPreparationRuntime({plan,platform:'linux/amd64',catalog:catalog('node')}),runner=new FakeRunner(),executor=new PreparationExecutor({cache:cacheFixture(),runner}),deadline=Date.now()+60_000,closure=await executor.acquire({plan,admission,snapshot:source,deadline});
     const before=await executor.prepareOffline({plan,admission,snapshot:source,closure,deadline});runner.mutatePrepared=root=>fs.writeFileSync(path.join(root,'node_modules','.cso-dependencies'),'changed toolchain bytes');const after=await executor.prepareOffline({plan,admission,snapshot:source,closure,deadline});expect(after.preparedDependencyHash).not.toBe(before.preparedDependencyHash);
+  });
+
+  test('Rails build diagnostics with random build directories stay out of the prepared identity', () => {
+    for (const path of [
+      'vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0/date-3.5.1/gem_make.out',
+      'vendor/bundle/ruby/3.4.0/extensions/aarch64-linux/3.4.0/json-3.0.2/mkmf.log',
+      'vendor/bundle/ruby/3.4.0/gems/sqlite3-2.9.0/ext/sqlite3/tmp/x86_64-linux-gnu/ports/sqlite3/3.51.1/sqlite-autoconf-3510100/config.log',
+    ]) expect(preparedIdentityEntry('rails', path)).toBe(false);
+    for (const path of [
+      'vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0/date-3.5.1/date_core.so',
+      'vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0/date-3.5.1/gem.build_complete',
+      'vendor/bundle/ruby/3.4.0/gems/sqlite3-2.9.0/lib/sqlite3/sqlite3_native.so',
+      'vendor/bundle/ruby/3.4.0/gems/rails-8.1.2/lib/rails.rb',
+      'log/gem_make.out',
+    ]) expect(preparedIdentityEntry('rails', path)).toBe(true);
+    expect(preparedIdentityEntry('node', 'vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0/date-3.5.1/gem_make.out')).toBe(true);
   });
 
   test('network-policy and exact-command receipt changes are rejected before promotion', async () => {
@@ -364,6 +379,43 @@ describe('CSO constrained dependency preparation executor', () => {
       await Promise.race([cancelled, Bun.sleep(500).then(() => { throw new Error('registry DNS cancellation did not settle after the deadline response'); })]);
       expect(cancellations).toBe(1); expect(() => broker.assertClean()).toThrow();
     } finally { await broker.close(); }
+  });
+
+  // Rails acquires ~70 gems in sequence. Under Bun, stream.pipe left each finished
+  // tunnel's upstream open, so the broker hit its 64-connection limit mid-acquisition.
+  test('finished registry tunnels release both sockets across more tunnels than the connection limit', async () => {
+    const base = root('cso-broker-release-'), socketPath = path.join(base, 'registry.sock');
+    const registry = net.createServer(upstream => { upstream.on('data', chunk => upstream.write(chunk)); upstream.on('end', () => upstream.end()); });
+    await new Promise<void>(resolve => registry.listen(0, '127.0.0.1', resolve));
+    const registryPort = (registry.address() as net.AddressInfo).port, dial = net.connect;
+    const connect = spyOn(net, 'connect').mockImplementation(((options: any, ...rest: any[]) =>
+      dial({ host: '127.0.0.1', port: options?.port === 443 ? registryPort : options?.port }, ...rest)) as typeof net.connect);
+    const broker = new RegistryEgressBroker(socketPath, ['rubygems.org'], Date.now() + 60_000, 64 * 1024 * 1024,
+      () => ({ promise: Promise.resolve([{ address: '151.101.1.227', family: 4 as const }]), cancel: () => {} }));
+    await broker.start();
+    try {
+      for (let index = 0; index < 70; index++) {
+        const echoed = await new Promise<string>((resolveEcho, reject) => {
+          const client = net.createConnection({ path: socketPath }); let output = '';
+          client.setTimeout(5_000, () => client.destroy(new Error(`tunnel ${index} stalled`)));
+          client.once('connect', () => client.write('CONNECT rubygems.org:443 HTTP/1.1\r\nHost: rubygems.org:443\r\n\r\n'));
+          client.on('data', chunk => {
+            output += chunk.toString();
+            if (output === 'HTTP/1.1 200 Connection Established\r\n\r\n') { client.write(`gem-${index}`); return; }
+            if (output.endsWith(`gem-${index}`)) client.end();
+          });
+          client.once('close', () => resolveEcho(output)); client.once('error', reject);
+        });
+        expect(echoed).toEndWith(`gem-${index}`);
+      }
+      const deadline = Date.now() + 2_000;
+      while ((broker as any).sockets.size && Date.now() < deadline) await Bun.sleep(10);
+      expect((broker as any).sockets.size).toBe(0);
+      expect(() => broker.assertClean()).not.toThrow();
+      expect([...broker.contactedHosts]).toEqual(['rubygems.org']);
+    } finally {
+      connect.mockRestore(); await broker.close(); await new Promise<void>(resolve => registry.close(() => resolve()));
+    }
   });
 
   test('registry address classification rejects mapped, translated, private, and unspecified destinations', () => {

@@ -160,7 +160,7 @@ If TODOS.md does not exist, skip this step.
 
 1. **Read the version source** (the same signal `/ship` uses):
    ```bash
-   bun run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base <base>
+   bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base <base>
    ```
    `state: NO_VERSION` means no version source is configured or release automation owns
    it: print `VERSION: not applicable (<versionSource.reason>)`, skip this step, and never
@@ -222,47 +222,60 @@ health summary and continue to Step 9. Ship-owned children already stopped at St
 
 ```bash
 
-# Codex preflight: one block (functions sourced here don't persist to later blocks).
-_TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
-_CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get codex_reviews 2>/dev/null || echo enabled)
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null || true
-if [ "$_CODEX_CFG" = "disabled" ]; then
+# Codex preflight: the probe runs as a command, so any shell works.
+_CODEX_PROBE=~/.claude/skills/gstack/bin/gstack-codex-probe
+_CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get --stored codex_reviews 2>/dev/null)
+_gstack_helper_error=""
+[ -x "$_CODEX_PROBE" ] || _gstack_helper_error="gstack: cannot load gstack-codex-probe; re-run ./setup. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#sourced-helper-location"
+if [ "$_CODEX_CFG" = "disabled" ] || [ "$_CODEX_CFG" = "unreadable" ]; then
   _CODEX_MODE="disabled"
 elif { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
   _CODEX_MODE="under_codex"
 elif ! command -v codex >/dev/null 2>&1; then
-  _CODEX_MODE="not_installed"; _gstack_codex_log_event "codex_cli_missing" 2>/dev/null || true
-elif ! _gstack_codex_auth_probe >/dev/null 2>&1; then
-  _CODEX_MODE="not_authed"; _gstack_codex_log_event "codex_auth_failed" 2>/dev/null || true
+  _CODEX_MODE="not_installed"; "$_CODEX_PROBE" log-event codex_cli_missing 2>/dev/null || true
+elif [ -n "$_gstack_helper_error" ]; then
+  _CODEX_MODE="helper_unavailable"; echo "$_gstack_helper_error"
+elif ! "$_CODEX_PROBE" check-auth >/dev/null 2>&1; then
+  _CODEX_MODE="not_authed"; "$_CODEX_PROBE" log-event codex_auth_failed 2>/dev/null || true
 else
-  # The free sandbox check runs before the paid model probe. Probe code 2 means
-  # the CLI cannot execute at all, a different fix from an unusable model.
-  _CODEX_MP=0; _gstack_codex_sandbox_preflight || _CODEX_MP=3
-  [ "$_CODEX_MP" -ne 0 ] || { _gstack_codex_model_probe; _CODEX_MP=$?; }
+  # Free sandbox check before the paid probe; probe exit 2 = the CLI cannot run.
+  _CODEX_MP=0; _CODEX_PS=""
+  "$_CODEX_PROBE" check-sandbox || _CODEX_MP=3
+  for _CODEX_KIND in exec; do
+    [ "$_CODEX_MP" -eq 0 ] || break
+    _CODEX_PO=$("$_CODEX_PROBE" probe-model $_CODEX_KIND); _CODEX_MP=$?; printf '%s\n' "$_CODEX_PO"
+    case "$_CODEX_PO" in *"STATE: inconclusive"*) _CODEX_PS=inconclusive ;; *"STATE: rate_limited"*) _CODEX_PS=rate_limited ;; esac
+  done
   if [ "$_CODEX_MP" -eq 3 ]; then
     _CODEX_MODE="sandbox_unavailable"
   elif [ "$_CODEX_MP" -eq 2 ]; then
     _CODEX_MODE="broken_install"
+  elif [ "$_CODEX_MP" -eq 4 ]; then
+    _CODEX_MODE="quota_exhausted"
   elif [ "$_CODEX_MP" -ne 0 ]; then
     _CODEX_MODE="model_unusable"
-  elif [ "${_GSTACK_CODEX_PROBE_STATE:-}" = inconclusive ]; then
+  elif [ "$_CODEX_PS" = inconclusive ]; then
     _CODEX_MODE="unverified"
+  elif [ "$_CODEX_PS" = rate_limited ]; then
+    _CODEX_MODE="unverified (rate_limited)"
   else
-    _CODEX_MODE="ready"; _gstack_codex_version_check 2>/dev/null || true
+    _CODEX_MODE="ready"; "$_CODEX_PROBE" check-version || true
   fi
 fi
 echo "CODEX_MODE: $_CODEX_MODE"
 ```
 
 Branch on the echoed `CODEX_MODE`:
-- **`disabled`** — the user turned Codex reviews off (`codex_reviews=disabled`). Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
+- **`disabled`** (or a send's `consent_missing` line) — `codex_reviews` is off or unreadable. Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
+- **`helper_unavailable`** — the probe is missing or not executable; relay the line above (cause and fix). Fall back to the Claude subagent path.
 - **`not_installed`** — Codex CLI absent. Print: "Codex not installed; outside coverage unavailable. Install: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
 - **`under_codex`** — stale artifact selected its own harness. Print: "Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage. Repair: setup --host codex." Skip the outside invocation and follow the workflow's native-review instructions below. Conflicting inherited harness markers are not grounds to guess another provider.
 - **`not_authed`** — installed but no credentials. Print: "Codex not authenticated; outside coverage unavailable. Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
 - **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines. Fall back to the Claude subagent path.
 - **`model_unusable`** — the selected model (see `CODEX_MODEL:`) is invalid or unavailable to the account (HTTP 400 on every call). Relay the probe's HINT lines and the fix (`GSTACK_CODEX_MODEL=<supported-model>` or config.toml `model`); never substitute a model. Fall back to the Claude subagent path. The ~10s round trip is cached for 1h.
+- **`quota_exhausted`** — Codex usage limit: relay the probe's lines verbatim (reset time, retry); no more Codex calls this run. Fall back to the Claude subagent path.
 - **`sandbox_unavailable`** — Codex's sandbox cannot start here (containers without user namespaces); the probe printed the reason and fix. No paid call ran; outside coverage is unavailable. Fall back to the Claude subagent path.
-- **`ready`** or **`unverified`** — run the Codex pass below. `unverified` means the model check timed out; say so, and let the pass's own verdict decide.
+- **`ready`** or **`unverified`** — run the Codex pass below. `unverified` means the model check timed out or, with `(rate_limited)`, hit a 429; say so, and let the pass's own verdict decide.
 
 **Disabled is a terminal branch for this section.** If the preflight prints
 `CODEX_MODE: disabled`, persist `outside_status: disabled` with the guarded
@@ -317,7 +330,7 @@ THE DOCS AND DIFF: <include current contents of each touched document, with its 
 
 **If `CODEX_MODE: ready` (or `unverified`) — run Codex:**
 
-Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -337,16 +350,19 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
-_gstack_codex_sandbox_preflight >/dev/null || exit 1
-_gstack_codex_first_use_notice
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+_CODEX_OUT=$("$_CODEX_PROBE" select-model exec) || exit 1
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" check-sandbox || exit 1
+"$_CODEX_PROBE" show-first-use-notice
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 300 codex exec - -C "$_REPO_ROOT" -s "${_GSTACK_CODEX_SANDBOX:?}" -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="high"' -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+"$_CODEX_PROBE" run-with-timeout --effort high 300 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 _OUTSIDE_RC=0
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
 case "$_OUTSIDE_RC" in
   0|3) ;;
   4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
@@ -372,7 +388,7 @@ On `CODEX_MODE: under_codex`, report the setup repair and
 `outside_status: unavailable`, run no outside CLI, and use the native subagent below.
 A native result never supplies outside coverage.
 
-Dispatch via the Agent tool with the same prompt, passing `run_in_background: false` (subagents default to background since Claude Code v2.1.198). Bound it at a 5-minute timeout; if it never completes, treat the review as unavailable and continue.
+Dispatch via the Agent tool with the same prompt, passing `run_in_background: false` when available (subagents default to background since Claude Code v2.1.198). A launch receipt means it went background: await its completion notice. Bound it at a 5-minute timeout; if it never completes, treat the review as unavailable and continue.
 Present findings under `DOCUMENTATION REVIEW (Claude subagent):`. If it fails: "Doc review unavailable. Continuing to Step 9." Skip the apply gate, persist `status: unavailable`, `outside_status: unavailable`, and `source: none` below, then continue; unavailable is not a clean review.
 
 **Apply decision (informational, never auto-edit, but findings don't evaporate).**
@@ -565,7 +581,7 @@ PR titles must start with `v<VERSION>` whenever the project has a version source
 Run this entire block in one shell, substituting `github` or `gitlab` for `<platform>` from Step 0 and the base branch for `<base>`. No variables cross tool calls. No version source (NO_VERSION) or no PR/MR skips title sync; an update failure warns and continues.
 
 ```bash
-VB=$(bun run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base "<base>") || { echo "Title sync: not run (the version source is broken; see the error above)."; exit 0; }
+VB=$(bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base "<base>") || { echo "Title sync: not run (the version source is broken; see the error above)."; exit 0; }
 V=$(echo "$VB" | jq -r '.currentVersion // empty')
 [ -n "$V" ] || { echo "Title sync: not applicable (no version source is configured)."; exit 0; }
 case "<platform>" in

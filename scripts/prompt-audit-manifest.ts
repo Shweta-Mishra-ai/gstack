@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Prompt-audit manifest: the files a contributor feeds to Anthropic's
  * `/claude-api prompt-audit` (a Claude Code skill, run in your own Claude Code

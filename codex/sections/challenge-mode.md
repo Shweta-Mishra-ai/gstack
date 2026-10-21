@@ -19,15 +19,27 @@ With focus (e.g., "security"):
 
 Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Focus specifically on SECURITY. Your job is to find every way an attacker could exploit this code. Think about injection vectors, auth bypasses, privilege escalation, data exposure, and timing attacks. Be adversarial."
 
-2. Run codex exec with **JSONL output** to capture reasoning traces and tool calls.
-Replace `<prompt>` with the full prompt from step 1, verbatim and unescaped; Codex reads it on stdin.
+2. Create the prompt file and write the full prompt from step 1 into it. Codex reads it on stdin.
+
+```bash
+_GT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp"
+mkdir -p "$_GT" && chmod 700 "$_GT" || { echo "Not sent: cannot create $_GT for the text file." >&2; exit 1; }
+_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }
+PROMPT_FILE=$(mktemp "${_GT:?}/codex-prompt.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "PROMPT_FILE: $PROMPT_FILE (name: ${PROMPT_FILE##*/})"
+```
+
+Write the text into each printed file with your file-write tool (Claude Code's Write tool needs a Read of the empty file first), exactly as it should appear. The text never goes into a shell command, heredoc or quoted argument. If a write fails or is refused, do not send: print the cause, the file path and the command below for sending by hand.
+
+3. Run codex exec with **JSONL output** to capture reasoning traces and tool calls.
+Substitute the printed name for `<prompt-file-name>` (letters, digits, `.`, `_` and `-` only).
 Use `timeout: 600000` on the Bash call (the tool's maximum) — the gate sits ABOVE the
 540s wrapper so the wrapper fires first, ends Codex, and prints its explicit stall message:
 
-If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
 
 ```bash
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+PROMPT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<prompt-file-name>"
+[ -s "$PROMPT_FILE" ] || { echo "Not run: $PROMPT_FILE is missing or empty, so the prompt was never written. Write it, then run by hand: codex exec - -C $_REPO_ROOT < $PROMPT_FILE" >&2; exit 1; }
 PYTHON_CMD=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
 if [ -z "$PYTHON_CMD" ]; then
   echo "ERROR: Python 3 is required to parse Codex JSON output. Install python3 or python and retry." >&2
@@ -37,14 +49,13 @@ fi
 # capture stderr to $TMPERR for auth error detection (was: 2>/dev/null).
 [ -n "${TMPERR:-}" ] || TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX") || { echo "ERROR: mktemp failed in TMP_ROOT=$TMP_ROOT; not running codex without its temp file" >&2; exit 1; }
 TMPRESP=$(mktemp "$TMP_ROOT/codex-resp-XXXXXX") || { echo "ERROR: mktemp failed in TMP_ROOT=$TMP_ROOT; not running codex without its temp file" >&2; exit 1; }
-source ~/.claude/skills/gstack/bin/gstack-codex-probe || exit 1
-_gstack_codex_select_model exec || exit 1
-_PROMPT_FILE=$(mktemp "$TMP_ROOT/codex-prompt-XXXXXX") || { echo "ERROR: mktemp failed in TMP_ROOT=$TMP_ROOT; not running codex without its temp file" >&2; exit 1; }
-# The prompt goes to Codex on stdin (codex exec -), verbatim: no shell quoting, no argv size limit.
-cat > "$_PROMPT_FILE" <<'CODEX_PROMPT_END'
-<prompt>
-CODEX_PROMPT_END
-_gstack_codex_timeout_wrapper 540 codex exec - -C "$_REPO_ROOT" -s "${_GSTACK_CODEX_SANDBOX:?}" -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="high"' -c 'web_search="cached"' --json -o "$TMPRESP" < "$_PROMPT_FILE" 2>"$TMPERR" | tee "$TMPRESP.events" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+_CODEX_PROBE=~/.claude/skills/gstack/bin/gstack-codex-probe
+_CODEX_ROLE=''
+if [ -n "$_CODEX_ROLE" ]; then export _CODEX_DEADLINE=$(($(date +%s)+540)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
+else _CODEX_OUT=$("$_CODEX_PROBE" select-model exec) || exit 1; fi
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" run-with-timeout --user-invoked --effort high --request-effort '<effort-level>' 540 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$TMPRESP" < "$PROMPT_FILE" 2>"$TMPERR" | tee "$TMPRESP.events" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 import sys, json
 turn_completed_count = 0
 turn_failed = False
@@ -86,23 +97,23 @@ elif turn_completed_count == 0:
 _CODEX_EXIT=${PIPESTATUS[0]:-${pipestatus[1]}}  # bash sets PIPESTATUS; zsh (lowercase, 1-indexed) falls through
 # Fix 1: hang detection — log + surface actionable message
 if [ "$_CODEX_EXIT" = "124" ]; then
-  _gstack_codex_log_event "codex_timeout" "540"
-  _gstack_codex_log_hang "challenge" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  "$_CODEX_PROBE" log-event codex_timeout "540"
+  "$_CODEX_PROBE" log-hang "challenge" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
   echo "Codex stalled past 9 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
 elif [ "$_CODEX_EXIT" != "0" ]; then
   # Surface non-zero exits so the calling agent doesn't read "no output" as
   # a silent model/API stall.
   echo "[codex exit $_CODEX_EXIT] $(head -1 "$TMPERR" 2>/dev/null || echo "no stderr captured")"
   head -20 "$TMPERR" 2>/dev/null | sed 's/^/  /' || true
-  _gstack_codex_log_event "codex_nonzero_exit" "challenge:$_CODEX_EXIT"
+  "$_CODEX_PROBE" log-event codex_nonzero_exit "challenge:$_CODEX_EXIT"
 fi
 # Fix 2: surface auth errors from captured stderr instead of dropping them
 if grep -qiE "auth|login|unauthorized" "$TMPERR" 2>/dev/null; then
   echo "[codex auth error] $(head -1 "$TMPERR")"
-  _gstack_codex_log_event "codex_auth_failed"
+  "$_CODEX_PROBE" log-event codex_auth_failed
 fi
-bun ~/.claude/skills/gstack/lib/outside-review-result.ts --label 'Codex challenge' --exit "$_CODEX_EXIT" --stderr "$TMPERR" --events "$TMPRESP.events" execution "$TMPRESP"
-rm -f "$TMPRESP" "$TMPRESP.events" "$_PROMPT_FILE"
+bun --no-env-file --config=/dev/null ~/.claude/skills/gstack/lib/outside-review-result.ts --label 'Codex challenge' --exit "$_CODEX_EXIT" --stderr "$TMPERR" --events "$TMPRESP.events" execution "$TMPRESP"
+rm -f "$TMPRESP" "$TMPRESP.events" "$PROMPT_FILE"
 ```
 
 `VERDICT: unavailable` means the challenge did not run (its line names why, such as a
@@ -112,7 +123,7 @@ present the output below.
 This parses codex's JSONL events to extract reasoning traces, tool calls, and the final
 response. The `[codex thinking]` lines show what codex reasoned through before its answer.
 
-3. Present the full streamed output:
+4. Present the full streamed output:
 
 ```
 CODEX SAYS (adversarial challenge):
@@ -122,7 +133,7 @@ CODEX SAYS (adversarial challenge):
 Tokens: N | Est. cost: ~$X.XX
 ```
 
-3a. **Synthesis recommendation (REQUIRED).** After presenting the full
+4a. **Synthesis recommendation (REQUIRED).** After presenting the full
 adversarial output, emit ONE recommendation line summarizing what the user
 should do, in this format:
 

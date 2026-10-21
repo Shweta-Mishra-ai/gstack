@@ -276,6 +276,8 @@ test('successful delivery', () => {
     fixtureGit(root, ['config', 'user.name', 'QA Fixture'], remaining());
     fixtureGit(root, ['config', 'user.email', 'qa-fixture@gstack.test'], remaining());
     fixtureGit(root, ['config', 'commit.gpgsign', 'false'], remaining());
+    fixtureGit(root, ['config', 'gc.auto', '0'], remaining());
+    fixtureGit(root, ['config', 'maintenance.auto', 'false'], remaining());
     fixtureGit(root, ['add', '.'], remaining());
     fixtureGit(root, ['commit', '-m', 'Seed owned functional QA fixture'], remaining());
     const revision = fixtureGit(root, ['rev-parse', 'HEAD'], remaining());

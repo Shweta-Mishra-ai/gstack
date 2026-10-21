@@ -523,6 +523,43 @@ test('captures list declared-but-unrun required probes without judging them', ()
   expect(receipt(result.stdout).requiredRemaining).toEqual(['bun run probe -- reject']);
 });
 
+test('post-repair required probes count only captures started after the last fixture-declared source edit', () => {
+  const f = fixture();
+  const src = path.join(f.root, 'src');
+  fs.mkdirSync(src);
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 1;\n');
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(path.join(src, 'worker.ts'), old, old);
+  fs.utimesSync(src, old, old);
+  const probe = (program: string) => [process.execPath, '-e', program];
+  const [duplicate, partial] = [probe('console.log(JSON.stringify({scenario:"duplicate"}))'), probe('console.log(JSON.stringify({scenario:"partial"}))')];
+  const env = { ...process.env, GSTACK_QA_REQUIRED_PROBES: JSON.stringify([duplicate.join(' '), partial.join(' ')]),
+    GSTACK_QA_REQUIRED_AFTER_EDIT: JSON.stringify({ paths: [src], since: new Date(Date.now() - 30_000).toISOString() }) };
+  let last: Record<string, unknown> = {};
+  const capture = (captureId: string, argv: string[]) => {
+    const after = captureId === '001' ? [] : ['--after', String(Number(captureId) - 1).padStart(3, '0'), '--hypothesis', 'The previous scenario result shows which invariant the next probe must check.'];
+    const result = spawnSync(process.execPath, [CLI, 'capture', f.root, captureId, '--timeout-ms', '4000', ...after, '--', ...argv], { cwd: f.root, encoding: 'utf8', timeout: 10_000, env });
+    expect(result.status, result.stderr).toBe(0);
+    last = receipt(result.stdout);
+    return last.requiredRemaining as string[];
+  };
+  expect(capture('001', duplicate)).toEqual([duplicate.join(' '), partial.join(' ')]);
+  expect(capture('002', partial)).toEqual([duplicate.join(' '), partial.join(' ')]);
+  // The edit's mtime is pinned to capture 002's completion: a real write's mtime comes from the kernel's coarse clock,
+  // which lags Date.now() by up to a tick, while 002 started only one child run (a few ms on a fast machine) earlier;
+  // the GPT voice's run on 51f1e02 counted 002 as post-edit that way. 002 started before this instant and 003 after it.
+  const edit = new Date(Date.parse(String(last.completedAt)));
+  expect(Date.parse(String(last.startedAt))).toBeLessThan(edit.getTime());
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 2;\n');
+  fs.utimesSync(path.join(src, 'worker.ts'), edit, edit);
+  expect(capture('003', duplicate)).toEqual([partial.join(' ')]);
+  expect(capture('004', partial)).toEqual([]);
+  const secondEdit = new Date(Date.now() + 60_000);
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 3;\n');
+  fs.utimesSync(path.join(src, 'worker.ts'), secondEdit, secondEdit);
+  expect(capture('005', probe('console.log(JSON.stringify({scenario:"happy"}))'))).toEqual([duplicate.join(' '), partial.join(' ')]);
+});
+
 test('materialize accepts a single limits string as a one-item list', () => {
   const f = fixture();
   expect(f.capture('001', 'console.log(JSON.stringify({ step: 1 }))').status).toBe(0);

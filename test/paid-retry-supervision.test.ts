@@ -217,8 +217,9 @@ test('eval:bg runs the PR and release commands with their declared workers (cap:
 const cliOptions = (step: { run: string; env?: Record<string, string> }) => {
   const prefix = /\bbun(?: --no-install)? run scripts\/test-paid-shards\.ts /.exec(step.run);
   expect(prefix).not.toBeNull();
-  const args = step.run.slice(prefix!.index + prefix![0].length)
-    .replace(/\$\{\{\s*matrix\.slice\s*\}\}/g, '1').trim().split(/\s+/);
+  // One command line: a census arm loop continues past it.
+  const args = step.run.slice(prefix!.index + prefix![0].length).split('\n')[0]!
+    .replace(/\$\{\{\s*matrix\.slice\s*\}\}/g, '1').replace(/\$\{\{\s*matrix\.arm\s*\}\}/g, 'claude-opus').trim().split(/\s+/);
   return parseCliOptions(args, step.env ?? {});
 };
 
@@ -242,10 +243,16 @@ test('both gate executors plan the complete census and supervise every planned s
     expect(planned.skipJudges).toBe(skipJudges);
     expect(execute[0].env.EVALS_CONCURRENCY).toBe('2');
     expect(executor.strategy['fail-fast']).toBe(false);
-    expect(executor.strategy.matrix.slice).toBe(`\${{ fromJSON(needs.plan-slices.outputs.${prefix}slices) }}`);
-    // Per-slice ceilings (W2c/ENG-2), or the largest of them as one job cap.
-    expect([`\${{ fromJSON(needs.plan-slices.outputs.${prefix}slice_timeouts)[matrix.slice] }}`,
-      `\${{ fromJSON(needs.plan-slices.outputs.${prefix}timeout_minutes) }}`]).toContain(executor['timeout-minutes']);
+    if (jobName === 'gate-census') {
+      // One row per census arm and planned slice, each with its arm's planned slice ceiling (scripts/census-arms.ts).
+      expect(executor.strategy.matrix.include).toBe('${{ fromJSON(needs.plan-slices.outputs.gate_matrix) }}');
+      expect(executor['timeout-minutes']).toBe('${{ matrix.timeout }}');
+    } else {
+      expect(executor.strategy.matrix.slice).toBe(`\${{ fromJSON(needs.plan-slices.outputs.${prefix}slices) }}`);
+      // Per-slice ceilings (W2c/ENG-2), or the largest of them as one job cap.
+      expect([`\${{ fromJSON(needs.plan-slices.outputs.${prefix}slice_timeouts)[matrix.slice] }}`,
+        `\${{ fromJSON(needs.plan-slices.outputs.${prefix}timeout_minutes) }}`]).toContain(executor['timeout-minutes']);
+    }
     const manifest = buildRunManifest({ tier: 'gate', sliceBudgetMs: planned.sliceBudgetMs!, jobs: planned.jobs, evalsAll: true, env: { EVALS_ALL: '1' }, skipJudges });
     const files = [...new Set(manifest.entries.filter(row => row.status === 'planned').map(row => shardFile(row.file)))];
     expect(files).toContain('test/skill-e2e-ship-skip.test.ts');
@@ -262,8 +269,8 @@ test('both gate executors plan the complete census and supervise every planned s
     expect(manifest.sliceCount).toBeLessThanOrEqual(executor.strategy['max-parallel']);
     if (jobName === 'gate-census') {
       expect(emit[0].env.EVALS_ALL).toBe('1');
-      expect(emit[0].run).toContain('--emit-plan /tmp/gate-census-plan/manifest.json');
-      expect(execute[0].run).toContain('--plan /tmp/gate-census-plan/manifest.json --slice ${{ matrix.slice }}');
+      expect(emit[0].run).toContain('--emit-plan "/tmp/gate-census-plan/$arm/manifest.json"');
+      expect(execute[0].run).toContain('--plan /tmp/gate-census-plan/${{ matrix.arm }}/manifest.json --slice ${{ matrix.slice }}');
       expect(executor.steps.some((step: any) => step.with?.name === 'gate-census-plan')).toBe(true);
       expect(executor.steps.filter((step: any) => step.run?.includes('--emit-plan '))).toHaveLength(0);
     }
@@ -305,8 +312,10 @@ test('gate census requires all seven distinct slice results and its own reconcil
   const reconcile = report.steps.find((step: any) => step.id === 'gate-reconcile');
   expect(report.needs).toContain('gate-census');
   expect(reconcile.if).toBe('always()');
-  expect(reconcile.run).toContain('EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report /tmp/gate-census-report');
-  expect(reconcile.run).toContain('exit=${PIPESTATUS[0]}');
+  // One reconciliation per census arm, each against its own plan and slices.
+  expect(reconcile.run).toContain('dir="/tmp/gate-census-report/$arm"');
+  expect(reconcile.run).toContain('EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report "$dir"');
+  expect(reconcile.run).toContain('code=${PIPESTATUS[0]}');
   const failureGuards = report.steps.filter((step: any) => /Upsert tracking|Fail the workflow/.test(step.name ?? ''));
   expect(failureGuards).toHaveLength(2);
   for (const step of failureGuards) {

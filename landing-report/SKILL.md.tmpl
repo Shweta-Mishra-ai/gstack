@@ -68,7 +68,7 @@ what each level would claim.
 
 ```bash
 for LEVEL in micro patch minor major; do
-  bun run ~/.claude/skills/gstack/bin/gstack-next-version \
+  bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-next-version \
     --base "$BASE_BRANCH" \
     --bump "$LEVEL" \
     --current-version "$BASE_VERSION" \
